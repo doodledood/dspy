@@ -387,11 +387,24 @@ def test_apex_end_to_end_fake_data():
     assert first_iter.num_failures == 2 and first_iter.num_successes == 1
     assert len(first_iter.hypotheses) == 1
     assert first_iter.hypotheses[0].prompt_changes["predictor"].new_prompt == "good"
+    assert first_iter.candidates[0].hypothesis is None  # baseline evaluated first
+    assert first_iter.candidates[1].hypothesis == first_iter.hypotheses[0]
+    assert len(first_iter.candidates[0].per_example_scores) == len(calset)
+    assert len(first_iter.candidates[1].per_example_scores) == len(calset)
     assert second_iter.num_failures == 1 and second_iter.num_successes == 1
     assert second_iter.hypotheses == []
+    assert second_iter.candidates[0].hypothesis is None  # re-evaluated champion
+    assert len(second_iter.candidates[0].per_example_scores) == len(calset)
+    assert all(
+        score <= result.best_candidate.overall_score + 1e-9
+        for score in (cand.overall_score for cand in result.all_candidates)
+    )
 
     # Candidate history should contain baseline + new hypothesis + final baseline re-evaluation.
     assert len(result.all_candidates) == 3
+    assert result.all_candidates[0].hypothesis is None
+    assert result.all_candidates[1].hypothesis is not None
+    assert result.all_candidates[2].hypothesis is None
 
 
 def test_apex_public_api_exposed():
