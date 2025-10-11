@@ -536,3 +536,68 @@ def test_apex_public_api_exposed():
     import dspy.teleprompt as teleprompt_module
 
     assert teleprompt_module.APEX is APEX
+
+
+def test_apex_checkpoint_and_resume(tmp_path):
+    """Verify APEX can save checkpoints and resume from them."""
+
+    def dummy_metric(example: Example, prediction: dspy.Prediction, trace) -> float:
+        return 1.0 if prediction.output == "good" else 0.0
+
+    trainset = [make_train_example("x"), make_train_example("y")]
+    valset = trainset
+
+    analysis_lm = DummyLM(
+        [make_analysis_response() for _ in range(10)],  # Enough for multiple iterations
+        adapter=dspy.JSONAdapter(),
+    )
+    hypothesis_lm = DummyLM(
+        [make_hypothesis_response() for _ in range(10)],  # Enough for multiple iterations
+        adapter=dspy.JSONAdapter(),
+    )
+
+    # First run - will complete after 2 iterations
+    optimizer1 = APEX(
+        metric=dummy_metric,
+        analysis_lm=analysis_lm,
+        hypothesis_lm=hypothesis_lm,
+        max_iterations=2,
+        num_hypotheses=1,
+        convergence_patience=None,  # Rely on max_iterations
+        checkpoint_dir=tmp_path,
+        verbosity="none",
+        seed=42,
+    )
+
+    student = PromptDrivenModule(initial_prompt="bad")
+    optimized1 = optimizer1.compile(student=student, trainset=trainset, valset=valset)
+    initial_iterations = len(optimized1.apex_result.iterations)
+    assert initial_iterations == 2
+    assert optimized1.apex_result.stopped_after == "max_iterations"
+
+    # Verify checkpoint files were created
+    checkpoint_files = list(tmp_path.glob("checkpoint_iter_*.pkl"))
+    assert len(checkpoint_files) > 0, "No checkpoint files created"
+    latest_file = tmp_path / "latest_checkpoint.json"
+    assert latest_file.exists(), "latest_checkpoint.json not created"
+
+    # Second run - resume from checkpoint and continue for more iterations
+    optimizer2 = APEX(
+        metric=dummy_metric,
+        analysis_lm=analysis_lm,
+        hypothesis_lm=hypothesis_lm,
+        max_iterations=4,  # Continue for more iterations
+        num_hypotheses=1,
+        convergence_patience=None,
+        checkpoint_dir=tmp_path,
+        verbosity="none",
+        seed=42,
+    )
+
+    # Resume from checkpoint
+    optimized2 = optimizer2.compile(student=student, trainset=trainset, valset=valset, resume=True)
+    final_iterations = len(optimized2.apex_result.iterations)
+
+    # Should have continued from where it left off
+    assert final_iterations == 4
+    assert optimized2.apex_result.stopped_after == "max_iterations"

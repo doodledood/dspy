@@ -3,13 +3,13 @@ from __future__ import annotations
 import json
 import logging
 import os
-import pickle
 import random
 from enum import Enum
 from pathlib import Path
 from statistics import median
 from typing import Any, Callable, Iterable, Iterator, Literal, Mapping, Sequence, TypeAlias, TypeVar
 
+import cloudpickle
 from pydantic import BaseModel, ConfigDict, Field
 from tqdm.auto import tqdm
 
@@ -346,7 +346,6 @@ class APEX(Teleprompter):
         seed: int | None = None,
         checkpoint_dir: str | Path | None = None,
     ) -> None:
-        # Validation: ensure at least one stopping condition is set
         if max_iterations is None and convergence_patience is None:
             raise ValueError("At least one of max_iterations or convergence_patience must be specified.")
         if max_iterations is not None and max_iterations <= 0:
@@ -383,13 +382,10 @@ class APEX(Teleprompter):
         self.seed = seed if seed is not None else random.randint(1, 1_000_000)
         self._rng = random.Random(self.seed)
 
-        # Setup checkpointing
         self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
         if self.checkpoint_dir:
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
             self._log(f"APEX: Checkpointing enabled at {self.checkpoint_dir}", Verbosity.NORMAL)
-
-    # --- Logging & progress helpers ---------------------------------------------
 
     def _is_enabled(self, level: Verbosity) -> bool:
         return _verbosity_rank(self.verbosity) >= _verbosity_rank(level)
@@ -493,9 +489,8 @@ class APEX(Teleprompter):
 
         checkpoint_path = self.checkpoint_dir / f"checkpoint_iter_{iteration}.pkl"
         with open(checkpoint_path, "wb") as f:
-            pickle.dump(checkpoint, f)
+            cloudpickle.dump(checkpoint, f)
 
-        # Also save latest checkpoint pointer
         latest_path = self.checkpoint_dir / "latest_checkpoint.json"
         with open(latest_path, "w") as f:
             json.dump({"iteration": iteration, "checkpoint_file": f"checkpoint_iter_{iteration}.pkl"}, f)
@@ -520,7 +515,7 @@ class APEX(Teleprompter):
             return None
 
         with open(checkpoint_path, "rb") as f:
-            checkpoint = pickle.load(f)
+            checkpoint = cloudpickle.load(f)
 
         if not isinstance(checkpoint, ApexCheckpoint):
             raise TypeError(f"Invalid checkpoint type: expected ApexCheckpoint, got {type(checkpoint)}")
@@ -576,7 +571,6 @@ class APEX(Teleprompter):
             )
             self._log(f"APEX: Using seed={self.seed} for reproducibility", Verbosity.HIGH)
 
-            # Evaluate the initial baseline on validation set
             self._log("APEX: Evaluating initial baseline on validation set", Verbosity.NORMAL)
             baseline_candidate = self._evaluate_candidate(
                 program=current_program.deepcopy(),
@@ -604,53 +598,186 @@ class APEX(Teleprompter):
 
         stop_reason = ""
 
-        while True:
-            iteration += 1
+        try:
+            while True:
+                iteration += 1
 
-            if self.max_iterations is not None and iteration > self.max_iterations:
-                stop_reason = "max_iterations"
-                self._log("APEX: Stopping due to max iterations reached", Verbosity.NORMAL)
-                break
-            sampled_train = self._sample_trainset(trainset, iteration)
-            self._log(
-                f"APEX: iteration {iteration} started (train sample={len(sampled_train)}, val size={len(valset)})",
-                Verbosity.NORMAL,
-            )
-            self._log(
-                f"APEX: Sampled {len(sampled_train)} training examples from {len(trainset)} total", Verbosity.HIGH
-            )
-            baseline_for_analysis = current_program.deepcopy()
-            snapshot = self._snapshot_program(baseline_for_analysis)
-
-            failures, successes = self._evaluate_train_examples(baseline_for_analysis, sampled_train)
-            self._log(
-                f"APEX: Train evaluation complete - {len(failures)} failures, {len(successes)} successes",
-                Verbosity.HIGH,
-            )
-
-            if not failures:
+                if self.max_iterations is not None and iteration > self.max_iterations:
+                    stop_reason = "max_iterations"
+                    self._log("APEX: Stopping due to max iterations reached", Verbosity.NORMAL)
+                    break
+                sampled_train = self._sample_trainset(trainset, iteration)
                 self._log(
-                    f"APEX: iteration {iteration} - No failures found! All examples succeeded. Skipping to next iteration.",
+                    f"APEX: iteration {iteration} started (train sample={len(sampled_train)}, val size={len(valset)})",
                     Verbosity.NORMAL,
                 )
+                self._log(
+                    f"APEX: Sampled {len(sampled_train)} training examples from {len(trainset)} total", Verbosity.HIGH
+                )
+                baseline_for_analysis = current_program.deepcopy()
+                snapshot = self._snapshot_program(baseline_for_analysis)
+
+                failures, successes = self._evaluate_train_examples(baseline_for_analysis, sampled_train)
+                self._log(
+                    f"APEX: Train evaluation complete - {len(failures)} failures, {len(successes)} successes",
+                    Verbosity.HIGH,
+                )
+
+                if not failures:
+                    self._log(
+                        f"APEX: iteration {iteration} - No failures found! All examples succeeded. Skipping to next iteration.",
+                        Verbosity.NORMAL,
+                    )
+                    iteration_logs.append(
+                        ApexIterationLog(
+                            iteration=iteration,
+                            sampled_train_size=len(sampled_train),
+                            num_failures=0,
+                            num_successes=len(successes),
+                            hypotheses=[],
+                            candidates=[],
+                        )
+                    )
+                    no_improvement_count += 1
+                    if self.convergence_patience is not None:
+                        if no_improvement_count >= self.convergence_patience:
+                            stop_reason = "patience"
+                            self._log(
+                                "APEX: Stopping due to convergence patience reached (all successes)", Verbosity.NORMAL
+                            )
+                            break
+                    self._save_checkpoint(
+                        iteration=iteration,
+                        current_program=current_program,
+                        best_candidate=best_candidate,
+                        all_candidates=all_candidates,
+                        iteration_logs=iteration_logs,
+                        no_improvement_count=no_improvement_count,
+                        baseline_candidate=baseline_candidate,
+                    )
+                    continue
+
+                failure_summaries = self._analyze_examples(failures, mode="failure")
+                success_summaries = self._analyze_successes(successes, failure_count=len(failure_summaries))
+                if self._is_enabled(Verbosity.HIGH):
+                    self._log(
+                        f"APEX: iteration {iteration} analyzed {len(failure_summaries)} failure(s) and {len(success_summaries)} success(es)",
+                        Verbosity.HIGH,
+                    )
+                    if failure_summaries:
+                        self._log(
+                            f"APEX: Top failure categories: {', '.join({f.category for f in failure_summaries[:5]})}",
+                            Verbosity.HIGH,
+                        )
+
+                hypotheses = self._generate_hypotheses(
+                    failure_summaries=failure_summaries,
+                    success_summaries=success_summaries,
+                    snapshot=snapshot,
+                )
+                self._log(
+                    f"APEX: iteration {iteration} produced {len(hypotheses)} hypothesis(es)",
+                    Verbosity.NORMAL,
+                )
+                if hypotheses and self._is_enabled(Verbosity.NORMAL):
+                    for idx, h in enumerate(hypotheses, start=1):
+                        predictors_updated = list(h.prompt_changes.keys()) if h.prompt_changes else []
+                        self._log(
+                            f"APEX: hypothesis #{idx} - strategy: {h.strategy}, impact: {h.impact_score:.2f}, "
+                            f"updating: {', '.join(predictors_updated) if predictors_updated else 'no predictors'}",
+                            Verbosity.NORMAL,
+                        )
+                if self._is_enabled(Verbosity.HIGH) and hypotheses:
+                    self._log(
+                        "APEX: Detailed hypothesis info follows...",
+                        Verbosity.HIGH,
+                    )
+
+                candidates = self._evaluate_candidates(
+                    baseline=current_program,
+                    hypotheses=hypotheses,
+                    calset=valset,
+                    iteration=iteration,
+                    cached_baseline=current_baseline_candidate if iteration > 1 else None,
+                )
+
+                best_candidate_for_iteration = self._select_best_candidate(candidates)
+
+                all_candidates.extend(candidates)
                 iteration_logs.append(
                     ApexIterationLog(
                         iteration=iteration,
                         sampled_train_size=len(sampled_train),
-                        num_failures=0,
-                        num_successes=len(successes),
-                        hypotheses=[],
-                        candidates=[],
+                        num_failures=len(failure_summaries),
+                        num_successes=len(success_summaries),
+                        hypotheses=hypotheses,
+                        candidates=candidates,
                     )
                 )
-                no_improvement_count += 1
-                if self.convergence_patience is not None:
-                    if no_improvement_count >= self.convergence_patience:
-                        stop_reason = "patience"
+
+                if best_candidate_for_iteration.overall_score > best_candidate.overall_score:
+                    best_candidate = best_candidate_for_iteration
+                    self._log(
+                        f"APEX: New best candidate found with score {best_candidate.overall_score:.4f}",
+                        Verbosity.NORMAL,
+                    )
+                    if best_candidate.hypothesis and best_candidate.hypothesis.prompt_changes:
                         self._log(
-                            "APEX: Stopping due to convergence patience reached (all successes)", Verbosity.NORMAL
+                            f"APEX: Improved {len(best_candidate.hypothesis.prompt_changes)} predictor prompt(s) - strategy: {best_candidate.hypothesis.strategy}",
+                            Verbosity.NORMAL,
                         )
-                        break
+                        if self._is_enabled(Verbosity.HIGH):
+                            self._log(
+                                "APEX: Detailed improved prompts:",
+                                Verbosity.HIGH,
+                            )
+                            for predictor_name, changes in best_candidate.hypothesis.prompt_changes.items():
+                                self._log(
+                                    f"  → {predictor_name}: {changes.new_prompt[:300]}..."
+                                    if len(changes.new_prompt) > 300
+                                    else f"  → {predictor_name}: {changes.new_prompt}",
+                                    Verbosity.HIGH,
+                                )
+
+                baseline_candidate = candidates[0]
+                self._log(
+                    f"APEX: iteration {iteration} best score={best_candidate_for_iteration.overall_score:.4f}",
+                    Verbosity.NORMAL,
+                )
+
+                if self._is_enabled(Verbosity.HIGH):
+                    score_improvements = [c.overall_score - baseline_candidate.overall_score for c in candidates[1:]]
+                    if score_improvements:
+                        self._log(
+                            f"APEX: Score improvements from baseline: {score_improvements}",
+                            Verbosity.HIGH,
+                        )
+
+                if best_candidate_for_iteration is baseline_candidate:
+                    no_improvement_count += 1
+                    if self.convergence_patience is not None:
+                        self._log(
+                            f"APEX: No improvement ({no_improvement_count}/{self.convergence_patience} patience)",
+                            Verbosity.HIGH,
+                        )
+                        if no_improvement_count >= self.convergence_patience:
+                            stop_reason = "patience"
+                            self._log("APEX: Stopping due to convergence patience reached", Verbosity.NORMAL)
+                            break
+                    else:
+                        self._log(
+                            f"APEX: No improvement in iteration {iteration} (patience disabled)",
+                            Verbosity.HIGH,
+                        )
+                else:
+                    no_improvement_count = 0
+                    current_program = best_candidate_for_iteration.program
+                    current_baseline_candidate = best_candidate_for_iteration
+                    self._log(
+                        "APEX: Updating program with hypothesis improvements",
+                        Verbosity.HIGH,
+                    )
+
                 self._save_checkpoint(
                     iteration=iteration,
                     current_program=current_program,
@@ -660,138 +787,23 @@ class APEX(Teleprompter):
                     no_improvement_count=no_improvement_count,
                     baseline_candidate=baseline_candidate,
                 )
-                continue
+        except KeyboardInterrupt:
+            stop_reason = "interrupted"
+            self._log("APEX: Optimization interrupted by user (Ctrl+C)", Verbosity.NORMAL)
 
-            failure_summaries = self._analyze_examples(failures, mode="failure")
-            success_summaries = self._analyze_successes(successes, failure_count=len(failure_summaries))
-            if self._is_enabled(Verbosity.HIGH):
-                self._log(
-                    f"APEX: iteration {iteration} analyzed {len(failure_summaries)} failure(s) and {len(success_summaries)} success(es)",
-                    Verbosity.HIGH,
-                )
-                if failure_summaries:
-                    self._log(
-                        f"APEX: Top failure categories: {', '.join({f.category for f in failure_summaries[:5]})}",
-                        Verbosity.HIGH,
-                    )
-
-            hypotheses = self._generate_hypotheses(
-                failure_summaries=failure_summaries,
-                success_summaries=success_summaries,
-                snapshot=snapshot,
-            )
-            self._log(
-                f"APEX: iteration {iteration} produced {len(hypotheses)} hypothesis(es)",
-                Verbosity.NORMAL,
-            )
-            if hypotheses and self._is_enabled(Verbosity.NORMAL):
-                for idx, h in enumerate(hypotheses, start=1):
-                    predictors_updated = list(h.prompt_changes.keys()) if h.prompt_changes else []
-                    self._log(
-                        f"APEX: hypothesis #{idx} - strategy: {h.strategy}, impact: {h.impact_score:.2f}, "
-                        f"updating: {', '.join(predictors_updated) if predictors_updated else 'no predictors'}",
-                        Verbosity.NORMAL,
-                    )
-            if self._is_enabled(Verbosity.HIGH) and hypotheses:
-                self._log(
-                    "APEX: Detailed hypothesis info follows...",
-                    Verbosity.HIGH,
-                )
-
-            candidates = self._evaluate_candidates(
-                baseline=current_program,
-                hypotheses=hypotheses,
-                calset=valset,
-                iteration=iteration,
-                cached_baseline=current_baseline_candidate if iteration > 1 else None,
-            )
-
-            best_candidate_for_iteration = self._select_best_candidate(candidates)
-
-            all_candidates.extend(candidates)
-            iteration_logs.append(
-                ApexIterationLog(
+            if self.checkpoint_dir:
+                self._save_checkpoint(
                     iteration=iteration,
-                    sampled_train_size=len(sampled_train),
-                    num_failures=len(failure_summaries),
-                    num_successes=len(success_summaries),
-                    hypotheses=hypotheses,
-                    candidates=candidates,
+                    current_program=current_program,
+                    best_candidate=best_candidate,
+                    all_candidates=all_candidates,
+                    iteration_logs=iteration_logs,
+                    no_improvement_count=no_improvement_count,
+                    baseline_candidate=baseline_candidate if "baseline_candidate" in locals() else best_candidate,
                 )
-            )
-
-            if best_candidate_for_iteration.overall_score > best_candidate.overall_score:
-                best_candidate = best_candidate_for_iteration
                 self._log(
-                    f"APEX: New best candidate found with score {best_candidate.overall_score:.4f}",
-                    Verbosity.NORMAL,
+                    f"APEX: Checkpoint saved at iteration {iteration} - resume with resume=True", Verbosity.NORMAL
                 )
-                if best_candidate.hypothesis and best_candidate.hypothesis.prompt_changes:
-                    self._log(
-                        f"APEX: Improved {len(best_candidate.hypothesis.prompt_changes)} predictor prompt(s) - strategy: {best_candidate.hypothesis.strategy}",
-                        Verbosity.NORMAL,
-                    )
-                    if self._is_enabled(Verbosity.HIGH):
-                        self._log(
-                            "APEX: Detailed improved prompts:",
-                            Verbosity.HIGH,
-                        )
-                        for predictor_name, changes in best_candidate.hypothesis.prompt_changes.items():
-                            self._log(
-                                f"  → {predictor_name}: {changes.new_prompt[:300]}..."
-                                if len(changes.new_prompt) > 300
-                                else f"  → {predictor_name}: {changes.new_prompt}",
-                                Verbosity.HIGH,
-                            )
-
-            baseline_candidate = candidates[0]
-            self._log(
-                f"APEX: iteration {iteration} best score={best_candidate_for_iteration.overall_score:.4f}",
-                Verbosity.NORMAL,
-            )
-
-            if self._is_enabled(Verbosity.HIGH):
-                score_improvements = [c.overall_score - baseline_candidate.overall_score for c in candidates[1:]]
-                if score_improvements:
-                    self._log(
-                        f"APEX: Score improvements from baseline: {score_improvements}",
-                        Verbosity.HIGH,
-                    )
-
-            if best_candidate_for_iteration is baseline_candidate:
-                no_improvement_count += 1
-                if self.convergence_patience is not None:
-                    self._log(
-                        f"APEX: No improvement ({no_improvement_count}/{self.convergence_patience} patience)",
-                        Verbosity.HIGH,
-                    )
-                    if no_improvement_count >= self.convergence_patience:
-                        stop_reason = "patience"
-                        self._log("APEX: Stopping due to convergence patience reached", Verbosity.NORMAL)
-                        break
-                else:
-                    self._log(
-                        f"APEX: No improvement in iteration {iteration} (patience disabled)",
-                        Verbosity.HIGH,
-                    )
-            else:
-                no_improvement_count = 0
-                current_program = best_candidate_for_iteration.program
-                current_baseline_candidate = best_candidate_for_iteration
-                self._log(
-                    "APEX: Updating program with hypothesis improvements",
-                    Verbosity.HIGH,
-                )
-
-            self._save_checkpoint(
-                iteration=iteration,
-                current_program=current_program,
-                best_candidate=best_candidate,
-                all_candidates=all_candidates,
-                iteration_logs=iteration_logs,
-                no_improvement_count=no_improvement_count,
-                baseline_candidate=baseline_candidate,
-            )
 
         self._log(
             f"APEX: Optimization complete - stopped after {len(iteration_logs)} iterations ({stop_reason})",
@@ -823,8 +835,6 @@ class APEX(Teleprompter):
             stopped_after=stop_reason,
         )
         return optimized_program
-
-    # --- Train evaluation helpers -------------------------------------------------
 
     def _sample_trainset(self, trainset: Sequence[Example], iteration: int) -> list[Example]:
         if self.train_sample is None:
@@ -937,8 +947,6 @@ class APEX(Teleprompter):
         if isinstance(result, int | float):
             return float(result), None
         raise TypeError(f"Unsupported metric return type: {type(result)}")
-
-    # --- Analysis helpers ---------------------------------------------------------
 
     def _analyze_examples(
         self,
@@ -1054,7 +1062,6 @@ class APEX(Teleprompter):
         # Sort by impact_score (highest first), then by generalizability_score if tied
         validated_specs.sort(key=lambda h: (h.impact_score, h.generalizability_score), reverse=True)
 
-        # Take only the requested number of hypotheses
         validated_specs = validated_specs[: self.num_hypotheses]
 
         if self._is_enabled(Verbosity.HIGH):
@@ -1077,8 +1084,6 @@ class APEX(Teleprompter):
                             Verbosity.HIGH,
                         )
         return validated_specs
-
-    # --- Candidate evaluation -----------------------------------------------------
 
     def _evaluate_candidates(
         self,
@@ -1185,8 +1190,6 @@ class APEX(Teleprompter):
         best_score = max(c.overall_score for c in candidates)
         best_candidates = [c for c in candidates if c.overall_score == best_score]
         return self._rng.choice(best_candidates)
-
-    # --- Snapshot & serialization -------------------------------------------------
 
     def _snapshot_program(self, program: Module) -> ProgramSnapshot:
         prompts: dict[str, str] = {}
