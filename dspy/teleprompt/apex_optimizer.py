@@ -131,6 +131,21 @@ class SuccessAnalysisSignature(Signature):
     )
 
 
+class ChangeMagnitude(str, Enum):
+    """Magnitude of a prompt change."""
+    MINIMAL = "minimal"
+    MODERATE = "moderate"
+    SUBSTANTIAL = "substantial"
+
+
+class PromptChange(BaseModel):
+    """A single prompt change for a predictor."""
+
+    new_prompt: str = Field(description="Complete replacement text for the predictor's prompt")
+    rationale: str = Field(description="Why this change fixes the identified issues")
+    change_magnitude: ChangeMagnitude = Field(description="How significant this change is")
+
+
 class HypothesisSpec(BaseModel):
     """Specification for a hypothesis to improve the program.
 
@@ -153,10 +168,9 @@ class HypothesisSpec(BaseModel):
     expected_impact: str = Field(
         description="Specific prediction of which errors this should fix and why. Be concrete."
     )
-    prompt_changes: dict[str, dict[str, str]] = Field(
+    prompt_changes: dict[str, PromptChange] = Field(
         default_factory=dict,
-        description="Mapping of predictor_name to changes: {new_prompt: complete replacement text, "
-        "rationale: why this fixes issues, change_magnitude: minimal|moderate|substantial}",
+        description="Mapping of predictor_name to PromptChange objects",
     )
 
 
@@ -333,7 +347,7 @@ class APEX(Teleprompter):
         self.analysis_adapter = analysis_adapter or JSONAdapter()
         self.hypothesis_adapter = hypothesis_adapter or JSONAdapter()
 
-        default_threads = num_threads if num_threads is not None else (os.cpu_count() or 0)
+        default_threads = num_threads if num_threads is not None else (os.cpu_count() or 1)
         if default_threads is None or default_threads <= 0:
             default_threads = dspy.settings.num_threads or 1
 
@@ -700,14 +714,12 @@ class APEX(Teleprompter):
                             Verbosity.HIGH,
                         )
                         for predictor_name, changes in best_candidate.hypothesis.prompt_changes.items():
-                            if isinstance(changes, dict) and "new_prompt" in changes:
-                                new_prompt = changes["new_prompt"]
-                                self._log(
-                                    f"  → {predictor_name}: {new_prompt[:300]}..."
-                                    if len(new_prompt) > 300
-                                    else f"  → {predictor_name}: {new_prompt}",
-                                    Verbosity.HIGH,
-                                )
+                            self._log(
+                                f"  → {predictor_name}: {changes.new_prompt[:300]}..."
+                                if len(changes.new_prompt) > 300
+                                else f"  → {predictor_name}: {changes.new_prompt}",
+                                Verbosity.HIGH,
+                            )
 
             baseline_candidate = candidates[0]
             self._log(
@@ -1018,19 +1030,17 @@ class APEX(Teleprompter):
                     Verbosity.HIGH,
                 )
                 for predictor_name, changes in spec.prompt_changes.items():
-                    if isinstance(changes, dict) and "new_prompt" in changes:
-                        new_prompt = changes["new_prompt"]
+                    self._log(
+                        f"  → {predictor_name}: {changes.new_prompt[:200]}..."
+                        if len(changes.new_prompt) > 200
+                        else f"  → {predictor_name}: {changes.new_prompt}",
+                        Verbosity.HIGH,
+                    )
+                    if changes.rationale:
                         self._log(
-                            f"  → {predictor_name}: {new_prompt[:200]}..."
-                            if len(new_prompt) > 200
-                            else f"  → {predictor_name}: {new_prompt}",
+                            f"     Rationale: {changes.rationale}",
                             Verbosity.HIGH,
                         )
-                        if changes.get("rationale"):
-                            self._log(
-                                f"     Rationale: {changes['rationale']}",
-                                Verbosity.HIGH,
-                            )
         return validated_specs[: self.num_hypotheses]
 
     # --- Candidate evaluation -----------------------------------------------------
@@ -1123,8 +1133,7 @@ class APEX(Teleprompter):
             if predictor_name not in name_to_predictor:
                 raise ValueError(f"Hypothesis references unknown predictor '{predictor_name}'.")
             predictor = name_to_predictor[predictor_name]
-            if isinstance(changes, dict) and "new_prompt" in changes:
-                predictor.signature.instructions = changes["new_prompt"]
+            predictor.signature.instructions = changes.new_prompt
         return candidate
 
     def _select_best_candidate(self, candidates: list[CandidateRecord]) -> CandidateRecord:

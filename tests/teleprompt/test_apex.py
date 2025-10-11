@@ -3,7 +3,7 @@ import pytest
 import dspy
 import dspy.teleprompt.apex_optimizer as apex_module
 from dspy import Example
-from dspy.teleprompt.apex_optimizer import APEX, Verbosity
+from dspy.teleprompt.apex_optimizer import APEX, ChangeMagnitude, PromptChange, Verbosity
 from dspy.utils.dummies import DummyLM
 
 
@@ -37,11 +37,11 @@ def make_hypothesis_response(prompt_value: str = "good") -> dict:
                 "strategy": "Rewrite prompt",
                 "expected_impact": "Outputs 'good'",
                 "prompt_changes": {
-                    "predictor": {
-                        "new_prompt": prompt_value,
-                        "rationale": "Align output with expectation",
-                        "change_magnitude": "minimal",
-                    }
+                    "predictor": PromptChange(
+                        new_prompt=prompt_value,
+                        rationale="Align output with expectation",
+                        change_magnitude=ChangeMagnitude.MINIMAL,
+                    )
                 },
             }
         ]
@@ -126,11 +126,11 @@ def test_apex_train_sampling_controls_analysis_calls():
                         "strategy": "swap prompt",
                         "expected_impact": "",
                         "prompt_changes": {
-                            "predictor": {
-                                "new_prompt": "good",
-                                "rationale": "",
-                                "change_magnitude": "minimal",
-                            }
+                            "predictor": PromptChange(
+                                new_prompt="good",
+                                rationale="",
+                                change_magnitude=ChangeMagnitude.MINIMAL,
+                            )
                         },
                     }
                 ]
@@ -291,11 +291,11 @@ def test_apex_trims_hypotheses_to_limit():
                         "strategy": "Rewrite prompt A",
                         "expected_impact": "Outputs 'good'",
                         "prompt_changes": {
-                            "predictor": {
-                                "new_prompt": "good",
-                                "rationale": "Align",
-                                "change_magnitude": "minimal",
-                            }
+                            "predictor": PromptChange(
+                                new_prompt="good",
+                                rationale="Align",
+                                change_magnitude=ChangeMagnitude.MINIMAL,
+                            )
                         },
                     },
                     {
@@ -305,11 +305,11 @@ def test_apex_trims_hypotheses_to_limit():
                         "strategy": "Rewrite prompt B",
                         "expected_impact": "Outputs 'great'",
                         "prompt_changes": {
-                            "predictor": {
-                                "new_prompt": "great",
-                                "rationale": "Align alt",
-                                "change_magnitude": "moderate",
-                            }
+                            "predictor": PromptChange(
+                                new_prompt="great",
+                                rationale="Align alt",
+                                change_magnitude=ChangeMagnitude.MODERATE,
+                            )
                         },
                     },
                 ]
@@ -334,7 +334,7 @@ def test_apex_trims_hypotheses_to_limit():
 
     iteration = optimized.apex_result.iterations[0]
     assert len(iteration.hypotheses) == 1
-    assert iteration.hypotheses[0].prompt_changes["predictor"]["new_prompt"] == "good"
+    assert iteration.hypotheses[0].prompt_changes["predictor"].new_prompt == "good"
 
 
 def test_apex_handles_fewer_successes_than_failures():
@@ -432,7 +432,7 @@ def test_apex_end_to_end_fake_data():
     first_iter, second_iter = result.iterations
     assert first_iter.num_failures == 2 and first_iter.num_successes == 1
     assert len(first_iter.hypotheses) == 1
-    assert first_iter.hypotheses[0].prompt_changes["predictor"]["new_prompt"] == "good"
+    assert first_iter.hypotheses[0].prompt_changes["predictor"].new_prompt == "good"
     assert first_iter.candidates[0].hypothesis is None  # baseline evaluated first
     assert first_iter.candidates[1].hypothesis == first_iter.hypotheses[0]
     assert len(first_iter.candidates[0].per_example_scores) == len(calset)
