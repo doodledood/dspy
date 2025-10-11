@@ -9,31 +9,27 @@ from dspy.utils.dummies import DummyLM
 
 def make_analysis_response(root_cause: str = "Prompt missing correct token") -> dict:
     return {
-        "json_response": {
-            "root_cause": root_cause,
-            "involved_predictors": ["predictor"],
-            "context": "Baseline emits 'bad'",
-            "category": "format_ambiguity",
-            "key_details": "Needs to say good",
-        }
+        "root_cause": root_cause,
+        "involved_predictors": ["predictor"],
+        "context": "Baseline emits 'bad'",
+        "category": "format_ambiguity",
+        "key_details": "Needs to say good",
     }
 
 
 def make_success_response(pattern: str = "Prompt handled well") -> dict:
     return {
-        "json_response": {
-            "success_pattern": pattern,
-            "contributing_predictors": ["predictor"],
-            "context": "Handled correctly",
-            "category": "clear_format_compliance",
-            "key_details": "Keep current instructions",
-        }
+        "success_pattern": pattern,
+        "contributing_predictors": ["predictor"],
+        "context": "Handled correctly",
+        "category": "clear_format_compliance",
+        "key_details": "Keep current instructions",
     }
 
 
 def make_hypothesis_response(prompt_value: str = "good") -> dict:
     return {
-        "json_response": [
+        "hypotheses": [
             {
                 "observation": "Prompt mismatch",
                 "fixable_root_causes": ["Prompt missing correct token"],
@@ -88,8 +84,8 @@ def test_apex_improves_and_tracks_history():
 
     optimizer = APEX(
         metric=metric,
-        analysis_llm=analysis_lm,
-        hypothesis_llm=hypothesis_lm,
+        analysis_lm=analysis_lm,
+        hypothesis_lm=hypothesis_lm,
         max_iterations=5,
         num_hypotheses=1,
         convergence_patience=2,
@@ -122,7 +118,7 @@ def test_apex_train_sampling_controls_analysis_calls():
     hypothesis_lm = DummyLM(
         [
             {
-                "json_response": [
+                "hypotheses": [
                     {
                         "observation": "fix",
                         "fixable_root_causes": ["always wrong"],
@@ -145,8 +141,8 @@ def test_apex_train_sampling_controls_analysis_calls():
 
     optimizer = APEX(
         metric=metric,
-        analysis_llm=analysis_lm,
-        hypothesis_llm=hypothesis_lm,
+        analysis_lm=analysis_lm,
+        hypothesis_lm=hypothesis_lm,
         max_iterations=1,
         num_hypotheses=1,
         train_sample=1,
@@ -174,7 +170,7 @@ def test_apex_sampling_callable_receives_iteration():
     hypothesis_lm = DummyLM(
         [
             {
-                "json_response": [
+                "hypotheses": [
                     {
                         "observation": "fix",
                         "fixable_root_causes": ["wrong"],
@@ -191,8 +187,8 @@ def test_apex_sampling_callable_receives_iteration():
 
     optimizer = APEX(
         metric=metric,
-        analysis_llm=analysis_lm,
-        hypothesis_llm=hypothesis_lm,
+        analysis_lm=analysis_lm,
+        hypothesis_lm=hypothesis_lm,
         max_iterations=1,
         num_hypotheses=1,
         train_sample=sampler,
@@ -233,8 +229,8 @@ def test_apex_uses_configured_num_threads(monkeypatch):
 
     optimizer = APEX(
         metric=metric,
-        analysis_llm=analysis_lm,
-        hypothesis_llm=hypothesis_lm,
+        analysis_lm=analysis_lm,
+        hypothesis_lm=hypothesis_lm,
         max_iterations=1,
         num_hypotheses=1,
         train_sample=None,
@@ -253,7 +249,7 @@ def test_apex_uses_configured_num_threads(monkeypatch):
 
 def test_apex_rejects_invalid_analysis_json():
     analysis_lm = DummyLM(
-        [{"json_response": "not json"}],
+        [{"invalid_field": "missing required fields"}],  # Invalid response, missing required fields
         adapter=dspy.JSONAdapter(),
     )
     hypothesis_lm = DummyLM(
@@ -263,8 +259,8 @@ def test_apex_rejects_invalid_analysis_json():
 
     optimizer = APEX(
         metric=metric,
-        analysis_llm=analysis_lm,
-        hypothesis_llm=hypothesis_lm,
+        analysis_lm=analysis_lm,
+        hypothesis_lm=hypothesis_lm,
         max_iterations=1,
         num_hypotheses=1,
         convergence_patience=1,
@@ -274,7 +270,8 @@ def test_apex_rejects_invalid_analysis_json():
 
     student = PromptDrivenModule(initial_prompt="bad")
     trainset = [make_train_example("x")]
-    with pytest.raises(ValueError):
+    from dspy.utils.exceptions import AdapterParseError
+    with pytest.raises(AdapterParseError):
         optimizer.compile(student, trainset=trainset, valset=trainset)
 
 
@@ -286,7 +283,7 @@ def test_apex_trims_hypotheses_to_limit():
     hypothesis_lm = DummyLM(
         [
             {
-                "json_response": [
+                "hypotheses": [
                     {
                         "observation": "option A",
                         "fixable_root_causes": ["Prompt missing correct token"],
@@ -323,8 +320,8 @@ def test_apex_trims_hypotheses_to_limit():
 
     optimizer = APEX(
         metric=metric,
-        analysis_llm=analysis_lm,
-        hypothesis_llm=hypothesis_lm,
+        analysis_lm=analysis_lm,
+        hypothesis_lm=hypothesis_lm,
         max_iterations=1,
         num_hypotheses=1,
         convergence_patience=1,
@@ -337,7 +334,7 @@ def test_apex_trims_hypotheses_to_limit():
 
     iteration = optimized.apex_result.iterations[0]
     assert len(iteration.hypotheses) == 1
-    assert iteration.hypotheses[0].prompt_changes["predictor"].new_prompt == "good"
+    assert iteration.hypotheses[0].prompt_changes["predictor"]["new_prompt"] == "good"
 
 
 def test_apex_handles_fewer_successes_than_failures():
@@ -364,8 +361,8 @@ def test_apex_handles_fewer_successes_than_failures():
 
     optimizer = APEX(
         metric=mixed_metric,
-        analysis_llm=analysis_lm,
-        hypothesis_llm=hypothesis_lm,
+        analysis_lm=analysis_lm,
+        hypothesis_lm=hypothesis_lm,
         max_iterations=2,
         num_hypotheses=1,
         convergence_patience=1,
@@ -404,15 +401,15 @@ def test_apex_end_to_end_fake_data():
     hypothesis_lm = DummyLM(
         [
             make_hypothesis_response("good"),
-            {"json_response": []},
+            {"hypotheses": []},
         ],
         adapter=dspy.JSONAdapter(),
     )
 
     optimizer = APEX(
         metric=metric,
-        analysis_llm=analysis_lm,
-        hypothesis_llm=hypothesis_lm,
+        analysis_lm=analysis_lm,
+        hypothesis_lm=hypothesis_lm,
         max_iterations=3,
         num_hypotheses=1,
         convergence_patience=1,
@@ -435,7 +432,7 @@ def test_apex_end_to_end_fake_data():
     first_iter, second_iter = result.iterations
     assert first_iter.num_failures == 2 and first_iter.num_successes == 1
     assert len(first_iter.hypotheses) == 1
-    assert first_iter.hypotheses[0].prompt_changes["predictor"].new_prompt == "good"
+    assert first_iter.hypotheses[0].prompt_changes["predictor"]["new_prompt"] == "good"
     assert first_iter.candidates[0].hypothesis is None  # baseline evaluated first
     assert first_iter.candidates[1].hypothesis == first_iter.hypotheses[0]
     assert len(first_iter.candidates[0].per_example_scores) == len(calset)
@@ -449,11 +446,12 @@ def test_apex_end_to_end_fake_data():
         for score in (cand.overall_score for cand in result.all_candidates)
     )
 
-    # Candidate history should contain baseline + new hypothesis + final baseline re-evaluation.
-    assert len(result.all_candidates) == 3
-    assert result.all_candidates[0].hypothesis is None
-    assert result.all_candidates[1].hypothesis is not None
-    assert result.all_candidates[2].hypothesis is None
+    # Candidate history should contain initial baseline + baseline + new hypothesis + final baseline re-evaluation.
+    assert len(result.all_candidates) == 4
+    assert result.all_candidates[0].hypothesis is None  # Initial baseline (iteration 0)
+    assert result.all_candidates[1].hypothesis is None  # First iteration baseline
+    assert result.all_candidates[2].hypothesis is not None  # First iteration hypothesis
+    assert result.all_candidates[3].hypothesis is None  # Second iteration baseline
 
 
 def test_apex_normal_verbosity_logs_candidates_only():
@@ -471,8 +469,8 @@ def test_apex_normal_verbosity_logs_candidates_only():
 
     optimizer = APEX(
         metric=metric,
-        analysis_llm=analysis_lm,
-        hypothesis_llm=hypothesis_lm,
+        analysis_lm=analysis_lm,
+        hypothesis_lm=hypothesis_lm,
         max_iterations=1,
         num_hypotheses=1,
         convergence_patience=1,
@@ -510,8 +508,8 @@ def test_apex_high_verbosity_logs_analysis():
 
     optimizer = APEX(
         metric=metric,
-        analysis_llm=analysis_lm,
-        hypothesis_llm=hypothesis_lm,
+        analysis_lm=analysis_lm,
+        hypothesis_lm=hypothesis_lm,
         max_iterations=1,
         num_hypotheses=1,
         convergence_patience=1,

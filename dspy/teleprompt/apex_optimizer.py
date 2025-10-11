@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
+import pickle
 import random
 from enum import Enum
+from pathlib import Path
 from statistics import median
 from typing import Any, Callable, Iterable, Iterator, Literal, Mapping, Sequence, TypeAlias, TypeVar
 
@@ -11,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from tqdm.auto import tqdm
 
 import dspy
+from dspy.adapters import Adapter, JSONAdapter
 from dspy.clients.lm import LM
 from dspy.primitives import Example, Module, Prediction
 from dspy.signatures import InputField, OutputField, Signature
@@ -255,6 +259,36 @@ class ApexOptimizationResult(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
 
+class CheckpointConfig(BaseModel):
+    """Configuration saved in checkpoint."""
+
+    max_iterations: int | None
+    num_hypotheses: int
+    num_eval_runs: int
+    train_sample: int | None  # Only save if it's an int
+    success_threshold: float
+    min_metric: float
+    max_metric: float
+    convergence_patience: int | None
+    seed: int
+
+
+class ApexCheckpoint(BaseModel):
+    """Checkpoint for resuming APEX optimization."""
+
+    iteration: int
+    current_program: Module
+    best_candidate: CandidateRecord
+    all_candidates: list[CandidateRecord]
+    iteration_logs: list[ApexIterationLog]
+    no_improvement_count: int
+    baseline_candidate: CandidateRecord
+    rng_state: Any  # Random state is opaque
+    config: CheckpointConfig
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+
 class APEX(Teleprompter):
     """APEX teleprompter implementing systematic prompt optimization."""
 
@@ -263,8 +297,10 @@ class APEX(Teleprompter):
         *,
         metric: MetricFn,
         analysis_lm: LM,
+        analysis_adapter: Adapter | None = None,
         max_iterations: int | None = None,
         hypothesis_lm: LM | None = None,
+        hypothesis_adapter: Adapter | None = None,
         verbosity: Verbosity | str | None = None,
         num_threads: int | None = None,
         num_hypotheses: int = 1,
@@ -275,6 +311,7 @@ class APEX(Teleprompter):
         max_metric: float = 1.0,
         convergence_patience: int | None = 3,
         seed: int | None = None,
+        checkpoint_dir: str | Path | None = None,
     ) -> None:
         # Validation: ensure at least one stopping condition is set
         if max_iterations is None and convergence_patience is None:
@@ -293,9 +330,13 @@ class APEX(Teleprompter):
         self.metric = metric
         self.analysis_lm = analysis_lm
         self.hypothesis_lm = hypothesis_lm or analysis_lm
+        self.analysis_adapter = analysis_adapter or JSONAdapter()
+        self.hypothesis_adapter = hypothesis_adapter or JSONAdapter()
+
         default_threads = num_threads if num_threads is not None else (os.cpu_count() or 0)
         if default_threads is None or default_threads <= 0:
             default_threads = dspy.settings.num_threads or 1
+
         self.num_threads = max(1, int(default_threads))
         self.max_iterations = max_iterations
         self.num_hypotheses = num_hypotheses
@@ -308,6 +349,12 @@ class APEX(Teleprompter):
         self.convergence_patience = convergence_patience
         self.seed = seed if seed is not None else random.randint(1, 1_000_000)
         self._rng = random.Random(self.seed)
+
+        # Setup checkpointing
+        self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
+        if self.checkpoint_dir:
+            self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            self._log(f"APEX: Checkpointing enabled at {self.checkpoint_dir}", Verbosity.NORMAL)
 
     # --- Logging & progress helpers ---------------------------------------------
 
@@ -329,7 +376,7 @@ class APEX(Teleprompter):
                 logger.debug(message)
             elif log_level == "error":
                 logger.error(message)
-            else:  # "info" or default
+            else:
                 logger.info(message)
 
     def _parallel_execute(
@@ -373,6 +420,81 @@ class APEX(Teleprompter):
         with tqdm(iterable, total=progress_total, desc=description, leave=False) as progress:
             yield from progress
 
+    def _save_checkpoint(
+        self,
+        iteration: int,
+        current_program: Module,
+        best_candidate: CandidateRecord,
+        all_candidates: list[CandidateRecord],
+        iteration_logs: list[ApexIterationLog],
+        no_improvement_count: int,
+        baseline_candidate: CandidateRecord,
+    ) -> None:
+        """Save checkpoint to disk."""
+        if not self.checkpoint_dir:
+            return
+
+        config = CheckpointConfig(
+            max_iterations=self.max_iterations,
+            num_hypotheses=self.num_hypotheses,
+            num_eval_runs=self.num_eval_runs,
+            train_sample=self.train_sample if isinstance(self.train_sample, int) else None,
+            success_threshold=self.success_threshold,
+            min_metric=self.min_metric,
+            max_metric=self.max_metric,
+            convergence_patience=self.convergence_patience,
+            seed=self.seed,
+        )
+
+        checkpoint = ApexCheckpoint(
+            iteration=iteration,
+            current_program=current_program,
+            best_candidate=best_candidate,
+            all_candidates=all_candidates,
+            iteration_logs=iteration_logs,
+            no_improvement_count=no_improvement_count,
+            baseline_candidate=baseline_candidate,
+            rng_state=self._rng.getstate(),
+            config=config,
+        )
+
+        checkpoint_path = self.checkpoint_dir / f"checkpoint_iter_{iteration}.pkl"
+        with open(checkpoint_path, "wb") as f:
+            pickle.dump(checkpoint, f)
+
+        # Also save latest checkpoint pointer
+        latest_path = self.checkpoint_dir / "latest_checkpoint.json"
+        with open(latest_path, "w") as f:
+            json.dump({"iteration": iteration, "checkpoint_file": f"checkpoint_iter_{iteration}.pkl"}, f)
+
+        self._log(f"APEX: Saved checkpoint at iteration {iteration}", Verbosity.HIGH)
+
+    def _load_checkpoint(self) -> ApexCheckpoint | None:
+        """Load the latest checkpoint if it exists."""
+        if not self.checkpoint_dir:
+            return None
+
+        latest_path = self.checkpoint_dir / "latest_checkpoint.json"
+        if not latest_path.exists():
+            return None
+
+        with open(latest_path) as f:
+            latest_info = json.load(f)
+
+        checkpoint_path = self.checkpoint_dir / latest_info["checkpoint_file"]
+        if not checkpoint_path.exists():
+            self._log(f"APEX: Checkpoint file {checkpoint_path} not found", Verbosity.HIGH, "warning")
+            return None
+
+        with open(checkpoint_path, "rb") as f:
+            checkpoint = pickle.load(f)
+
+        if not isinstance(checkpoint, ApexCheckpoint):
+            raise TypeError(f"Invalid checkpoint type: expected ApexCheckpoint, got {type(checkpoint)}")
+
+        self._log(f"APEX: Loaded checkpoint from iteration {checkpoint.iteration}", Verbosity.NORMAL)
+        return checkpoint
+
     def compile(
         self,
         student: Module,
@@ -380,6 +502,7 @@ class APEX(Teleprompter):
         trainset: list[Example],
         teacher: Module | None = None,
         valset: list[Example] | None = None,
+        resume: bool = False,
     ) -> Module:
         if teacher is not None:
             raise ValueError("APEX does not support teacher programs.")
@@ -388,42 +511,67 @@ class APEX(Teleprompter):
         if not valset:
             raise ValueError("calibration set (valset) must be provided and non-empty.")
 
-        current_program = student.deepcopy()
-        assert not getattr(current_program, "_compiled", False), "Student must be uncompiled."
+        checkpoint = None
+        if resume and self.checkpoint_dir:
+            checkpoint = self._load_checkpoint()
 
-        all_candidates: list[CandidateRecord] = []
-        iteration_logs: list[ApexIterationLog] = []
+        if checkpoint:
+            current_program = checkpoint.current_program
+            all_candidates = checkpoint.all_candidates
+            iteration_logs = checkpoint.iteration_logs
+            best_candidate = checkpoint.best_candidate
+            baseline_candidate = checkpoint.baseline_candidate
+            no_improvement_count = checkpoint.no_improvement_count
+            iteration = checkpoint.iteration
+            self._rng.setstate(checkpoint.rng_state)
+            self._log(f"APEX: Resuming from iteration {iteration}", Verbosity.NORMAL)
+        else:
+            current_program = student.deepcopy()
+            assert not getattr(current_program, "_compiled", False), "Student must be uncompiled."
 
-        self._log(f"APEX: running with num_threads={self.num_threads}", Verbosity.NORMAL)
-        max_iter_str = f"{self.max_iterations}" if self.max_iterations is not None else "until convergence"
-        patience_str = f"{self.convergence_patience}" if self.convergence_patience is not None else "disabled"
-        self._log(
-            f"APEX: Configuration - max_iterations={max_iter_str}, num_hypotheses={self.num_hypotheses}, "
-            f"success_threshold={self.success_threshold:.2f}, convergence_patience={patience_str}",
-            Verbosity.HIGH,
-        )
-        self._log(f"APEX: Using seed={self.seed} for reproducibility", Verbosity.HIGH)
+            all_candidates: list[CandidateRecord] = []
+            iteration_logs: list[ApexIterationLog] = []
 
-        # Evaluate the initial baseline on validation set
-        self._log("APEX: Evaluating initial baseline on validation set", Verbosity.NORMAL)
-        baseline_candidate = self._evaluate_candidate(
-            program=current_program.deepcopy(),
-            calset=valset,
-            iteration=0,
-            hypothesis=None,
-        )
-        all_candidates.append(baseline_candidate)
-        best_candidate = baseline_candidate
-        self._log(f"APEX: Initial baseline score={baseline_candidate.overall_score:.4f}", Verbosity.NORMAL)
+            self._log(f"APEX: running with num_threads={self.num_threads}", Verbosity.NORMAL)
+            max_iter_str = f"{self.max_iterations}" if self.max_iterations is not None else "until convergence"
+            patience_str = f"{self.convergence_patience}" if self.convergence_patience is not None else "disabled"
+            self._log(
+                f"APEX: Configuration - max_iterations={max_iter_str}, num_hypotheses={self.num_hypotheses}, "
+                f"success_threshold={self.success_threshold:.2f}, convergence_patience={patience_str}",
+                Verbosity.HIGH,
+            )
+            self._log(f"APEX: Using seed={self.seed} for reproducibility", Verbosity.HIGH)
 
-        no_improvement_count = 0
+            # Evaluate the initial baseline on validation set
+            self._log("APEX: Evaluating initial baseline on validation set", Verbosity.NORMAL)
+            baseline_candidate = self._evaluate_candidate(
+                program=current_program.deepcopy(),
+                calset=valset,
+                iteration=0,
+                hypothesis=None,
+            )
+            all_candidates.append(baseline_candidate)
+            best_candidate = baseline_candidate
+            self._log(f"APEX: Initial baseline score={baseline_candidate.overall_score:.4f}", Verbosity.NORMAL)
+
+            no_improvement_count = 0
+            iteration = 0
+
+            self._save_checkpoint(
+                iteration=0,
+                current_program=current_program,
+                best_candidate=best_candidate,
+                all_candidates=all_candidates,
+                iteration_logs=iteration_logs,
+                no_improvement_count=no_improvement_count,
+                baseline_candidate=baseline_candidate,
+            )
+
         stop_reason = ""
-        iteration = 0
 
         while True:
             iteration += 1
 
-            # Check max_iterations stopping condition
             if self.max_iterations is not None and iteration > self.max_iterations:
                 stop_reason = "max_iterations"
                 self._log("APEX: Stopping due to max iterations reached", Verbosity.NORMAL)
@@ -445,13 +593,11 @@ class APEX(Teleprompter):
                 Verbosity.HIGH,
             )
 
-            # If no failures, log and continue to next iteration
             if not failures:
                 self._log(
                     f"APEX: iteration {iteration} - No failures found! All examples succeeded. Skipping to next iteration.",
                     Verbosity.NORMAL,
                 )
-                # Create an empty candidate record for this iteration
                 iteration_logs.append(
                     ApexIterationLog(
                         iteration=iteration,
@@ -462,7 +608,6 @@ class APEX(Teleprompter):
                         candidates=[],
                     )
                 )
-                # Count this as no improvement
                 no_improvement_count += 1
                 if self.convergence_patience is not None:
                     if no_improvement_count >= self.convergence_patience:
@@ -471,6 +616,15 @@ class APEX(Teleprompter):
                             "APEX: Stopping due to convergence patience reached (all successes)", Verbosity.NORMAL
                         )
                         break
+                self._save_checkpoint(
+                    iteration=iteration,
+                    current_program=current_program,
+                    best_candidate=best_candidate,
+                    all_candidates=all_candidates,
+                    iteration_logs=iteration_logs,
+                    no_improvement_count=no_improvement_count,
+                    baseline_candidate=baseline_candidate,
+                )
                 continue
 
             failure_summaries = self._analyze_examples(failures, mode="failure")
@@ -495,7 +649,6 @@ class APEX(Teleprompter):
                 f"APEX: iteration {iteration} produced {len(hypotheses)} hypothesis(es)",
                 Verbosity.NORMAL,
             )
-            # Show hypothesis summary at NORMAL level
             if hypotheses and self._is_enabled(Verbosity.NORMAL):
                 for idx, h in enumerate(hypotheses, start=1):
                     predictors_updated = list(h.prompt_changes.keys()) if h.prompt_changes else []
@@ -534,16 +687,13 @@ class APEX(Teleprompter):
                 best_candidate = best_candidate_for_iteration
                 self._log(
                     f"APEX: New best candidate found with score {best_candidate.overall_score:.4f}",
-                    Verbosity.NORMAL,  # Changed to NORMAL so it's always visible
+                    Verbosity.NORMAL,
                 )
-                # Log the improved prompts per predictor
                 if best_candidate.hypothesis and best_candidate.hypothesis.prompt_changes:
-                    # Show a summary at NORMAL level
                     self._log(
                         f"APEX: Improved {len(best_candidate.hypothesis.prompt_changes)} predictor prompt(s) - strategy: {best_candidate.hypothesis.strategy}",
                         Verbosity.NORMAL,
                     )
-                    # Show full prompts at HIGH level
                     if self._is_enabled(Verbosity.HIGH):
                         self._log(
                             "APEX: Detailed improved prompts:",
@@ -596,6 +746,16 @@ class APEX(Teleprompter):
                     "APEX: Updating program with hypothesis improvements",
                     Verbosity.HIGH,
                 )
+
+            self._save_checkpoint(
+                iteration=iteration,
+                current_program=current_program,
+                best_candidate=best_candidate,
+                all_candidates=all_candidates,
+                iteration_logs=iteration_logs,
+                no_improvement_count=no_improvement_count,
+                baseline_candidate=baseline_candidate,
+            )
 
         self._log(
             f"APEX: Optimization complete - stopped after {len(iteration_logs)} iterations ({stop_reason})",
@@ -754,16 +914,15 @@ class APEX(Teleprompter):
 
         signature_class = FailureAnalysisSignature if mode == "failure" else SuccessAnalysisSignature
         analysis_lm = self.analysis_lm
+        analysis_adapter = self.analysis_adapter
 
         def process(record: TrainExampleRecord) -> Prediction:
-            with dspy.context(lm=analysis_lm):
+            with dspy.context(lm=analysis_lm, adapter=analysis_adapter):
                 predictor = dspy.Predict(signature_class)
 
-                # Get input data from the example
                 inputs = record.example.inputs().toDict()
                 expected = record.example.labels().toDict()
 
-                # Prepare input based on signature
                 if mode == "failure":
                     result = predictor(
                         problem=str(inputs),
@@ -831,7 +990,6 @@ class APEX(Teleprompter):
             Verbosity.HIGH,
         )
 
-        # Format the analyses for the hypothesis generation
         failure_text = "\n".join([f"- {f.root_cause} (category: {f.category})" for f in failure_summaries])
         success_text = (
             "\n".join([f"- {s.success_pattern} (category: {s.category})" for s in success_summaries])
@@ -846,13 +1004,12 @@ class APEX(Teleprompter):
             ]
         )
 
-        with dspy.context(lm=self.hypothesis_lm):
+        with dspy.context(lm=self.hypothesis_lm, adapter=self.hypothesis_adapter):
             predictor = dspy.Predict(HypothesisGenerationSignature)
             result = predictor(
                 failure_analyses=failure_text, success_analyses=success_text, current_prompts=prompt_text
             )
 
-        # Get the hypotheses directly from the typed result
         validated_specs = result.hypotheses if result.hypotheses else []
         if self._is_enabled(Verbosity.HIGH):
             for idx, spec in enumerate(validated_specs, start=1):
@@ -860,7 +1017,6 @@ class APEX(Teleprompter):
                     f"APEX: hypothesis #{idx} ({spec.strategy}) targeting {', '.join(spec.fixable_root_causes) or 'no fixable causes'}",
                     Verbosity.HIGH,
                 )
-                # Log the actual prompt changes per predictor
                 for predictor_name, changes in spec.prompt_changes.items():
                     if isinstance(changes, dict) and "new_prompt" in changes:
                         new_prompt = changes["new_prompt"]
@@ -938,7 +1094,6 @@ class APEX(Teleprompter):
             for _ in range(self.num_eval_runs):
                 with dspy.settings.context(trace=[]):
                     prediction = program(**example.inputs().toDict())
-                    prediction = self._sanitize_prediction(prediction)
                     trace_entries = list(dspy.settings.trace or [])
                 score, _ = self._evaluate_metric(example, prediction, trace_entries)
                 score = max(self.min_metric, min(self.max_metric, score))
@@ -968,7 +1123,6 @@ class APEX(Teleprompter):
             if predictor_name not in name_to_predictor:
                 raise ValueError(f"Hypothesis references unknown predictor '{predictor_name}'.")
             predictor = name_to_predictor[predictor_name]
-            # changes is a dict with 'new_prompt' and optionally 'rationale'
             if isinstance(changes, dict) and "new_prompt" in changes:
                 predictor.signature.instructions = changes["new_prompt"]
         return candidate
