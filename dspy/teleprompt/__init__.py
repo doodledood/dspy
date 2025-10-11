@@ -1,3 +1,4 @@
+from dspy.teleprompt.apex_optimizer import APEX
 from dspy.teleprompt.avatar_optimizer import AvatarOptimizer
 from dspy.teleprompt.bettertogether import BetterTogether
 from dspy.teleprompt.bootstrap import BootstrapFewShot
@@ -18,6 +19,7 @@ from .gepa.gepa import GEPA
 
 __all__ = [
     "AvatarOptimizer",
+    "APEX",
     "BetterTogether",
     "BootstrapFewShot",
     "BootstrapFinetune",
