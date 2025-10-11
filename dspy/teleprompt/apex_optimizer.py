@@ -6,18 +6,18 @@ import random
 from statistics import median
 from typing import Any, Callable, Iterable, Mapping, Sequence, TypeAlias, TypeVar, cast
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
 
 import dspy
-from dspy.signatures import InputField, OutputField
+from dspy.adapters import JSONAdapter
 from dspy.clients.lm import LM
 from dspy.primitives import Example, Module, Prediction
+from dspy.signatures import InputField, OutputField
 from dspy.teleprompt.prompts import render_failure_prompt, render_hypothesis_prompt, render_success_prompt
 from dspy.teleprompt.teleprompt import Teleprompter
 
 logger = logging.getLogger(__name__)
 
-JsonValue: TypeAlias = str | int | float | bool | None | list["JsonValue"] | dict[str, "JsonValue"]
 JsonObject: TypeAlias = dict[str, JsonValue]
 TraceEntry: TypeAlias = tuple[Any, Mapping[str, Any], Prediction]
 
@@ -28,7 +28,7 @@ SamplerFn = Callable[[list[Example], int], list[Example]]
 
 class JsonResponseSignature(dspy.Signature):
     analysis_prompt: str = InputField(desc="Fully formatted prompt to send to the language model.")
-    json_response: str = OutputField(desc="Strict JSON object or array encoded as text.")
+    json_response: JsonValue = OutputField(desc="Strict JSON object or array encoded as text.")
 
 
 class FailureAnalysis(BaseModel):
@@ -48,22 +48,22 @@ class SuccessAnalysis(BaseModel):
 
 
 class FailureExamplePayload(BaseModel):
-    input: JsonObject
-    expected: JsonObject
-    prediction: JsonObject | None
+    input: JsonValue
+    expected: JsonValue
+    prediction: JsonValue | None
     metric_score: float
     metric_feedback: str | None = None
-    trace: list['PredictorTraceRecord']
+    trace: list[PredictorTraceRecord]
     error: str | None = None
 
 
 class SuccessExamplePayload(BaseModel):
-    input: JsonObject
-    expected: JsonObject
-    prediction: JsonObject | None
+    input: JsonValue
+    expected: JsonValue
+    prediction: JsonValue | None
     metric_score: float
     metric_feedback: str | None = None
-    trace: list['PredictorTraceRecord']
+    trace: list[PredictorTraceRecord]
 
 
 class FailurePromptPayload(BaseModel):
@@ -95,17 +95,17 @@ class HypothesisPromptPayload(BaseModel):
 class PredictorTraceRecord(BaseModel):
     name: str
     prompt: str
-    inputs: JsonObject
-    outputs: JsonObject
+    inputs: JsonValue
+    outputs: JsonValue
 
     model_config = ConfigDict(frozen=True)
 
 
 class TrainExampleRecord(BaseModel):
     example: Example
-    inputs: JsonObject
-    expected: JsonObject
-    prediction: JsonObject | None
+    inputs: JsonValue
+    expected: JsonValue
+    prediction: JsonValue | None
     metric_score: float
     metric_feedback: str | None = None
     is_success: bool
@@ -114,7 +114,7 @@ class TrainExampleRecord(BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    def failure_payload(self, snapshot: "ProgramSnapshot", success_threshold: float) -> "FailurePromptPayload":
+    def failure_payload(self, snapshot: ProgramSnapshot, success_threshold: float) -> FailurePromptPayload:
         return FailurePromptPayload(
             program_structure=snapshot.structure,
             predictor_flow=snapshot.flow_description,
@@ -131,7 +131,7 @@ class TrainExampleRecord(BaseModel):
             success_threshold=success_threshold,
         )
 
-    def success_payload(self, snapshot: "ProgramSnapshot", success_threshold: float) -> "SuccessPromptPayload":
+    def success_payload(self, snapshot: ProgramSnapshot, success_threshold: float) -> SuccessPromptPayload:
         return SuccessPromptPayload(
             program_structure=snapshot.structure,
             predictor_flow=snapshot.flow_description,
@@ -207,9 +207,10 @@ class APEX(Teleprompter):
         self,
         *,
         metric: MetricFn,
-        analysis_lm: LM,
+        analysis_llm: LM | None = None,
+        analysis_lm: LM | None = None,
         max_iterations: int,
-        hypothesis_lm: LM | None = None,
+        hypothesis_llm: LM | None = None,
         num_hypotheses: int = 1,
         num_eval_runs: int = 1,
         train_sample: None | int | SamplerFn = None,
@@ -230,9 +231,17 @@ class APEX(Teleprompter):
         if min_metric > max_metric:
             raise ValueError("min_metric cannot exceed max_metric.")
 
+        analysis_model = analysis_llm or analysis_lm
+        if analysis_model is None:
+            raise ValueError("analysis_llm must be provided.")
+        if analysis_llm is not None and analysis_lm is not None and analysis_llm is not analysis_lm:
+            raise ValueError("Provide only one of analysis_llm or analysis_lm.")
+
+        hypothesis_model = hypothesis_llm or analysis_model
+
         self.metric = metric
-        self.analysis_lm = analysis_lm
-        self.hypothesis_lm = hypothesis_lm or analysis_lm
+        self.analysis_lm = analysis_model
+        self.hypothesis_lm = hypothesis_model
         self.max_iterations = max_iterations
         self.num_hypotheses = num_hypotheses
         self.num_eval_runs = num_eval_runs
@@ -243,8 +252,11 @@ class APEX(Teleprompter):
         self.convergence_patience = convergence_patience
         self.seed = seed if seed is not None else random.randint(1, 1_000_000)
         self._rng = random.Random(self.seed)
-        self._analysis_predictor = dspy.Predict(JsonResponseSignature, lm=analysis_lm)
-        self._hypothesis_predictor = dspy.Predict(JsonResponseSignature, lm=hypothesis_lm or analysis_lm)
+        self._analysis_predictor = dspy.Predict(JsonResponseSignature, lm=analysis_model)
+        self._hypothesis_predictor = dspy.Predict(JsonResponseSignature, lm=hypothesis_model)
+        self._analysis_predictor.lm = analysis_model
+        self._hypothesis_predictor.lm = hypothesis_model
+        self._json_adapter = JSONAdapter()
 
     def compile(
         self,
@@ -483,8 +495,10 @@ class APEX(Teleprompter):
                 else record.success_payload(snapshot, success_threshold)
             )
             prompt = prompt_builder(payload)
-            json_obj = self._call_predictor_json(self._analysis_predictor, prompt)
-            analyses.append(target_model.model_validate(json_obj))
+            with dspy.settings.context(adapter=self._json_adapter):
+                prediction = self._analysis_predictor(analysis_prompt=prompt)
+            json_payload = self._normalize_json_response(prediction.json_response)
+            analyses.append(target_model.model_validate(json_payload))
         return analyses
 
     def _analyze_successes(
@@ -530,7 +544,9 @@ class APEX(Teleprompter):
             num_hypotheses=self.num_hypotheses,
         )
         prompt = self._build_hypothesis_prompt(payload)
-        data = self._call_predictor_json(self._hypothesis_predictor, prompt)
+        with dspy.settings.context(adapter=self._json_adapter):
+            prediction = self._hypothesis_predictor(analysis_prompt=prompt)
+        data = self._normalize_json_response(prediction.json_response)
         if not isinstance(data, list):
             raise ValueError("APEX expected a JSON array of hypotheses.")
         specs: list[HypothesisSpec] = []
@@ -664,7 +680,7 @@ class APEX(Teleprompter):
         return self._serialize_mapping(prediction.toDict())
 
     def _serialize_value(self, value: Any) -> JsonValue:
-        if isinstance(value, (str, int, float, bool)) or value is None:
+        if isinstance(value, str | int | float | bool) or value is None:
             return value
         if isinstance(value, list):
             return [self._serialize_value(v) for v in value]
@@ -689,17 +705,8 @@ class APEX(Teleprompter):
     def _build_hypothesis_prompt(self, payload: HypothesisPromptPayload) -> str:
         return render_hypothesis_prompt(payload.model_dump())
 
-    def _call_predictor_json(self, predictor: Module, prompt: str) -> JsonValue:
-        prediction = predictor(analysis_prompt=prompt)
-        response = getattr(prediction, "json_response", None)
-        if response is None:
-            raise ValueError("Predictor did not return a 'json_response' field.")
-        return self._coerce_json_data(response)
-
-    def _coerce_json_data(self, response: Any) -> JsonValue:
-        if isinstance(response, dict):
-            return cast(JsonValue, response)
-        if isinstance(response, list):
+    def _normalize_json_response(self, response: JsonValue | str) -> JsonValue:
+        if isinstance(response, dict | list):
             return cast(JsonValue, response)
         if isinstance(response, str):
             candidate = response.strip()
@@ -709,8 +716,10 @@ class APEX(Teleprompter):
                 if newline != -1:
                     candidate = candidate[newline + 1 :]
             try:
-                return cast(JsonValue, json.loads(candidate))
+                loaded = json.loads(candidate)
             except json.JSONDecodeError as exc:  # pragma: no cover - debug aid
                 raise ValueError("APEX expected JSON output from language model.") from exc
+            if not isinstance(loaded, dict | list):
+                raise TypeError("APEX expected a JSON object or array from language model.")
+            return cast(JsonValue, loaded)
         raise TypeError("APEX expected a JSON object or array from language model.")
-

@@ -1,10 +1,42 @@
-import json
-
 import pytest
 
 import dspy
 from dspy import Example
 from dspy.teleprompt.apex_optimizer import APEX
+from dspy.utils.dummies import DummyLM
+
+
+def make_analysis_response(root_cause: str = "Prompt missing correct token") -> dict:
+    return {
+        "json_response": {
+            "root_cause": root_cause,
+            "involved_predictors": ["predictor"],
+            "context": "Baseline emits 'bad'",
+            "category": "format_ambiguity",
+            "key_details": "Needs to say good",
+        }
+    }
+
+
+def make_hypothesis_response(prompt_value: str = "good") -> dict:
+    return {
+        "json_response": [
+            {
+                "observation": "Prompt mismatch",
+                "fixable_root_causes": ["Prompt missing correct token"],
+                "non_fixable_root_causes": [],
+                "strategy": "Rewrite prompt",
+                "expected_impact": "Outputs 'good'",
+                "prompt_changes": {
+                    "predictor": {
+                        "new_prompt": prompt_value,
+                        "rationale": "Align output with expectation",
+                        "change_magnitude": "minimal",
+                    }
+                },
+            }
+        ]
+    }
 
 
 class PromptDrivenModule(dspy.Module):
@@ -28,61 +60,23 @@ def metric(example: Example, prediction: dspy.Prediction, trace) -> float:
     return 1.0 if expected == predicted else 0.0
 
 
-class LinearResponder:
-    """Deterministic responder returning predefined JSON payloads in order."""
-
-    def __init__(self, responses: list[dict]):
-        self._responses = responses
-        self.call_count = 0
-
-    def __call__(self, prompt: str | None = None):
-        if self.call_count >= len(self._responses):
-            raise RuntimeError("Responder exhausted responses.")
-        payload = self._responses[self.call_count]
-        self.call_count += 1
-        return json.dumps(payload)
-
-
 def test_apex_improves_and_tracks_history():
     trainset = [make_train_example("x"), make_train_example("y")]
     calset = trainset
 
-    failure_responses = [
-        {
-            "root_cause": "Prompt missing correct token",
-            "involved_predictors": ["predictor"],
-            "context": "Baseline emits 'bad'",
-            "category": "format_ambiguity",
-            "key_details": "Needs to say good",
-        }
-        for _ in range(len(trainset))
-    ]
-    analysis_responder = LinearResponder(failure_responses)
-    hypothesis_responder = LinearResponder(
-        [
-            [
-                {
-                    "observation": "Prompt mismatch",
-                    "fixable_root_causes": ["Prompt missing correct token"],
-                    "non_fixable_root_causes": [],
-                    "strategy": "Rewrite prompt",
-                    "expected_impact": "Outputs 'good'",
-                    "prompt_changes": {
-                        "predictor": {
-                            "new_prompt": "good",
-                            "rationale": "Align output with expectation",
-                            "change_magnitude": "minimal",
-                        }
-                    },
-                }
-            ]
-        ]
+    analysis_lm = DummyLM(
+        [make_analysis_response() for _ in range(len(trainset))],
+        adapter=dspy.JSONAdapter(),
+    )
+    hypothesis_lm = DummyLM(
+        [make_hypothesis_response()],
+        adapter=dspy.JSONAdapter(),
     )
 
     optimizer = APEX(
         metric=metric,
-        analysis_llm=analysis_responder,
-        hypothesis_llm=hypothesis_responder,
+        analysis_llm=analysis_lm,
+        hypothesis_llm=hypothesis_lm,
         max_iterations=5,
         num_hypotheses=1,
         convergence_patience=2,
@@ -107,42 +101,38 @@ def test_apex_train_sampling_controls_analysis_calls():
     trainset = [make_train_example(str(i)) for i in range(6)]
     calset = trainset[:2]
 
-    analysis_responder = LinearResponder(
+    analysis_lm = DummyLM(
+        [make_analysis_response("always wrong")],
+        adapter=dspy.JSONAdapter(),
+    )
+    hypothesis_lm = DummyLM(
         [
             {
-                "root_cause": "always wrong",
-                "involved_predictors": ["predictor"],
-                "context": "",
-                "category": "generic",
-                "key_details": "",
+                "json_response": [
+                    {
+                        "observation": "fix",
+                        "fixable_root_causes": ["always wrong"],
+                        "non_fixable_root_causes": [],
+                        "strategy": "swap prompt",
+                        "expected_impact": "",
+                        "prompt_changes": {
+                            "predictor": {
+                                "new_prompt": "good",
+                                "rationale": "",
+                                "change_magnitude": "minimal",
+                            }
+                        },
+                    }
+                ]
             }
-        ]
-    )
-    hypothesis_responder = LinearResponder(
-        [
-            [
-                {
-                    "observation": "fix",
-                    "fixable_root_causes": ["always wrong"],
-                    "non_fixable_root_causes": [],
-                    "strategy": "swap prompt",
-                    "expected_impact": "",
-                    "prompt_changes": {
-                        "predictor": {
-                            "new_prompt": "good",
-                            "rationale": "",
-                            "change_magnitude": "minimal",
-                        }
-                    },
-                }
-            ]
-        ]
+        ],
+        adapter=dspy.JSONAdapter(),
     )
 
     optimizer = APEX(
         metric=metric,
-        analysis_llm=analysis_responder,
-        hypothesis_llm=hypothesis_responder,
+        analysis_llm=analysis_lm,
+        hypothesis_llm=hypothesis_lm,
         max_iterations=1,
         num_hypotheses=1,
         train_sample=1,
@@ -154,7 +144,7 @@ def test_apex_train_sampling_controls_analysis_calls():
     student = PromptDrivenModule(initial_prompt="bad")
     optimizer.compile(student, trainset=trainset, valset=calset)
 
-    assert analysis_responder.call_count == 1
+    assert len(analysis_lm.history) == 1
 
 
 def test_apex_sampling_callable_receives_iteration():
@@ -162,43 +152,32 @@ def test_apex_sampling_callable_receives_iteration():
         assert iteration == 1
         return dataset[:2]
 
-    analysis_responder = LinearResponder(
-        [
-            {
-                "root_cause": "wrong",
-                "involved_predictors": ["predictor"],
-                "context": "",
-                "category": "generic",
-                "key_details": "",
-            },
-            {
-                "root_cause": "wrong",
-                "involved_predictors": ["predictor"],
-                "context": "",
-                "category": "generic",
-                "key_details": "",
-            },
-        ]
+    analysis_lm = DummyLM(
+        [make_analysis_response("wrong") for _ in range(2)],
+        adapter=dspy.JSONAdapter(),
     )
-    hypothesis_responder = LinearResponder(
+    hypothesis_lm = DummyLM(
         [
-            [
-                {
-                    "observation": "fix",
-                    "fixable_root_causes": ["wrong"],
-                    "non_fixable_root_causes": [],
-                    "strategy": "",
-                    "expected_impact": "",
-                    "prompt_changes": {},
-                }
-            ]
-        ]
+            {
+                "json_response": [
+                    {
+                        "observation": "fix",
+                        "fixable_root_causes": ["wrong"],
+                        "non_fixable_root_causes": [],
+                        "strategy": "",
+                        "expected_impact": "",
+                        "prompt_changes": {},
+                    }
+                ]
+            }
+        ],
+        adapter=dspy.JSONAdapter(),
     )
 
     optimizer = APEX(
         metric=metric,
-        analysis_llm=analysis_responder,
-        hypothesis_llm=hypothesis_responder,
+        analysis_llm=analysis_lm,
+        hypothesis_llm=hypothesis_lm,
         max_iterations=1,
         num_hypotheses=1,
         train_sample=sampler,
@@ -212,7 +191,133 @@ def test_apex_sampling_callable_receives_iteration():
     student = PromptDrivenModule(initial_prompt="bad")
     optimizer.compile(student, trainset=trainset, valset=calset)
 
-    assert analysis_responder.call_count == 2
+    assert len(analysis_lm.history) == 2
+
+
+def test_apex_rejects_invalid_analysis_json():
+    analysis_lm = DummyLM(
+        [{"json_response": "not json"}],
+        adapter=dspy.JSONAdapter(),
+    )
+    hypothesis_lm = DummyLM(
+        [make_hypothesis_response()],
+        adapter=dspy.JSONAdapter(),
+    )
+
+    optimizer = APEX(
+        metric=metric,
+        analysis_llm=analysis_lm,
+        hypothesis_llm=hypothesis_lm,
+        max_iterations=1,
+        num_hypotheses=1,
+        convergence_patience=1,
+        seed=0,
+    )
+
+    student = PromptDrivenModule(initial_prompt="bad")
+    trainset = [make_train_example("x")]
+    with pytest.raises(ValueError):
+        optimizer.compile(student, trainset=trainset, valset=trainset)
+
+
+def test_apex_trims_hypotheses_to_limit():
+    analysis_lm = DummyLM(
+        [make_analysis_response()],
+        adapter=dspy.JSONAdapter(),
+    )
+    hypothesis_lm = DummyLM(
+        [
+            {
+                "json_response": [
+                    {
+                        "observation": "option A",
+                        "fixable_root_causes": ["Prompt missing correct token"],
+                        "non_fixable_root_causes": [],
+                        "strategy": "Rewrite prompt A",
+                        "expected_impact": "Outputs 'good'",
+                        "prompt_changes": {
+                            "predictor": {
+                                "new_prompt": "good",
+                                "rationale": "Align",
+                                "change_magnitude": "minimal",
+                            }
+                        },
+                    },
+                    {
+                        "observation": "option B",
+                        "fixable_root_causes": ["Prompt missing correct token"],
+                        "non_fixable_root_causes": [],
+                        "strategy": "Rewrite prompt B",
+                        "expected_impact": "Outputs 'great'",
+                        "prompt_changes": {
+                            "predictor": {
+                                "new_prompt": "great",
+                                "rationale": "Align alt",
+                                "change_magnitude": "moderate",
+                            }
+                        },
+                    },
+                ]
+            }
+        ],
+        adapter=dspy.JSONAdapter(),
+    )
+
+    optimizer = APEX(
+        metric=metric,
+        analysis_llm=analysis_lm,
+        hypothesis_llm=hypothesis_lm,
+        max_iterations=1,
+        num_hypotheses=1,
+        convergence_patience=1,
+        seed=0,
+    )
+
+    student = PromptDrivenModule(initial_prompt="bad")
+    optimized = optimizer.compile(student, trainset=[make_train_example("x")], valset=[make_train_example("x")])
+
+    iteration = optimized.apex_result.iterations[0]
+    assert len(iteration.hypotheses) == 1
+    assert iteration.hypotheses[0].prompt_changes["predictor"].new_prompt == "good"
+
+
+def test_apex_handles_fewer_successes_than_failures():
+    def mixed_metric(example: Example, prediction: dspy.Prediction, trace) -> float:
+        # Treat inputs ending with "success" as automatic successes.
+        if example.input.endswith("success"):
+            return 1.0
+        return 1.0 if prediction.output == "good" else 0.0
+
+    trainset = [
+        Example(input="a_success", output="good").with_inputs("input"),
+        Example(input="b_failure", output="good").with_inputs("input"),
+        Example(input="c_failure", output="good").with_inputs("input"),
+    ]
+    calset = trainset
+
+    analysis_payloads = [
+        make_analysis_response("mixed failure 1"),
+        make_analysis_response("mixed failure 2"),
+    ]
+    analysis_lm = DummyLM(analysis_payloads, adapter=dspy.JSONAdapter())
+    hypothesis_lm = DummyLM([make_hypothesis_response()], adapter=dspy.JSONAdapter())
+
+    optimizer = APEX(
+        metric=mixed_metric,
+        analysis_llm=analysis_lm,
+        hypothesis_llm=hypothesis_lm,
+        max_iterations=2,
+        num_hypotheses=1,
+        convergence_patience=1,
+        seed=123,
+    )
+
+    student = PromptDrivenModule(initial_prompt="bad")
+    optimized = optimizer.compile(student, trainset=trainset, valset=calset)
+
+    # Only two failure analyses should have been requested despite one success available.
+    assert len(analysis_lm.history) == 2
+    assert optimized.apex_result.best_candidate.overall_score >= 1.0
 
 
 def test_apex_public_api_exposed():
