@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import logging
 import os
 import random
@@ -8,7 +7,7 @@ from enum import Enum
 from statistics import median
 from typing import Any, Callable, Iterable, Iterator, Literal, Mapping, Sequence, TypeAlias, TypeVar, cast
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, JsonValue
 from tqdm.auto import tqdm
 
 import dspy
@@ -58,30 +57,37 @@ def _verbosity_rank(level: Verbosity) -> int:
     }[level]
 
 
-def _normalize_json_response_static(response: JsonValue | str) -> JsonValue:
-    """Static version of _normalize_json_response for use in parallel workers."""
-    if isinstance(response, dict | list):
-        return cast(JsonValue, response)
-    if isinstance(response, str):
-        candidate = response.strip()
-        if candidate.startswith("```"):
-            candidate = candidate.strip("`")
-            newline = candidate.find("\n")
-            if newline != -1:
-                candidate = candidate[newline + 1 :]
-        try:
-            loaded = json.loads(candidate)
-        except json.JSONDecodeError as exc:  # pragma: no cover - debug aid
-            raise ValueError("APEX expected JSON output from language model.") from exc
-        if not isinstance(loaded, dict | list):
-            raise TypeError("APEX expected a JSON object or array from language model.")
-        return cast(JsonValue, loaded)
-    raise TypeError("APEX expected a JSON object or array from language model.")
+class FailureAnalysisSignature(dspy.Signature):
+    """Analyze a failed example to identify root causes and patterns."""
+
+    analysis_prompt: str = InputField(desc="Fully formatted prompt with failure details.")
+    root_cause: str = OutputField(desc="The primary reason for the failure.")
+    involved_predictors: list[str] = OutputField(
+        desc="List of predictor names involved in the failure.", default_factory=list
+    )
+    context: str = OutputField(desc="Additional context about the failure.")
+    category: str = OutputField(desc="Category of the failure (e.g., reasoning, formatting, knowledge).")
+    key_details: str = OutputField(desc="Key details that are important for understanding the failure.")
 
 
-class JsonResponseSignature(dspy.Signature):
-    analysis_prompt: str = InputField(desc="Fully formatted prompt to send to the language model.")
-    json_response: JsonValue = OutputField(desc="Strict JSON object or array encoded as text.")
+class SuccessAnalysisSignature(dspy.Signature):
+    """Analyze a successful example to identify success patterns."""
+
+    analysis_prompt: str = InputField(desc="Fully formatted prompt with success details.")
+    success_pattern: str = OutputField(desc="The pattern that led to success.")
+    contributing_predictors: list[str] = OutputField(
+        desc="List of predictor names that contributed to success.", default_factory=list
+    )
+    context: str = OutputField(desc="Additional context about the success.")
+    category: str = OutputField(desc="Category of the success pattern.")
+    key_details: str = OutputField(desc="Key details that are important for understanding the success.")
+
+
+class HypothesisGenerationSignature(dspy.Signature):
+    """Generate hypotheses for improving the program based on failure and success analyses."""
+
+    analysis_prompt: str = InputField(desc="Fully formatted prompt with analyses and current prompts.")
+    hypotheses: list["HypothesisSpec"] = OutputField(desc="List of improvement hypotheses.")
 
 
 class FailureAnalysis(BaseModel):
@@ -400,8 +406,19 @@ class APEX(Teleprompter):
         )
         self._log(f"APEX: Using seed={self.seed} for reproducibility", Verbosity.HIGH)
 
+        # Evaluate the initial baseline on validation set
+        self._log("APEX: Evaluating initial baseline on validation set", Verbosity.NORMAL)
+        baseline_candidate = self._evaluate_candidate(
+            program=current_program.deepcopy(),
+            calset=valset,
+            iteration=0,
+            hypothesis=None,
+        )
+        all_candidates.append(baseline_candidate)
+        best_candidate = baseline_candidate
+        self._log(f"APEX: Initial baseline score={baseline_candidate.overall_score:.4f}", Verbosity.NORMAL)
+
         no_improvement_count = 0
-        best_candidate: CandidateRecord | None = None
         stop_reason = ""
 
         for iteration in range(1, self.max_iterations + 1):
@@ -410,7 +427,9 @@ class APEX(Teleprompter):
                 f"APEX: iteration {iteration} started (train sample={len(sampled_train)}, val size={len(valset)})",
                 Verbosity.NORMAL,
             )
-            self._log(f"APEX: Sampled {len(sampled_train)} training examples from {len(trainset)} total", Verbosity.HIGH)
+            self._log(
+                f"APEX: Sampled {len(sampled_train)} training examples from {len(trainset)} total", Verbosity.HIGH
+            )
             baseline_for_analysis = current_program.deepcopy()
             snapshot = self._snapshot_program(baseline_for_analysis)
 
@@ -493,7 +512,7 @@ class APEX(Teleprompter):
                 )
             )
 
-            if best_candidate is None or best_candidate_for_iteration.overall_score > best_candidate.overall_score:
+            if best_candidate_for_iteration.overall_score > best_candidate.overall_score:
                 best_candidate = best_candidate_for_iteration
                 self._log(
                     f"APEX: New best candidate found with score {best_candidate.overall_score:.4f}",
@@ -514,7 +533,9 @@ class APEX(Teleprompter):
                         )
                         for predictor_name, change in best_candidate.hypothesis.prompt_changes.items():
                             self._log(
-                                f"  → {predictor_name}: {change.new_prompt[:300]}..." if len(change.new_prompt) > 300 else f"  → {predictor_name}: {change.new_prompt}",
+                                f"  → {predictor_name}: {change.new_prompt[:300]}..."
+                                if len(change.new_prompt) > 300
+                                else f"  → {predictor_name}: {change.new_prompt}",
                                 Verbosity.HIGH,
                             )
 
@@ -554,14 +575,12 @@ class APEX(Teleprompter):
                 stop_reason = "max_iterations"
                 self._log("APEX: Stopping due to max iterations reached", Verbosity.NORMAL)
 
-        assert best_candidate is not None, "APEX failed to evaluate any candidates."
-
         self._log(
             f"APEX: Optimization complete - stopped after {len(iteration_logs)} iterations ({stop_reason})",
             Verbosity.NORMAL,
         )
         self._log(
-            f"APEX: Final score: {best_candidate.overall_score:.4f} (improved from initial baseline)",
+            f"APEX: Final score: {best_candidate.overall_score:.4f} (initial baseline: {baseline_candidate.overall_score:.4f})",
             Verbosity.NORMAL,
         )
         if self._is_enabled(Verbosity.HIGH):
@@ -652,7 +671,7 @@ class APEX(Teleprompter):
                 prediction_obj = program(**input_kwargs)
                 if prediction_obj is not None:
                     prediction_obj = self._sanitize_prediction(prediction_obj)
-            except Exception as exc:  # pragma: no cover - defensive
+            except Exception as exc:
                 self._log(f"APEX: Program execution failed on example: {str(exc)[:200]}", Verbosity.HIGH, "warning")
                 error_message = f"execution_error: {exc}"
             finally:
@@ -666,8 +685,10 @@ class APEX(Teleprompter):
             else:
                 metric_score = self.min_metric
                 if error_message:
-                    self._log(f"APEX: No prediction to evaluate due to error: {error_message[:100]}", Verbosity.HIGH, "debug")
-        except Exception as exc:  # pragma: no cover - defensive
+                    self._log(
+                        f"APEX: No prediction to evaluate due to error: {error_message[:100]}", Verbosity.HIGH, "debug"
+                    )
+        except Exception as exc:
             self._log(f"APEX: Metric evaluation failed: {str(exc)[:200]}", Verbosity.HIGH, "warning")
             metric_score = self.min_metric
             metric_feedback = f"metric_error: {exc}"
@@ -725,12 +746,10 @@ class APEX(Teleprompter):
             return []
 
         prompt_builder = self._build_failure_prompt if mode == "failure" else self._build_success_prompt
-        target_model = FailureAnalysis if mode == "failure" else SuccessAnalysis
+        signature_class = FailureAnalysisSignature if mode == "failure" else SuccessAnalysisSignature
 
-        # Store LM and adapter references to avoid serialization issues
         analysis_lm = self.analysis_lm
         analysis_adapter = self.analysis_adapter
-        verbosity = self.verbosity
 
         def process(record: TrainExampleRecord) -> BaseModel:
             payload = (
@@ -741,34 +760,25 @@ class APEX(Teleprompter):
             prompt = prompt_builder(payload)
 
             with dspy.context(lm=analysis_lm, adapter=analysis_adapter):
-                predictor = dspy.Predict(JsonResponseSignature)
-                prediction = predictor(analysis_prompt=prompt)
+                predictor = dspy.Predict(signature_class())
+                result = predictor(analysis_prompt=prompt)
 
-            json_payload = _normalize_json_response_static(prediction.json_response)
-
-            # Handle missing fields with defaults to prevent validation errors
             if mode == "failure":
-                if not isinstance(json_payload, dict):
-                    json_payload = {"root_cause": str(json_payload)}
-                    if _verbosity_rank(verbosity) >= _verbosity_rank(Verbosity.HIGH):
-                        logger.debug(f"APEX: Non-dict JSON response for failure analysis, converted: {json_payload}")
-                json_payload.setdefault("root_cause", "Unknown failure")
-                json_payload.setdefault("involved_predictors", [])
-                json_payload.setdefault("context", "No context provided")
-                json_payload.setdefault("category", "uncategorized")
-                json_payload.setdefault("key_details", "No details provided")
+                return FailureAnalysis(
+                    root_cause=result.root_cause,
+                    involved_predictors=result.involved_predictors or [],
+                    context=result.context,
+                    category=result.category,
+                    key_details=result.key_details,
+                )
             else:
-                if not isinstance(json_payload, dict):
-                    json_payload = {"success_pattern": str(json_payload)}
-                    if _verbosity_rank(verbosity) >= _verbosity_rank(Verbosity.HIGH):
-                        logger.debug(f"APEX: Non-dict JSON response for success analysis, converted: {json_payload}")
-                json_payload.setdefault("success_pattern", "Unknown success pattern")
-                json_payload.setdefault("contributing_predictors", [])
-                json_payload.setdefault("context", "No context provided")
-                json_payload.setdefault("category", "uncategorized")
-                json_payload.setdefault("key_details", "No details provided")
-
-            return target_model.model_validate(json_payload)
+                return SuccessAnalysis(
+                    success_pattern=result.success_pattern,
+                    contributing_predictors=result.contributing_predictors or [],
+                    context=result.context,
+                    category=result.category,
+                    key_details=result.key_details,
+                )
 
         analyses = self._parallel_execute(
             records,
@@ -841,22 +851,14 @@ class APEX(Teleprompter):
         )
         prompt = self._build_hypothesis_prompt(payload)
 
-        # Create predictor inside context to avoid serialization issues
         with dspy.context(lm=self.hypothesis_lm, adapter=self.hypothesis_adapter):
-            predictor = dspy.Predict(JsonResponseSignature)
-            prediction = predictor(analysis_prompt=prompt)
+            predictor = dspy.Predict(HypothesisGenerationSignature())
+            result = predictor(analysis_prompt=prompt)
 
-        data = _normalize_json_response_static(prediction.json_response)
-        if not isinstance(data, list):
-            raise ValueError("APEX expected a JSON array of hypotheses.")
-        specs: list[HypothesisSpec] = []
-        for item in data:
-            try:
-                specs.append(HypothesisSpec.model_validate(item))
-            except ValidationError as exc:  # pragma: no cover - debug aid
-                raise ValueError("APEX received an invalid hypothesis JSON payload.") from exc
+        # Get the hypotheses directly from the typed result
+        validated_specs = result.hypotheses if result.hypotheses else []
         if self._is_enabled(Verbosity.HIGH):
-            for idx, spec in enumerate(specs, start=1):
+            for idx, spec in enumerate(validated_specs, start=1):
                 self._log(
                     f"APEX: hypothesis #{idx} ({spec.strategy}) targeting {', '.join(spec.fixable_root_causes) or 'no fixable causes'}",
                     Verbosity.HIGH,
@@ -864,7 +866,9 @@ class APEX(Teleprompter):
                 # Log the actual prompt changes per predictor
                 for predictor_name, change in spec.prompt_changes.items():
                     self._log(
-                        f"  → {predictor_name}: {change.new_prompt[:200]}..." if len(change.new_prompt) > 200 else f"  → {predictor_name}: {change.new_prompt}",
+                        f"  → {predictor_name}: {change.new_prompt[:200]}..."
+                        if len(change.new_prompt) > 200
+                        else f"  → {predictor_name}: {change.new_prompt}",
                         Verbosity.HIGH,
                     )
                     if change.rationale:
@@ -872,7 +876,7 @@ class APEX(Teleprompter):
                             f"     Rationale: {change.rationale}",
                             Verbosity.HIGH,
                         )
-        return specs[: self.num_hypotheses]
+        return validated_specs[: self.num_hypotheses]
 
     # --- Candidate evaluation -----------------------------------------------------
 
@@ -1031,12 +1035,7 @@ class APEX(Teleprompter):
         if hasattr(value, "content") and not isinstance(value, str | bytes):
             content_value = value.content
             if isinstance(content_value, list):
-                joined = "".join(
-                    part
-                    if isinstance(part, str)
-                    else str(part.get("text", ""))
-                    for part in content_value
-                )
+                joined = "".join(part if isinstance(part, str) else str(part.get("text", "")) for part in content_value)
                 return joined
             return self._serialize_value(content_value)
         if isinstance(value, str | int | float | bool) or value is None:
@@ -1069,7 +1068,3 @@ class APEX(Teleprompter):
 
     def _build_hypothesis_prompt(self, payload: HypothesisPromptPayload) -> str:
         return render_hypothesis_prompt(payload.model_dump())
-
-    def _normalize_json_response(self, response: JsonValue | str) -> JsonValue:
-        """Instance method that delegates to static version."""
-        return _normalize_json_response_static(response)
