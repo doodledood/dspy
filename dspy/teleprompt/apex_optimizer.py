@@ -243,6 +243,8 @@ class APEX(Teleprompter):
         self.convergence_patience = convergence_patience
         self.seed = seed if seed is not None else random.randint(1, 1_000_000)
         self._rng = random.Random(self.seed)
+        self._analysis_predictor = dspy.Predict(JsonResponseSignature, lm=analysis_lm)
+        self._hypothesis_predictor = dspy.Predict(JsonResponseSignature, lm=hypothesis_lm or analysis_lm)
 
     def compile(
         self,
@@ -528,8 +530,16 @@ class APEX(Teleprompter):
             num_hypotheses=self.num_hypotheses,
         )
         prompt = self._build_hypothesis_prompt(payload)
-        hypotheses = self._call_llm_list(self.hypothesis_lm, prompt, HypothesisSpec)
-        return hypotheses[: self.num_hypotheses]
+        data = self._call_predictor_json(self._hypothesis_predictor, prompt)
+        if not isinstance(data, list):
+            raise ValueError("APEX expected a JSON array of hypotheses.")
+        specs: list[HypothesisSpec] = []
+        for item in data:
+            try:
+                specs.append(HypothesisSpec.model_validate(item))
+            except ValidationError as exc:  # pragma: no cover - debug aid
+                raise ValueError("APEX received an invalid hypothesis JSON payload.") from exc
+        return specs[: self.num_hypotheses]
 
     # --- Candidate evaluation -----------------------------------------------------
 
@@ -679,34 +689,18 @@ class APEX(Teleprompter):
     def _build_hypothesis_prompt(self, payload: HypothesisPromptPayload) -> str:
         return render_hypothesis_prompt(payload.model_dump())
 
-    def _call_llm_model(self, fn: Callable[..., Any], prompt: str, model_cls: type[ModelT]) -> ModelT:
-        data = self._coerce_json_data(self._call_llm_raw(fn, prompt))
-        try:
-            return cast(ModelT, model_cls.model_validate(data))
-        except ValidationError as exc:  # pragma: no cover - debug aid
-            raise ValueError(f"APEX expected {model_cls.__name__} from language model") from exc
-
-    def _call_llm_list(self, fn: Callable[..., Any], prompt: str, model_cls: type[ModelT]) -> list[ModelT]:
-        data = self._coerce_json_data(self._call_llm_raw(fn, prompt))
-        if not isinstance(data, list):
-            raise ValueError("APEX expected a JSON array from language model")
-        models: list[ModelT] = []
-        for item in data:
-            try:
-                models.append(cast(ModelT, model_cls.model_validate(item)))
-            except ValidationError as exc:  # pragma: no cover - debug aid
-                raise ValueError(f"APEX expected {model_cls.__name__} entries from language model") from exc
-        return models
-
-    def _call_llm_raw(self, fn: Callable[..., Any], prompt: str) -> Any:
-        try:
-            return fn(prompt=prompt)
-        except TypeError:
-            return fn(prompt)
+    def _call_predictor_json(self, predictor: Module, prompt: str) -> JsonValue:
+        prediction = predictor(analysis_prompt=prompt)
+        response = getattr(prediction, "json_response", None)
+        if response is None:
+            raise ValueError("Predictor did not return a 'json_response' field.")
+        return self._coerce_json_data(response)
 
     def _coerce_json_data(self, response: Any) -> JsonValue:
-        if isinstance(response, dict | list):
-            return response
+        if isinstance(response, dict):
+            return cast(JsonValue, response)
+        if isinstance(response, list):
+            return cast(JsonValue, response)
         if isinstance(response, str):
             candidate = response.strip()
             if candidate.startswith("```"):
@@ -715,7 +709,8 @@ class APEX(Teleprompter):
                 if newline != -1:
                     candidate = candidate[newline + 1 :]
             try:
-                return json.loads(candidate)
+                return cast(JsonValue, json.loads(candidate))
             except json.JSONDecodeError as exc:  # pragma: no cover - debug aid
-                raise ValueError("APEX expected JSON output from language model") from exc
-        raise TypeError("APEX expected dict/list or JSON string from language model")
+                raise ValueError("APEX expected JSON output from language model.") from exc
+        raise TypeError("APEX expected a JSON object or array from language model.")
+
