@@ -333,6 +333,67 @@ def test_apex_handles_fewer_successes_than_failures():
     assert optimized.apex_result.best_candidate.overall_score >= 1.0
 
 
+def test_apex_end_to_end_fake_data():
+    trainset = [
+        Example(input="sample_success", output="baseline").with_inputs("input"),
+        make_train_example("fix_a"),
+        make_train_example("fix_b"),
+    ]
+    calset = [
+        Example(input="sample_success", output="baseline").with_inputs("input"),
+        make_train_example("fix_a"),
+        make_train_example("fix_b"),
+    ]
+
+    analysis_responses = [
+        make_analysis_response("fix format for fix_a"),
+        make_analysis_response("fix format for fix_b"),
+        make_success_response("baseline prompt handles sample_success"),
+        make_analysis_response("baseline prompt now mismatched"),
+        make_success_response("good prompt stable"),
+    ]
+    analysis_lm = DummyLM(analysis_responses, adapter=dspy.JSONAdapter())
+    hypothesis_lm = DummyLM(
+        [
+            make_hypothesis_response("good"),
+            {"json_response": []},
+        ],
+        adapter=dspy.JSONAdapter(),
+    )
+
+    optimizer = APEX(
+        metric=metric,
+        analysis_llm=analysis_lm,
+        hypothesis_llm=hypothesis_lm,
+        max_iterations=3,
+        num_hypotheses=1,
+        convergence_patience=1,
+        num_eval_runs=1,
+        seed=99,
+    )
+
+    student = PromptDrivenModule(initial_prompt="baseline")
+    optimized = optimizer.compile(student, trainset=trainset, valset=calset)
+    result = optimized.apex_result
+
+    # Best candidate should apply the "good" prompt and improve average score from 1/3 to 2/3.
+    assert optimized.predictor.signature.instructions == "good"
+    assert pytest.approx(result.best_candidate.overall_score, rel=0.0, abs=1e-9) == 2 / 3
+    assert result.stopped_after == "patience"
+
+    # Two iterations: first with a winning hypothesis, second with no improvement.
+    assert len(result.iterations) == 2
+    first_iter, second_iter = result.iterations
+    assert first_iter.num_failures == 2 and first_iter.num_successes == 1
+    assert len(first_iter.hypotheses) == 1
+    assert first_iter.hypotheses[0].prompt_changes["predictor"].new_prompt == "good"
+    assert second_iter.num_failures == 1 and second_iter.num_successes == 1
+    assert second_iter.hypotheses == []
+
+    # Candidate history should contain baseline + new hypothesis + final baseline re-evaluation.
+    assert len(result.all_candidates) == 3
+
+
 def test_apex_public_api_exposed():
     import dspy.teleprompt as teleprompt_module
 
