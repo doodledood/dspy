@@ -1,6 +1,7 @@
 import pytest
 
 import dspy
+import dspy.teleprompt.apex_optimizer as apex_module
 from dspy import Example
 from dspy.teleprompt.apex_optimizer import APEX, Verbosity
 from dspy.utils.dummies import DummyLM
@@ -207,6 +208,47 @@ def test_apex_sampling_callable_receives_iteration():
     optimizer.compile(student, trainset=trainset, valset=calset)
 
     assert len(analysis_lm.history) == 2
+
+
+def test_apex_uses_configured_num_threads(monkeypatch):
+    calls: list[int] = []
+
+    def fake_execute(self, function, data):
+        calls.append(self.num_threads)
+        return [function(item) for item in data]
+
+    monkeypatch.setattr(apex_module.ParallelExecutor, "execute", fake_execute)
+
+    trainset = [make_train_example("x"), make_train_example("y")]
+    calset = trainset
+
+    analysis_lm = DummyLM(
+        [make_analysis_response("thread test") for _ in range(len(trainset))],
+        adapter=dspy.JSONAdapter(),
+    )
+    hypothesis_lm = DummyLM(
+        [make_hypothesis_response("good")],
+        adapter=dspy.JSONAdapter(),
+    )
+
+    optimizer = APEX(
+        metric=metric,
+        analysis_llm=analysis_lm,
+        hypothesis_llm=hypothesis_lm,
+        max_iterations=1,
+        num_hypotheses=1,
+        train_sample=None,
+        num_eval_runs=1,
+        convergence_patience=1,
+        seed=11,
+        verbosity="none",
+        num_threads=2,
+    )
+
+    student = PromptDrivenModule(initial_prompt="bad")
+    optimizer.compile(student, trainset=trainset, valset=calset)
+
+    assert any(num == 2 for num in calls)
 
 
 def test_apex_rejects_invalid_analysis_json():

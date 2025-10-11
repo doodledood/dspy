@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 from enum import Enum
 from statistics import median
@@ -17,6 +18,7 @@ from dspy.primitives import Example, Module, Prediction
 from dspy.signatures import InputField, OutputField
 from dspy.teleprompt.prompts import render_failure_prompt, render_hypothesis_prompt, render_success_prompt
 from dspy.teleprompt.teleprompt import Teleprompter
+from dspy.utils.parallelizer import ParallelExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -242,6 +244,7 @@ class APEX(Teleprompter):
         analysis_adapter: JSONAdapter | None = None,
         hypothesis_adapter: JSONAdapter | None = None,
         verbosity: Verbosity | str | None = None,
+        num_threads: int | None = None,
         num_hypotheses: int = 1,
         num_eval_runs: int = 1,
         train_sample: None | int | SamplerFn = None,
@@ -273,6 +276,10 @@ class APEX(Teleprompter):
         self.metric = metric
         self.analysis_lm = analysis_model
         self.hypothesis_lm = hypothesis_model
+        default_threads = num_threads if num_threads is not None else (os.cpu_count() or 0)
+        if default_threads is None or default_threads <= 0:
+            default_threads = dspy.settings.num_threads or 1
+        self.num_threads = max(1, int(default_threads))
         self.max_iterations = max_iterations
         self.num_hypotheses = num_hypotheses
         self.num_eval_runs = num_eval_runs
@@ -299,6 +306,30 @@ class APEX(Teleprompter):
     def _log(self, message: str, level: Verbosity = Verbosity.NORMAL) -> None:
         if self._is_enabled(level):
             logger.info(message)
+
+    def _parallel_execute(
+        self,
+        items: Iterable[ItemT],
+        func: Callable[[ItemT], Any],
+        *,
+        description: str,
+        level: Verbosity,
+    ) -> list[Any]:
+        items_list = list(items)
+        if not items_list:
+            return []
+        if self.num_threads <= 1 or len(items_list) <= 1:
+            results: list[Any] = []
+            for item in self._iter_with_progress(items_list, description=description, level=level):
+                results.append(func(item))
+            return results
+        executor = ParallelExecutor(
+            num_threads=self.num_threads,
+            disable_progress_bar=not self._is_enabled(level),
+            max_errors=max(len(items_list), 1),
+            provide_traceback=self._is_enabled(Verbosity.HIGH),
+        )
+        return executor.execute(func, items_list)
 
     def _iter_with_progress(
         self,
@@ -337,6 +368,8 @@ class APEX(Teleprompter):
 
         all_candidates: list[CandidateRecord] = []
         iteration_logs: list[ApexIterationLog] = []
+
+        self._log(f"APEX: running with num_threads={self.num_threads}", Verbosity.NORMAL)
 
         no_improvement_count = 0
         best_candidate: CandidateRecord | None = None
@@ -465,12 +498,18 @@ class APEX(Teleprompter):
         success_records: list[TrainExampleRecord] = []
 
         examples = list(trainset)
-        for example in self._iter_with_progress(
+
+        def process(example: Example) -> TrainExampleRecord:
+            return self._run_single_example(program, example, snapshot.predictor_name_by_id)
+
+        records = self._parallel_execute(
             examples,
+            process,
             description="APEX: evaluating trainset",
             level=Verbosity.NORMAL,
-        ):
-            record = self._run_single_example(program, example, snapshot.predictor_name_by_id)
+        )
+
+        for record in records:
             if record.is_success:
                 success_records.append(record)
             else:
@@ -569,14 +608,9 @@ class APEX(Teleprompter):
 
         prompt_builder = self._build_failure_prompt if mode == "failure" else self._build_success_prompt
 
-        analyses: list[BaseModel] = []
         target_model = FailureAnalysis if mode == "failure" else SuccessAnalysis
-        iterator = self._iter_with_progress(
-            records,
-            description=f"APEX: analyzing {mode}s",
-            level=Verbosity.HIGH,
-        )
-        for index, record in enumerate(iterator, start=1):
+
+        def process(record: TrainExampleRecord) -> BaseModel:
             payload = (
                 record.failure_payload(snapshot, success_threshold)
                 if mode == "failure"
@@ -586,9 +620,17 @@ class APEX(Teleprompter):
             with dspy.settings.context(adapter=self.analysis_adapter):
                 prediction = self._analysis_predictor(analysis_prompt=prompt)
             json_payload = self._normalize_json_response(prediction.json_response)
-            analysis = target_model.model_validate(json_payload)
-            analyses.append(analysis)
-            if self._is_enabled(Verbosity.HIGH):
+            return target_model.model_validate(json_payload)
+
+        analyses = self._parallel_execute(
+            records,
+            process,
+            description=f"APEX: analyzing {mode}s",
+            level=Verbosity.HIGH,
+        )
+
+        if self._is_enabled(Verbosity.HIGH):
+            for index, analysis in enumerate(analyses, start=1):
                 if isinstance(analysis, FailureAnalysis):
                     self._log(
                         f"APEX: failure analysis #{index} ({analysis.category}) → {analysis.root_cause}",
@@ -716,14 +758,10 @@ class APEX(Teleprompter):
         iteration: int,
         hypothesis: HypothesisSpec | None,
     ) -> CandidateRecord:
-        scores: list[float] = []
         label = "baseline" if hypothesis is None else "hypothesis"
         cal_examples = list(calset)
-        for example in self._iter_with_progress(
-            cal_examples,
-            description=f"APEX: evaluating {label}",
-            level=Verbosity.NORMAL,
-        ):
+
+        def process(example: Example) -> float:
             per_runs: list[float] = []
             for _ in range(self.num_eval_runs):
                 with dspy.settings.context(trace=[]):
@@ -733,7 +771,14 @@ class APEX(Teleprompter):
                 score, _ = self._evaluate_metric(example, prediction, trace_entries)
                 score = max(self.min_metric, min(self.max_metric, score))
                 per_runs.append(score)
-            scores.append(median(per_runs))
+            return median(per_runs)
+
+        scores = self._parallel_execute(
+            cal_examples,
+            process,
+            description=f"APEX: evaluating {label}",
+            level=Verbosity.NORMAL,
+        )
 
         overall = sum(scores) / len(scores)
         return CandidateRecord(
