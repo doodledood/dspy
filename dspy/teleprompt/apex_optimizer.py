@@ -133,6 +133,7 @@ class SuccessAnalysisSignature(Signature):
 
 class ChangeMagnitude(str, Enum):
     """Magnitude of a prompt change."""
+
     MINIMAL = "minimal"
     MODERATE = "moderate"
     SUBSTANTIAL = "substantial"
@@ -149,24 +150,30 @@ class PromptChange(BaseModel):
 class HypothesisSpec(BaseModel):
     """Specification for a hypothesis to improve the program.
 
-    Each hypothesis represents a complete strategy for addressing ALL identified fixable issues.
-    Multiple hypotheses should offer different approaches to the same problems, not address different subsets.
+    Each hypothesis can address one or more fixable issues, prioritizing by impact.
+    Different hypotheses may target different numbers of problems based on their generalizability.
     """
 
-    observation: str = Field(description="Synthesized description of patterns found across all errors")
+    observation: str = Field(description="Synthesized description of patterns found across the targeted errors")
     fixable_root_causes: list[str] = Field(
         default_factory=list,
-        description="Specific fixable issues that this hypothesis addresses through prompt changes",
+        description="Specific fixable issues that this hypothesis addresses through prompt changes (may be subset of all issues)",
     )
     non_fixable_root_causes: list[str] = Field(
         default_factory=list,
         description="Issues that cannot be fixed with prompt changes (e.g., 'needs retrieval system', 'requires multi-step architecture')",
     )
-    strategy: str = Field(
-        description="Description of the approach this hypothesis takes. What makes it different from alternative approaches?"
+    impact_score: float = Field(
+        default=0.0,
+        description="Estimated impact score (0-1) based on volume and criticality of issues addressed",
     )
+    generalizability_score: float = Field(
+        default=0.0,
+        description="How generalizable this hypothesis is (0-1) - will it help with future unseen examples?",
+    )
+    strategy: str = Field(description="Description of the approach this hypothesis takes. What makes it unique?")
     expected_impact: str = Field(
-        description="Specific prediction of which errors this should fix and why. Be concrete."
+        description="Specific prediction of which errors this should fix and estimated success rate."
     )
     prompt_changes: dict[str, PromptChange] = Field(
         default_factory=dict,
@@ -175,37 +182,48 @@ class HypothesisSpec(BaseModel):
 
 
 class HypothesisGenerationSignature(Signature):
-    """Generate hypotheses for improving a DSPy program based on systematic error analysis.
+    """Generate impact-driven hypotheses for improving a DSPy program based on systematic error analysis.
 
-    You are a prompt engineering expert. Synthesize the analyses and generate hypotheses for fixing ALL fixable issues.
+    You are a prompt engineering expert. Generate diverse hypotheses that address errors by impact and generalizability.
 
-    Step 1: Pattern Synthesis
-    - Identify common patterns across errors
-    - How successes differ from failures
-    - Which issues are fixable by prompt changes
-    - Which issues need architecture/tools/data (mark as non-fixable)
+    Step 1: Error Prioritization
+    - Rank fixable issues by volume (how often they occur) and criticality (how severely they fail)
+    - Group related issues that share root causes
+    - Identify which issues are fixable via prompts vs need architecture changes
 
-    Step 2: Hypothesis Generation
-    Critical Requirements:
-    - Each hypothesis must address ALL fixable root causes together
-    - Multiple hypotheses should represent DIFFERENT STRATEGIES for fixing the same issues
-    - Different strategies include: minimal vs substantial changes, fix upstream vs make downstream robust,
-      add constraints vs add examples, different predictor combinations
-    - Bias toward minimal effective change (simplest intervention that works)
-    - Specify COMPLETE REPLACEMENT PROMPTS for each affected predictor
+    Step 2: Hypothesis Generation Strategy
+    CRITICAL: Generate a MIX of hypotheses with varying scopes, biased toward MINIMAL EFFECTIVE changes:
+
+    - Some hypotheses should target ONLY the most critical issue (highest impact, most focused)
+    - Some should address the top 2-3 critical issues together (balanced approach)
+    - Some could attempt broader fixes addressing many issues (if generalizable pattern exists)
+
+    Each hypothesis should:
+    - BIAS TOWARD MINIMAL EFFECTIVE CHANGE: The smallest prompt modification that solves the problem(s)
+    - Prefer surgical, targeted fixes over complete rewrites when possible
+    - Target issues based on their impact/volume, not try to fix everything
+    - Be as generalizable as possible for the issues it addresses
+    - Include impact_score (0-1) based on volume/criticality of addressed issues
+    - Include generalizability_score (0-1) for future robustness
+    - Consider change_magnitude in diversity (minimal vs moderate vs substantial) but prefer minimal
+    - Specify COMPLETE REPLACEMENT PROMPTS for affected predictors
+
+    Hypothesis Diversity Examples (in order of preference):
+    1. Minimal: Add a single constraint/example to fix the #1 error (e.g., add format specification)
+    2. Targeted: Small adjustments to 2-3 related issues (e.g., clarify ambiguous instructions)
+    3. Moderate: Restructure a section to address multiple errors (when minimal changes insufficient)
+    4. Comprehensive: Full rewrite only when pattern analysis shows fundamental prompt issues
+
+    Ordering:
+    - Order hypotheses by impact_score (highest first)
+    - If tied on impact, prefer higher generalizability
+    - Generate up to `num_hypotheses` hypotheses
+    - If you generate more than requested, only the first `num_hypotheses` will be used
 
     When to generate 0 hypotheses:
-    - All root causes are non-fixable (need architecture/data/tools)
-    - No clear improvement strategy emerges from the analysis
-    - Errors are too diverse/unclear to form actionable hypothesis
-
-    When to generate multiple hypotheses:
-    - There are genuinely different ways to address the same root causes
-    - You want to explore different intervention levels (minimal vs substantial)
-    - Different architectural approaches are viable
-
-    Important: Different hypotheses should NOT address different subsets of issues - they should all address ALL fixable issues.
-    Preserve what works (insights from success analyses). Consider predictor interactions and dependencies.
+    - All root causes need architecture/data/tool changes (not fixable via prompts)
+    - No clear improvement strategy emerges
+    - Errors are too diverse/random to form actionable hypothesis
     """
 
     failure_analyses: str = InputField(
@@ -215,11 +233,12 @@ class HypothesisGenerationSignature(Signature):
         desc="Success pattern summaries for contrast, showing what works well and should be preserved"
     )
     current_prompts: str = InputField(desc="Current predictor prompts in the program that may need modification")
+    num_hypotheses: int = InputField(desc="Maximum number of hypotheses to generate (ordered by impact)")
 
     hypotheses: list[HypothesisSpec] = OutputField(
-        desc="List of improvement hypotheses (0 to num_hypotheses). "
-        "Each addresses ALL fixable issues with a different strategy. "
-        "May be empty if no actionable improvements are found."
+        desc="List of improvement hypotheses ordered by impact_score (highest first). "
+        "Each may address different numbers of issues based on impact/generalizability tradeoffs. "
+        "May be empty if no actionable improvements found. Limited to num_hypotheses."
     )
 
 
@@ -667,7 +686,8 @@ class APEX(Teleprompter):
                 for idx, h in enumerate(hypotheses, start=1):
                     predictors_updated = list(h.prompt_changes.keys()) if h.prompt_changes else []
                     self._log(
-                        f"APEX: hypothesis #{idx} - strategy: {h.strategy}, updating: {', '.join(predictors_updated) if predictors_updated else 'no predictors'}",
+                        f"APEX: hypothesis #{idx} - strategy: {h.strategy}, impact: {h.impact_score:.2f}, "
+                        f"updating: {', '.join(predictors_updated) if predictors_updated else 'no predictors'}",
                         Verbosity.NORMAL,
                     )
             if self._is_enabled(Verbosity.HIGH) and hypotheses:
@@ -1019,14 +1039,25 @@ class APEX(Teleprompter):
         with dspy.context(lm=self.hypothesis_lm, adapter=self.hypothesis_adapter):
             predictor = dspy.Predict(HypothesisGenerationSignature)
             result = predictor(
-                failure_analyses=failure_text, success_analyses=success_text, current_prompts=prompt_text
+                failure_analyses=failure_text,
+                success_analyses=success_text,
+                current_prompts=prompt_text,
+                num_hypotheses=self.num_hypotheses,
             )
 
         validated_specs = result.hypotheses if result.hypotheses else []
+
+        # Sort by impact_score (highest first), then by generalizability_score if tied
+        validated_specs.sort(key=lambda h: (h.impact_score, h.generalizability_score), reverse=True)
+
+        # Take only the requested number of hypotheses
+        validated_specs = validated_specs[: self.num_hypotheses]
+
         if self._is_enabled(Verbosity.HIGH):
             for idx, spec in enumerate(validated_specs, start=1):
                 self._log(
-                    f"APEX: hypothesis #{idx} ({spec.strategy}) targeting {', '.join(spec.fixable_root_causes) or 'no fixable causes'}",
+                    f"APEX: hypothesis #{idx} ({spec.strategy}) targeting {', '.join(spec.fixable_root_causes) or 'no fixable causes'} "
+                    f"[impact={spec.impact_score:.2f}, generalizability={spec.generalizability_score:.2f}]",
                     Verbosity.HIGH,
                 )
                 for predictor_name, changes in spec.prompt_changes.items():
@@ -1041,7 +1072,7 @@ class APEX(Teleprompter):
                             f"     Rationale: {changes.rationale}",
                             Verbosity.HIGH,
                         )
-        return validated_specs[: self.num_hypotheses]
+        return validated_specs
 
     # --- Candidate evaluation -----------------------------------------------------
 
