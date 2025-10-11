@@ -73,6 +73,7 @@ class FailureAnalysisSignature(Signature):
     prediction: str = InputField(desc="The model's actual prediction/output")
     expected: str = InputField(desc="The expected correct output")
     error: str = InputField(desc="Error message if execution failed", default="")
+    execution_flow: str = InputField(desc="Program flow showing predictor relationships and instructions", default="")
 
     root_cause: str = OutputField(
         desc="Detailed description of what fundamentally caused this failure. "
@@ -112,6 +113,7 @@ class SuccessAnalysisSignature(Signature):
     problem: str = InputField(desc="The problem statement or input to the program")
     prediction: str = InputField(desc="The model's actual prediction/output")
     expected: str = InputField(desc="The expected correct output")
+    execution_flow: str = InputField(desc="Program flow showing predictor relationships and instructions", default="")
 
     success_pattern: str = OutputField(
         desc="Clear description of what made this execution successful. What did the predictors do right?"
@@ -232,6 +234,9 @@ class HypothesisGenerationSignature(Signature):
     success_analyses: str = InputField(
         desc="Success pattern summaries for contrast, showing what works well and should be preserved"
     )
+    program_flow: str = InputField(
+        desc="Program structure showing predictor relationships and dependencies (e.g., A → B → C)"
+    )
     current_prompts: str = InputField(desc="Current predictor prompts in the program that may need modification")
     num_hypotheses: int = InputField(desc="Maximum number of hypotheses to generate (ordered by impact)")
 
@@ -240,6 +245,16 @@ class HypothesisGenerationSignature(Signature):
         "Each may address different numbers of issues based on impact/generalizability tradeoffs. "
         "May be empty if no actionable improvements found. Limited to num_hypotheses."
     )
+
+
+class ExecutionFlowEntry(BaseModel):
+    """Structured representation of a single predictor execution in the flow."""
+
+    predictor_name: str
+    predictor_type: str
+    inputs: str
+    outputs: str
+    instructions: str
 
 
 class TrainExampleRecord(BaseModel):
@@ -251,6 +266,7 @@ class TrainExampleRecord(BaseModel):
     metric_feedback: str | None = None
     is_success: bool
     error: str | None = None
+    execution_flow: list[ExecutionFlowEntry] = Field(default_factory=list)
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -887,6 +903,7 @@ class APEX(Teleprompter):
 
         prediction_obj: Prediction | None = None
         error_message: str | None = None
+        raw_trace: list[TraceEntry] = []
 
         with dspy.settings.context(trace=[]):
             try:
@@ -895,13 +912,14 @@ class APEX(Teleprompter):
                 self._log(f"APEX: Program execution failed on example: {str(exc)[:200]}", Verbosity.HIGH, "warning")
                 error_message = f"execution_error: {exc}"
 
+        raw_trace = list(dspy.settings.trace or [])
+        execution_flow = self._extract_execution_flow(raw_trace, program)
+
         metric_score = self.min_metric
         metric_feedback: str | None = None
         try:
             if prediction_obj is not None:
-                metric_score, metric_feedback = self._evaluate_metric(
-                    example, prediction_obj, list(dspy.settings.trace or [])
-                )
+                metric_score, metric_feedback = self._evaluate_metric(example, prediction_obj, raw_trace)
             else:
                 metric_score = self.min_metric
                 if error_message:
@@ -923,7 +941,88 @@ class APEX(Teleprompter):
             metric_feedback=metric_feedback,
             is_success=is_success,
             error=error_message,
+            execution_flow=execution_flow,
         )
+
+    def _extract_execution_flow(
+        self,
+        trace: list[TraceEntry],
+        program: Module,
+    ) -> list[ExecutionFlowEntry]:
+        """Extract structured execution flow from raw trace."""
+        execution_flow: list[ExecutionFlowEntry] = []
+        predictor_lookup = dict(program.named_predictors())
+
+        for predictor_obj, inputs, outputs in trace:
+            predictor_name = "unknown"
+            predictor_type = type(predictor_obj).__name__
+
+            for name, pred in predictor_lookup.items():
+                if pred is predictor_obj:
+                    predictor_name = name
+                    break
+
+            instructions = ""
+            if hasattr(predictor_obj, "signature") and hasattr(predictor_obj.signature, "instructions"):
+                instructions = predictor_obj.signature.instructions
+
+            execution_flow.append(
+                ExecutionFlowEntry(
+                    predictor_name=predictor_name,
+                    predictor_type=predictor_type,
+                    inputs=str(inputs),
+                    outputs=str(outputs),
+                    instructions=instructions,
+                )
+            )
+
+        return execution_flow
+
+    def _format_execution_flow_as_graph(self, execution_flow: list[ExecutionFlowEntry]) -> str:
+        """Format execution flow as a relationship graph showing predictor dependencies."""
+        if not execution_flow:
+            return "No execution flow available"
+
+        if len(execution_flow) == 1:
+            entry = execution_flow[0]
+            return f"Single predictor: {entry.predictor_name} ({entry.predictor_type})"
+
+        flow_lines: list[str] = ["Program Flow:"]
+
+        for i in range(len(execution_flow)):
+            current = execution_flow[i]
+            if i == 0:
+                flow_lines.append(f"Input → {current.predictor_name}")
+
+            if i < len(execution_flow) - 1:
+                next_pred = execution_flow[i + 1]
+                flow_lines.append(f"{current.predictor_name} → {next_pred.predictor_name}")
+            else:
+                flow_lines.append(f"{current.predictor_name} → Output")
+
+        flow_lines.append("\nPredictor Types:")
+        for entry in execution_flow:
+            flow_lines.append(f"  - {entry.predictor_name}: {entry.predictor_type}")
+
+        return "\n".join(flow_lines)
+
+    def _format_execution_flow_with_details(self, execution_flow: list[ExecutionFlowEntry]) -> str:
+        """Format execution flow with instructions but without I/O values for analysis."""
+        if not execution_flow:
+            return "No execution flow available"
+
+        flow_parts: list[str] = []
+
+        flow_parts.append(self._format_execution_flow_as_graph(execution_flow))
+        flow_parts.append("\nPredictor Instructions:")
+
+        for idx, entry in enumerate(execution_flow, start=1):
+            flow_parts.append(
+                f"\n{idx}. {entry.predictor_name}:\n"
+                f"   Instructions: {entry.instructions if entry.instructions else 'No instructions'}"
+            )
+
+        return "\n".join(flow_parts)
 
     def _evaluate_metric(
         self,
@@ -967,18 +1066,22 @@ class APEX(Teleprompter):
                 inputs = record.example.inputs().toDict()
                 expected = record.example.labels().toDict()
 
+                execution_flow_str = self._format_execution_flow_with_details(record.execution_flow)
+
                 if mode == "failure":
                     result = predictor(
                         problem=str(inputs),
                         prediction=str(record.prediction) if record.prediction else "",
                         expected=str(expected),
                         error=record.error or "",
+                        execution_flow=execution_flow_str,
                     )
                 else:
                     result = predictor(
                         problem=str(inputs),
                         prediction=str(record.prediction) if record.prediction else "",
                         expected=str(expected),
+                        execution_flow=execution_flow_str,
                     )
 
             return result
@@ -1048,11 +1151,14 @@ class APEX(Teleprompter):
             ]
         )
 
+        program_flow = snapshot.flow_description
+
         with dspy.context(lm=self.hypothesis_lm, adapter=self.hypothesis_adapter):
             predictor = dspy.Predict(HypothesisGenerationSignature)
             result = predictor(
                 failure_analyses=failure_text,
                 success_analyses=success_text,
+                program_flow=program_flow,
                 current_prompts=prompt_text,
                 num_hypotheses=self.num_hypotheses,
             )
@@ -1202,7 +1308,14 @@ class APEX(Teleprompter):
             lookup[id(predictor)] = name
 
         structure = repr(program)
-        flow_description = " -> ".join(flow) if flow else "No predictors"
+
+        if not flow:
+            flow_description = "No predictors"
+        elif len(flow) == 1:
+            flow_description = f"Single predictor: {flow[0]}"
+        else:
+            flow_description = "Input → " + " → ".join(flow) + " → Output"
+
         return ProgramSnapshot(
             structure=structure,
             flow_description=flow_description,
