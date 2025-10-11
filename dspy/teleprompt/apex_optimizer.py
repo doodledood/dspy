@@ -554,6 +554,7 @@ class APEX(Teleprompter):
             iteration_logs = checkpoint.iteration_logs
             best_candidate = checkpoint.best_candidate
             baseline_candidate = checkpoint.baseline_candidate
+            current_baseline_candidate = checkpoint.baseline_candidate
             no_improvement_count = checkpoint.no_improvement_count
             iteration = checkpoint.iteration
             self._rng.setstate(checkpoint.rng_state)
@@ -585,6 +586,7 @@ class APEX(Teleprompter):
             )
             all_candidates.append(baseline_candidate)
             best_candidate = baseline_candidate
+            current_baseline_candidate = baseline_candidate
             self._log(f"APEX: Initial baseline score={baseline_candidate.overall_score:.4f}", Verbosity.NORMAL)
 
             no_improvement_count = 0
@@ -701,6 +703,7 @@ class APEX(Teleprompter):
                 hypotheses=hypotheses,
                 calset=valset,
                 iteration=iteration,
+                cached_baseline=current_baseline_candidate if iteration > 1 else None,
             )
 
             best_candidate_for_iteration = self._select_best_candidate(candidates)
@@ -774,6 +777,7 @@ class APEX(Teleprompter):
             else:
                 no_improvement_count = 0
                 current_program = best_candidate_for_iteration.program
+                current_baseline_candidate = best_candidate_for_iteration
                 self._log(
                     "APEX: Updating program with hypothesis improvements",
                     Verbosity.HIGH,
@@ -1083,16 +1087,26 @@ class APEX(Teleprompter):
         hypotheses: list[HypothesisSpec],
         calset: list[Example],
         iteration: int,
+        cached_baseline: CandidateRecord | None = None,
     ) -> list[CandidateRecord]:
         candidates: list[CandidateRecord] = []
 
-        baseline_clone = baseline.deepcopy()
-        baseline_record = self._evaluate_candidate(
-            program=baseline_clone,
-            calset=calset,
-            iteration=iteration,
-            hypothesis=None,
-        )
+        if cached_baseline:
+            baseline_record = CandidateRecord(
+                program=baseline,
+                overall_score=cached_baseline.overall_score,
+                per_example_scores=cached_baseline.per_example_scores,
+                iteration=iteration,
+                hypothesis=None,
+            )
+        else:
+            baseline_record = self._evaluate_candidate(
+                program=baseline.deepcopy(),
+                calset=calset,
+                iteration=iteration,
+                hypothesis=None,
+            )
+
         candidates.append(baseline_record)
         self._log(
             f"APEX: iteration {iteration} baseline score={baseline_record.overall_score:.4f}",
