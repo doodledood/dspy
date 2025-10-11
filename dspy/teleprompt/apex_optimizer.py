@@ -210,6 +210,8 @@ class APEX(Teleprompter):
         analysis_lm: LM | None = None,
         max_iterations: int,
         hypothesis_llm: LM | None = None,
+        analysis_adapter: JSONAdapter | None = None,
+        hypothesis_adapter: JSONAdapter | None = None,
         num_hypotheses: int = 1,
         num_eval_runs: int = 1,
         train_sample: None | int | SamplerFn = None,
@@ -255,7 +257,8 @@ class APEX(Teleprompter):
         self._hypothesis_predictor = dspy.Predict(JsonResponseSignature, lm=hypothesis_model)
         self._analysis_predictor.lm = analysis_model
         self._hypothesis_predictor.lm = hypothesis_model
-        self._json_adapter = JSONAdapter()
+        self.analysis_adapter = analysis_adapter or JSONAdapter()
+        self.hypothesis_adapter = hypothesis_adapter or JSONAdapter()
 
     def compile(
         self,
@@ -413,6 +416,8 @@ class APEX(Teleprompter):
         with dspy.settings.context(trace=[]):
             try:
                 prediction_obj = program(**input_kwargs)
+                if prediction_obj is not None:
+                    prediction_obj = self._sanitize_prediction(prediction_obj)
             except Exception as exc:  # pragma: no cover - defensive
                 logger.exception("APEX failed to execute program on example.", exc_info=exc)
                 error_message = f"execution_error: {exc}"
@@ -494,7 +499,7 @@ class APEX(Teleprompter):
                 else record.success_payload(snapshot, success_threshold)
             )
             prompt = prompt_builder(payload)
-            with dspy.settings.context(adapter=self._json_adapter):
+            with dspy.settings.context(adapter=self.analysis_adapter):
                 prediction = self._analysis_predictor(analysis_prompt=prompt)
             json_payload = self._normalize_json_response(prediction.json_response)
             analyses.append(target_model.model_validate(json_payload))
@@ -543,7 +548,7 @@ class APEX(Teleprompter):
             num_hypotheses=self.num_hypotheses,
         )
         prompt = self._build_hypothesis_prompt(payload)
-        with dspy.settings.context(adapter=self._json_adapter):
+        with dspy.settings.context(adapter=self.hypothesis_adapter):
             prediction = self._hypothesis_predictor(analysis_prompt=prompt)
         data = self._normalize_json_response(prediction.json_response)
         if not isinstance(data, list):
@@ -602,6 +607,7 @@ class APEX(Teleprompter):
             for _ in range(self.num_eval_runs):
                 with dspy.settings.context(trace=[]):
                     prediction = program(**example.inputs().toDict())
+                    prediction = self._sanitize_prediction(prediction)
                     trace_entries = list(dspy.settings.trace or [])
                 score, _ = self._evaluate_metric(example, prediction, trace_entries)
                 score = max(self.min_metric, min(self.max_metric, score))
@@ -679,6 +685,22 @@ class APEX(Teleprompter):
         return self._serialize_mapping(prediction.toDict())
 
     def _serialize_value(self, value: Any) -> JsonValue:
+        if hasattr(value, "message") and getattr(value, "message") is not None:
+            return self._serialize_value(getattr(value, "message"))
+        if hasattr(value, "choices") and getattr(value, "choices") is not None:
+            choices = getattr(value, "choices")
+            return self._serialize_value(list(choices))
+        if hasattr(value, "content") and not isinstance(value, (str, bytes)):
+            content = getattr(value, "content")
+            if isinstance(content, list):
+                joined = "".join(
+                    part
+                    if isinstance(part, str)
+                    else str(part.get("text", ""))
+                    for part in content
+                )
+                return joined
+            return self._serialize_value(content)
         if isinstance(value, str | int | float | bool) or value is None:
             return value
         if isinstance(value, list):
@@ -692,6 +714,12 @@ class APEX(Teleprompter):
         if hasattr(value, "dict"):
             return self._serialize_value(value.dict())
         return str(value)
+
+    def _sanitize_prediction(self, prediction: Prediction) -> Prediction:
+        sanitized: dict[str, JsonValue] = {}
+        for key in prediction.keys():
+            sanitized[key] = self._serialize_value(prediction[key])
+        return Prediction(**sanitized)
 
     # --- Prompt builders & invocation helpers ------------------------------------
 

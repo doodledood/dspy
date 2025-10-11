@@ -7,6 +7,8 @@ outperforms the current baseline. The loop is intentionally simple—no Pareto f
 or stochastic branching—so you can understand, debug, and reproduce every prompt
 change that lands in your system.
 
+[👉 Run the hands-on notebook on the PAPILLON dataset.](./apex_optimizer/index.ipynb)
+
 ## When to use APEX
 
 - You can capture full execution traces of your DSPy program.
@@ -80,8 +82,10 @@ All candidates are tracked across iterations, so you can audit how prompts evolv
 | Parameter | Default | Description |
 | --- | --- | --- |
 | `metric` | **required** | Callable returning `float` or `{"score": float, "feedback": str}`. |
-| `analysis_llm` | **required** | Callable used for per-example analysis (must return JSON). |
-| `hypothesis_llm` | `analysis_llm` | Callable that synthesizes hypotheses (returns JSON list). |
+| `analysis_llm` | **required** | `dspy.clients.lm.LM` used for per-example analysis (expects JSON-compatible output). |
+| `analysis_adapter` | `JSONAdapter()` | Adapter used when invoking the analysis LM. |
+| `hypothesis_llm` | `analysis_llm` | LM that synthesizes hypotheses (defaults to `analysis_llm`). |
+| `hypothesis_adapter` | `analysis_adapter` | Adapter used when invoking the hypothesis LM. |
 | `max_iterations` | **required** | Hard iteration cap for the optimization loop. |
 | `num_hypotheses` | `1` | Max hypotheses generated per iteration. |
 | `num_eval_runs` | `1` | Evaluation repeats per calibration example (median reduces variance). |
@@ -91,24 +95,30 @@ All candidates are tracked across iterations, so you can audit how prompts evolv
 | `convergence_patience` | `3` | Stop after this many consecutive non-improving iterations. |
 | `seed` | random | RNG seed controlling sampling and tie-breaking. |
 
-## Providing analysis models
+## Configuring the analysis models
 
-`analysis_llm` and `hypothesis_llm` can be any callable that returns valid JSON. Many
-users wrap an LM client to ensure JSON output, for example:
+`analysis_llm` and `hypothesis_llm` should be instances of `dspy.clients.lm.LM` (or a
+test double such as `DummyLM`). APEX automatically wraps each call with `JSONAdapter`,
+so you only need to supply the underlying LM:
 
 ```python
-import json
+import dspy
 
-def call_json(llm, prompt):
-    response = llm(prompt=prompt)[0]  # first completion
-    return json.loads(response)
+analysis_llm = dspy.LM("openai/gpt-4o", max_tokens=1200, temperature=0.0)
+hypothesis_llm = dspy.LM("openai/gpt-4o-mini", max_tokens=1800, temperature=0.2)
 
-analysis_llm = lambda payload: call_json(tracing_lm, payload)
+apex = dspy.APEX(
+    metric=metric,
+    analysis_llm=analysis_llm,
+    hypothesis_llm=hypothesis_llm,
+    max_iterations=8,
+    train_sample=64,
+    num_eval_runs=3,
+)
 ```
 
-APEX ships prompt builders aligned with the design document, but you are free to replace
-them if you want custom formats—just ensure your responder returns the schema expected by
-`APEX._parse_hypothesis`.
+For unit tests or deterministic runs you can plug in `dspy.utils.dummies.DummyLM`,
+providing structured responses that mimic the expected JSON payloads.
 
 ## Inspecting results
 
