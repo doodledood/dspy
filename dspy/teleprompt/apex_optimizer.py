@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import logging
 import random
+from enum import Enum
 from statistics import median
-from typing import Any, Callable, Iterable, Mapping, Sequence, TypeAlias, TypeVar, cast
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence, TypeAlias, TypeVar, cast
 
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError
+from tqdm.auto import tqdm
 
 import dspy
 from dspy.adapters import JSONAdapter
@@ -22,8 +24,35 @@ JsonObject: TypeAlias = dict[str, JsonValue]
 TraceEntry: TypeAlias = tuple[Any, Mapping[str, Any], Prediction]
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
+ItemT = TypeVar("ItemT")
 MetricFn = Callable[[Example, Prediction, list[TraceEntry]], Any]
 SamplerFn = Callable[[list[Example], int], list[Example]]
+
+
+class Verbosity(str, Enum):
+    NONE = "none"
+    NORMAL = "normal"
+    HIGH = "high"
+
+    @classmethod
+    def parse(cls, value: str | Verbosity | None) -> Verbosity:
+        if value is None:
+            return cls.NORMAL
+        if isinstance(value, cls):
+            return value
+        normalized = value.lower()
+        for member in cls:
+            if member.value == normalized:
+                return member
+        raise ValueError(f"Unsupported verbosity level '{value}'. Use one of: none, normal, high.")
+
+
+def _verbosity_rank(level: Verbosity) -> int:
+    return {
+        Verbosity.NONE: 0,
+        Verbosity.NORMAL: 1,
+        Verbosity.HIGH: 2,
+    }[level]
 
 
 class JsonResponseSignature(dspy.Signature):
@@ -212,6 +241,7 @@ class APEX(Teleprompter):
         hypothesis_llm: LM | None = None,
         analysis_adapter: JSONAdapter | None = None,
         hypothesis_adapter: JSONAdapter | None = None,
+        verbosity: Verbosity | str | None = None,
         num_hypotheses: int = 1,
         num_eval_runs: int = 1,
         train_sample: None | int | SamplerFn = None,
@@ -247,6 +277,7 @@ class APEX(Teleprompter):
         self.num_hypotheses = num_hypotheses
         self.num_eval_runs = num_eval_runs
         self.train_sample = train_sample
+        self.verbosity = Verbosity.parse(verbosity)
         self.min_metric = float(min_metric)
         self.max_metric = float(max_metric)
         self.success_threshold = float(success_threshold) if success_threshold is not None else float(max_metric)
@@ -259,6 +290,32 @@ class APEX(Teleprompter):
         self._hypothesis_predictor.lm = hypothesis_model
         self.analysis_adapter = analysis_adapter or JSONAdapter()
         self.hypothesis_adapter = hypothesis_adapter or JSONAdapter()
+
+    # --- Logging & progress helpers ---------------------------------------------
+
+    def _is_enabled(self, level: Verbosity) -> bool:
+        return _verbosity_rank(self.verbosity) >= _verbosity_rank(level)
+
+    def _log(self, message: str, level: Verbosity = Verbosity.NORMAL) -> None:
+        if self._is_enabled(level):
+            logger.info(message)
+
+    def _iter_with_progress(
+        self,
+        iterable: Iterable[ItemT],
+        *,
+        description: str,
+        level: Verbosity,
+        total: int | None = None,
+    ) -> Iterator[ItemT]:
+        if not self._is_enabled(level):
+            yield from iterable
+            return
+        progress_total = total
+        if progress_total is None and hasattr(iterable, "__len__"):
+            progress_total = len(iterable)  # type: ignore[arg-type]
+        with tqdm(iterable, total=progress_total, desc=description, leave=False) as progress:
+            yield from progress
 
     def compile(
         self,
@@ -287,6 +344,10 @@ class APEX(Teleprompter):
 
         for iteration in range(1, self.max_iterations + 1):
             sampled_train = self._sample_trainset(trainset, iteration)
+            self._log(
+                f"APEX: iteration {iteration} started (train sample={len(sampled_train)}, val size={len(valset)})",
+                Verbosity.NORMAL,
+            )
             baseline_for_analysis = current_program.deepcopy()
             snapshot = self._snapshot_program(baseline_for_analysis)
 
@@ -309,11 +370,20 @@ class APEX(Teleprompter):
                     success_threshold=self.success_threshold,
                 ),
             )
+            if self._is_enabled(Verbosity.HIGH):
+                self._log(
+                    f"APEX: iteration {iteration} analyzed {len(failure_summaries)} failure(s) and {len(success_summaries)} success(es)",
+                    Verbosity.HIGH,
+                )
 
             hypotheses = self._generate_hypotheses(
                 failure_summaries=failure_summaries,
                 success_summaries=success_summaries,
                 snapshot=snapshot,
+            )
+            self._log(
+                f"APEX: iteration {iteration} produced {len(hypotheses)} hypothesis(es)",
+                Verbosity.NORMAL,
             )
 
             candidates = self._evaluate_candidates(
@@ -341,6 +411,10 @@ class APEX(Teleprompter):
                 best_candidate = best_candidate_for_iteration
 
             baseline_candidate = candidates[0]
+            self._log(
+                f"APEX: iteration {iteration} best score={best_candidate_for_iteration.overall_score:.4f}",
+                Verbosity.NORMAL,
+            )
             if best_candidate_for_iteration is baseline_candidate:
                 no_improvement_count += 1
                 if no_improvement_count >= self.convergence_patience:
@@ -390,7 +464,12 @@ class APEX(Teleprompter):
         failure_records: list[TrainExampleRecord] = []
         success_records: list[TrainExampleRecord] = []
 
-        for example in trainset:
+        examples = list(trainset)
+        for example in self._iter_with_progress(
+            examples,
+            description="APEX: evaluating trainset",
+            level=Verbosity.NORMAL,
+        ):
             record = self._run_single_example(program, example, snapshot.predictor_name_by_id)
             if record.is_success:
                 success_records.append(record)
@@ -492,7 +571,12 @@ class APEX(Teleprompter):
 
         analyses: list[BaseModel] = []
         target_model = FailureAnalysis if mode == "failure" else SuccessAnalysis
-        for record in records:
+        iterator = self._iter_with_progress(
+            records,
+            description=f"APEX: analyzing {mode}s",
+            level=Verbosity.HIGH,
+        )
+        for index, record in enumerate(iterator, start=1):
             payload = (
                 record.failure_payload(snapshot, success_threshold)
                 if mode == "failure"
@@ -502,7 +586,19 @@ class APEX(Teleprompter):
             with dspy.settings.context(adapter=self.analysis_adapter):
                 prediction = self._analysis_predictor(analysis_prompt=prompt)
             json_payload = self._normalize_json_response(prediction.json_response)
-            analyses.append(target_model.model_validate(json_payload))
+            analysis = target_model.model_validate(json_payload)
+            analyses.append(analysis)
+            if self._is_enabled(Verbosity.HIGH):
+                if isinstance(analysis, FailureAnalysis):
+                    self._log(
+                        f"APEX: failure analysis #{index} ({analysis.category}) → {analysis.root_cause}",
+                        Verbosity.HIGH,
+                    )
+                elif isinstance(analysis, SuccessAnalysis):
+                    self._log(
+                        f"APEX: success analysis #{index} ({analysis.category}) → {analysis.success_pattern}",
+                        Verbosity.HIGH,
+                    )
         return analyses
 
     def _analyze_successes(
@@ -559,6 +655,12 @@ class APEX(Teleprompter):
                 specs.append(HypothesisSpec.model_validate(item))
             except ValidationError as exc:  # pragma: no cover - debug aid
                 raise ValueError("APEX received an invalid hypothesis JSON payload.") from exc
+        if self._is_enabled(Verbosity.HIGH):
+            for idx, spec in enumerate(specs, start=1):
+                self._log(
+                    f"APEX: hypothesis #{idx} ({spec.strategy}) targeting {', '.join(spec.fixable_root_causes) or 'no fixable causes'}",
+                    Verbosity.HIGH,
+                )
         return specs[: self.num_hypotheses]
 
     # --- Candidate evaluation -----------------------------------------------------
@@ -581,6 +683,10 @@ class APEX(Teleprompter):
             hypothesis=None,
         )
         candidates.append(baseline_record)
+        self._log(
+            f"APEX: iteration {iteration} baseline score={baseline_record.overall_score:.4f}",
+            Verbosity.NORMAL,
+        )
 
         for hypothesis in hypotheses:
             candidate_program = self._apply_hypothesis(baseline, hypothesis)
@@ -591,6 +697,15 @@ class APEX(Teleprompter):
                 hypothesis=hypothesis,
             )
             candidates.append(record)
+            self._log(
+                f"APEX: iteration {iteration} hypothesis score={record.overall_score:.4f}",
+                Verbosity.NORMAL,
+            )
+            if self._is_enabled(Verbosity.HIGH):
+                self._log(
+                    f"APEX: hypothesis details → {hypothesis.model_dump()}",
+                    Verbosity.HIGH,
+                )
         return candidates
 
     def _evaluate_candidate(
@@ -602,7 +717,13 @@ class APEX(Teleprompter):
         hypothesis: HypothesisSpec | None,
     ) -> CandidateRecord:
         scores: list[float] = []
-        for example in calset:
+        label = "baseline" if hypothesis is None else "hypothesis"
+        cal_examples = list(calset)
+        for example in self._iter_with_progress(
+            cal_examples,
+            description=f"APEX: evaluating {label}",
+            level=Verbosity.NORMAL,
+        ):
             per_runs: list[float] = []
             for _ in range(self.num_eval_runs):
                 with dspy.settings.context(trace=[]):
@@ -685,22 +806,25 @@ class APEX(Teleprompter):
         return self._serialize_mapping(prediction.toDict())
 
     def _serialize_value(self, value: Any) -> JsonValue:
-        if hasattr(value, "message") and getattr(value, "message") is not None:
-            return self._serialize_value(getattr(value, "message"))
-        if hasattr(value, "choices") and getattr(value, "choices") is not None:
-            choices = getattr(value, "choices")
-            return self._serialize_value(list(choices))
-        if hasattr(value, "content") and not isinstance(value, (str, bytes)):
-            content = getattr(value, "content")
-            if isinstance(content, list):
+        if hasattr(value, "message"):
+            message_value = value.message
+            if message_value is not None:
+                return self._serialize_value(message_value)
+        if hasattr(value, "choices"):
+            choices_value = value.choices
+            if choices_value is not None:
+                return self._serialize_value(list(choices_value))
+        if hasattr(value, "content") and not isinstance(value, str | bytes):
+            content_value = value.content
+            if isinstance(content_value, list):
                 joined = "".join(
                     part
                     if isinstance(part, str)
                     else str(part.get("text", ""))
-                    for part in content
+                    for part in content_value
                 )
                 return joined
-            return self._serialize_value(content)
+            return self._serialize_value(content_value)
         if isinstance(value, str | int | float | bool) or value is None:
             return value
         if isinstance(value, list):

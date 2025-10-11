@@ -2,7 +2,7 @@ import pytest
 
 import dspy
 from dspy import Example
-from dspy.teleprompt.apex_optimizer import APEX
+from dspy.teleprompt.apex_optimizer import APEX, Verbosity
 from dspy.utils.dummies import DummyLM
 
 
@@ -95,6 +95,7 @@ def test_apex_improves_and_tracks_history():
         num_eval_runs=1,
         train_sample=None,
         seed=42,
+        verbosity="none",
     )
 
     student = PromptDrivenModule(initial_prompt="bad")
@@ -151,6 +152,7 @@ def test_apex_train_sampling_controls_analysis_calls():
         num_eval_runs=1,
         convergence_patience=1,
         seed=0,
+        verbosity="none",
     )
 
     student = PromptDrivenModule(initial_prompt="bad")
@@ -196,6 +198,7 @@ def test_apex_sampling_callable_receives_iteration():
         num_eval_runs=1,
         convergence_patience=1,
         seed=13,
+        verbosity="none",
     )
 
     trainset = [make_train_example("x"), make_train_example("y"), make_train_example("z")]
@@ -224,6 +227,7 @@ def test_apex_rejects_invalid_analysis_json():
         num_hypotheses=1,
         convergence_patience=1,
         seed=0,
+        verbosity="none",
     )
 
     student = PromptDrivenModule(initial_prompt="bad")
@@ -283,6 +287,7 @@ def test_apex_trims_hypotheses_to_limit():
         num_hypotheses=1,
         convergence_patience=1,
         seed=0,
+        verbosity="none",
     )
 
     student = PromptDrivenModule(initial_prompt="bad")
@@ -323,6 +328,7 @@ def test_apex_handles_fewer_successes_than_failures():
         num_hypotheses=1,
         convergence_patience=1,
         seed=123,
+        verbosity="none",
     )
 
     student = PromptDrivenModule(initial_prompt="bad")
@@ -370,6 +376,7 @@ def test_apex_end_to_end_fake_data():
         convergence_patience=1,
         num_eval_runs=1,
         seed=99,
+        verbosity="none",
     )
 
     student = PromptDrivenModule(initial_prompt="baseline")
@@ -405,6 +412,84 @@ def test_apex_end_to_end_fake_data():
     assert result.all_candidates[0].hypothesis is None
     assert result.all_candidates[1].hypothesis is not None
     assert result.all_candidates[2].hypothesis is None
+
+
+def test_apex_normal_verbosity_logs_candidates_only():
+    trainset = [make_train_example("x")]
+    calset = trainset
+
+    analysis_lm = DummyLM(
+        [make_analysis_response("normal verbosity check")],
+        adapter=dspy.JSONAdapter(),
+    )
+    hypothesis_lm = DummyLM(
+        [make_hypothesis_response("good")],
+        adapter=dspy.JSONAdapter(),
+    )
+
+    optimizer = APEX(
+        metric=metric,
+        analysis_llm=analysis_lm,
+        hypothesis_llm=hypothesis_lm,
+        max_iterations=1,
+        num_hypotheses=1,
+        convergence_patience=1,
+        seed=7,
+        verbosity="normal",
+    )
+
+    messages: list[tuple[Verbosity, str]] = []
+
+    def capture(message: str, level: Verbosity = Verbosity.NORMAL) -> None:
+        if optimizer._is_enabled(level):
+            messages.append((level, message))
+
+    optimizer._log = capture  # type: ignore[assignment]
+
+    student = PromptDrivenModule(initial_prompt="bad")
+    optimizer.compile(student, trainset=trainset, valset=calset)
+
+    assert any("hypothesis score" in msg for _, msg in messages)
+    assert all("failure analysis" not in msg for _, msg in messages)
+
+
+def test_apex_high_verbosity_logs_analysis():
+    trainset = [make_train_example("y")]
+    calset = trainset
+
+    analysis_lm = DummyLM(
+        [make_analysis_response("high verbosity issue")],
+        adapter=dspy.JSONAdapter(),
+    )
+    hypothesis_lm = DummyLM(
+        [make_hypothesis_response("better")],
+        adapter=dspy.JSONAdapter(),
+    )
+
+    optimizer = APEX(
+        metric=metric,
+        analysis_llm=analysis_lm,
+        hypothesis_llm=hypothesis_lm,
+        max_iterations=1,
+        num_hypotheses=1,
+        convergence_patience=1,
+        seed=8,
+        verbosity="high",
+    )
+
+    messages: list[tuple[Verbosity, str]] = []
+
+    def capture(message: str, level: Verbosity = Verbosity.NORMAL) -> None:
+        if optimizer._is_enabled(level):
+            messages.append((level, message))
+
+    optimizer._log = capture  # type: ignore[assignment]
+
+    student = PromptDrivenModule(initial_prompt="bad")
+    optimizer.compile(student, trainset=trainset, valset=calset)
+
+    assert any("hypothesis score" in msg for _, msg in messages)
+    assert any("failure analysis" in msg for _, msg in messages)
 
 
 def test_apex_public_api_exposed():
