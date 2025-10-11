@@ -86,10 +86,7 @@ class FailureAnalysisSignature(Signature):
         desc="Relevant characteristics of this example that are important for understanding when/why this failure occurs. "
         "Include input characteristics, intermediate state issues, or patterns that would help generalize to similar failures."
     )
-    category: str = OutputField(
-        desc="Short label categorizing this failure type (e.g., 'format_ambiguity', 'incomplete_reasoning', "
-        "'upstream_error_propagation', 'missing_constraints')"
-    )
+    category: str = OutputField(desc="Short label categorizing this failure type")
     key_details: str = OutputField(
         desc="Additional important information that would help someone design a fix. "
         "What specifically went wrong in the predictor's processing? What should have happened instead?"
@@ -125,9 +122,7 @@ class SuccessAnalysisSignature(Signature):
         desc="Relevant characteristics of this example that help explain the success. "
         "What about the input, intermediate outputs, or execution made this work?"
     )
-    category: str = OutputField(
-        desc="Short label for this success type (e.g., 'clear_format_compliance', 'complete_reasoning', 'robust_handling')"
-    )
+    category: str = OutputField(desc="Short label for this success type")
     key_details: str = OutputField(
         desc="What specifically worked well? What aspects of the prompts or execution should be preserved or amplified?"
     )
@@ -680,11 +675,6 @@ class APEX(Teleprompter):
                         f"APEX: iteration {iteration} analyzed {len(failure_summaries)} failure(s) and {len(success_summaries)} success(es)",
                         Verbosity.HIGH,
                     )
-                    if failure_summaries:
-                        self._log(
-                            f"APEX: Top failure categories: {', '.join({f.category for f in failure_summaries[:5]})}",
-                            Verbosity.HIGH,
-                        )
 
                 hypotheses = self._generate_hypotheses(
                     failure_summaries=failure_summaries,
@@ -807,6 +797,18 @@ class APEX(Teleprompter):
             stop_reason = "interrupted"
             self._log("APEX: Optimization interrupted by user (Ctrl+C)", Verbosity.NORMAL)
 
+            if "candidates" in locals() and candidates:
+                iteration_logs.append(
+                    ApexIterationLog(
+                        iteration=iteration,
+                        sampled_train_size=len(sampled_train) if "sampled_train" in locals() else 0,
+                        num_failures=len(failure_summaries) if "failure_summaries" in locals() else 0,
+                        num_successes=len(success_summaries) if "success_summaries" in locals() else 0,
+                        hypotheses=hypotheses if "hypotheses" in locals() else [],
+                        candidates=candidates,
+                    )
+                )
+
             if self.checkpoint_dir:
                 self._save_checkpoint(
                     iteration=iteration,
@@ -836,9 +838,11 @@ class APEX(Teleprompter):
                 f"APEX: Summary - evaluated {total_candidates} candidates from {total_hypotheses} hypotheses",
                 Verbosity.HIGH,
             )
-            score_trajectory = [log.candidates[0].overall_score for log in iteration_logs]
+            score_trajectory = [
+                max(c.overall_score for c in log.candidates) if log.candidates else 0.0 for log in iteration_logs
+            ]
             self._log(
-                f"APEX: Score trajectory across iterations: {score_trajectory}",
+                f"APEX: Best score trajectory across iterations: {score_trajectory}",
                 Verbosity.HIGH,
             )
 
@@ -1256,15 +1260,19 @@ class APEX(Teleprompter):
         cal_examples = list(calset)
 
         def process(example: Example) -> float:
-            per_runs: list[float] = []
-            for _ in range(self.num_eval_runs):
-                with dspy.settings.context(trace=[]):
-                    prediction = program(**example.inputs().toDict())
-                    trace_entries = list(dspy.settings.trace or [])
-                score, _ = self._evaluate_metric(example, prediction, trace_entries)
-                score = max(self.min_metric, min(self.max_metric, score))
-                per_runs.append(score)
-            return median(per_runs)
+            try:
+                per_runs: list[float] = []
+                for _ in range(self.num_eval_runs):
+                    with dspy.settings.context(trace=[]):
+                        prediction = program(**example.inputs().toDict())
+                        trace_entries = list(dspy.settings.trace or [])
+                    score, _ = self._evaluate_metric(example, prediction, trace_entries)
+                    score = max(self.min_metric, min(self.max_metric, score))
+                    per_runs.append(score)
+                return median(per_runs)
+            except Exception as e:
+                self._log(f"APEX: Error evaluating example: {str(e)[:200]}", Verbosity.NORMAL, "warning")
+                return self.min_metric
 
         scores = self._parallel_execute(
             cal_examples,
@@ -1273,11 +1281,17 @@ class APEX(Teleprompter):
             level=Verbosity.NORMAL,
         )
 
-        overall = sum(scores) / len(scores)
+        # Filter out None values that may result from parallel execution errors
+        valid_scores = [s for s in scores if s is not None]
+        if not valid_scores:
+            self._log(f"APEX: Warning - no valid scores obtained for {label}", Verbosity.NORMAL, "warning")
+            valid_scores = [self.min_metric]  # Use minimum metric as fallback
+
+        overall = sum(valid_scores) / len(valid_scores)
         return CandidateRecord(
             program=program,
             overall_score=overall,
-            per_example_scores=scores,
+            per_example_scores=valid_scores,
             iteration=iteration,
             hypothesis=hypothesis,
         )
