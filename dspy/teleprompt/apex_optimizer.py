@@ -91,7 +91,6 @@ class HypothesisPromptPayload(BaseModel):
     num_hypotheses: int
 
 
-
 class PredictorTraceRecord(BaseModel):
     name: str
     prompt: str

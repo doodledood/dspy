@@ -18,6 +18,18 @@ def make_analysis_response(root_cause: str = "Prompt missing correct token") -> 
     }
 
 
+def make_success_response(pattern: str = "Prompt handled well") -> dict:
+    return {
+        "json_response": {
+            "success_pattern": pattern,
+            "contributing_predictors": ["predictor"],
+            "context": "Handled correctly",
+            "category": "clear_format_compliance",
+            "key_details": "Keep current instructions",
+        }
+    }
+
+
 def make_hypothesis_response(prompt_value: str = "good") -> dict:
     return {
         "json_response": [
@@ -298,6 +310,7 @@ def test_apex_handles_fewer_successes_than_failures():
     analysis_payloads = [
         make_analysis_response("mixed failure 1"),
         make_analysis_response("mixed failure 2"),
+        make_success_response("success pattern"),
     ]
     analysis_lm = DummyLM(analysis_payloads, adapter=dspy.JSONAdapter())
     hypothesis_lm = DummyLM([make_hypothesis_response()], adapter=dspy.JSONAdapter())
@@ -315,8 +328,8 @@ def test_apex_handles_fewer_successes_than_failures():
     student = PromptDrivenModule(initial_prompt="bad")
     optimized = optimizer.compile(student, trainset=trainset, valset=calset)
 
-    # Only two failure analyses should have been requested despite one success available.
-    assert len(analysis_lm.history) == 2
+    # Ensures we analyzed all failures plus the single available success (no duplication).
+    assert len(analysis_lm.history) == len(analysis_payloads)
     assert optimized.apex_result.best_candidate.overall_score >= 1.0
 
 
