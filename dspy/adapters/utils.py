@@ -4,11 +4,12 @@ import inspect
 import json
 import types
 from collections.abc import Mapping
+from dataclasses import asdict, is_dataclass
 from typing import Any, Literal, Union, get_args, get_origin
 
 import json_repair
 import pydantic
-from pydantic import TypeAdapter
+from pydantic import BaseModel, TypeAdapter
 from pydantic.fields import FieldInfo
 
 from dspy.adapters.types.base_type import Type as DspyType
@@ -24,6 +25,25 @@ def serialize_for_json(value: Any) -> Any:
     Returns:
         The formatted value, which is serializable as a JSON string.
     """
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json")
+
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        try:
+            return model_dump(mode="json")
+        except TypeError:
+            return model_dump()
+
+    if is_dataclass(value):
+        return asdict(value)
+
+    if isinstance(value, Mapping):
+        return {k: serialize_for_json(v) for k, v in value.items()}
+
+    if isinstance(value, (list, tuple, set)):
+        return [serialize_for_json(v) for v in value]
+
     # Attempt to format the value as a JSON-compatible object using pydantic, falling back to
     # a string representation of the value if that fails (e.g. if the value contains an object
     # that pydantic doesn't recognize or can't serialize)
