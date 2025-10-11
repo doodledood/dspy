@@ -5,27 +5,23 @@ import os
 import random
 from enum import Enum
 from statistics import median
-from typing import Any, Callable, Iterable, Iterator, Literal, Mapping, Sequence, TypeAlias, TypeVar, cast
+from typing import Any, Callable, Iterable, Iterator, Literal, Mapping, Sequence, TypeAlias, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue
+from pydantic import BaseModel, ConfigDict, Field
 from tqdm.auto import tqdm
 
 import dspy
-from dspy.adapters import JSONAdapter
 from dspy.clients.lm import LM
 from dspy.primitives import Example, Module, Prediction
-from dspy.signatures import InputField, OutputField
-from dspy.teleprompt.prompts import render_failure_prompt, render_hypothesis_prompt, render_success_prompt
+from dspy.signatures import InputField, OutputField, Signature
 from dspy.teleprompt.teleprompt import Teleprompter
 from dspy.utils.parallelizer import ParallelExecutor
 
 logger = logging.getLogger(__name__)
 
-JsonObject: TypeAlias = dict[str, JsonValue]
 TraceEntry: TypeAlias = tuple[Any, Mapping[str, Any], Prediction]
 LogLevel: TypeAlias = Literal["info", "warning", "debug", "error"]
 
-ModelT = TypeVar("ModelT", bound=BaseModel)
 ItemT = TypeVar("ItemT")
 MetricFn = Callable[[Example, Prediction, list[TraceEntry]], Any]
 SamplerFn = Callable[[list[Example], int], list[Example]]
@@ -57,168 +53,169 @@ def _verbosity_rank(level: Verbosity) -> int:
     }[level]
 
 
-class FailureAnalysisSignature(dspy.Signature):
-    """Analyze a failed example to identify root causes and patterns."""
+class FailureAnalysisSignature(Signature):
+    """Analyze a failure in a DSPy program to identify its root cause.
 
-    analysis_prompt: str = InputField(desc="Fully formatted prompt with failure details.")
-    root_cause: str = OutputField(desc="The primary reason for the failure.")
+    Trace through the execution to find the ROOT CAUSE. The root cause may involve:
+    - A single predictor's prompt being unclear, incomplete, or incorrect
+    - Multiple predictors where an upstream predictor's output causes downstream failures
+    - Interaction issues between predictors
+    - Missing constraints or examples in prompts
+
+    Be thorough but concise. Focus on actionable insights for fixing the prompt(s).
+    """
+
+    problem: str = InputField(desc="The problem statement or input to the program")
+    prediction: str = InputField(desc="The model's actual prediction/output")
+    expected: str = InputField(desc="The expected correct output")
+    error: str = InputField(desc="Error message if execution failed", default="")
+
+    root_cause: str = OutputField(
+        desc="Detailed description of what fundamentally caused this failure. "
+        "Be specific about which predictor(s) and what aspect of their behavior caused the issue."
+    )
     involved_predictors: list[str] = OutputField(
-        desc="List of predictor names involved in the failure.", default_factory=list
+        desc="List of predictor names that contributed to the failure", default_factory=list
     )
-    context: str = OutputField(desc="Additional context about the failure.")
-    category: str = OutputField(desc="Category of the failure (e.g., reasoning, formatting, knowledge).")
-    key_details: str = OutputField(desc="Key details that are important for understanding the failure.")
+    context: str = OutputField(
+        desc="Relevant characteristics of this example that are important for understanding when/why this failure occurs. "
+        "Include input characteristics, intermediate state issues, or patterns that would help generalize to similar failures."
+    )
+    category: str = OutputField(
+        desc="Short label categorizing this failure type (e.g., 'format_ambiguity', 'incomplete_reasoning', "
+        "'upstream_error_propagation', 'missing_constraints')"
+    )
+    key_details: str = OutputField(
+        desc="Additional important information that would help someone design a fix. "
+        "What specifically went wrong in the predictor's processing? What should have happened instead?"
+    )
 
 
-class SuccessAnalysisSignature(dspy.Signature):
-    """Analyze a successful example to identify success patterns."""
+class SuccessAnalysisSignature(Signature):
+    """Analyze a SUCCESS in a DSPy program to understand what worked well.
 
-    analysis_prompt: str = InputField(desc="Fully formatted prompt with success details.")
-    success_pattern: str = OutputField(desc="The pattern that led to success.")
+    This will be contrasted with failures to identify what differentiates successful executions.
+
+    Focus on:
+    - What aspects of the prompts guided correct behavior
+    - How predictors handled this input well
+    - What patterns in the execution led to success
+    - What characteristics distinguish this from potential failures
+
+    Be thorough but concise. Focus on actionable insights that contrast with failures.
+    """
+
+    problem: str = InputField(desc="The problem statement or input to the program")
+    prediction: str = InputField(desc="The model's actual prediction/output")
+    expected: str = InputField(desc="The expected correct output")
+
+    success_pattern: str = OutputField(
+        desc="Clear description of what made this execution successful. What did the predictors do right?"
+    )
     contributing_predictors: list[str] = OutputField(
-        desc="List of predictor names that contributed to success.", default_factory=list
+        desc="List of predictors that worked well in this execution", default_factory=list
     )
-    context: str = OutputField(desc="Additional context about the success.")
-    category: str = OutputField(desc="Category of the success pattern.")
-    key_details: str = OutputField(desc="Key details that are important for understanding the success.")
-
-
-class HypothesisGenerationSignature(dspy.Signature):
-    """Generate hypotheses for improving the program based on failure and success analyses."""
-
-    analysis_prompt: str = InputField(desc="Fully formatted prompt with analyses and current prompts.")
-    hypotheses: list["HypothesisSpec"] = OutputField(desc="List of improvement hypotheses.")
-
-
-class FailureAnalysis(BaseModel):
-    root_cause: str
-    involved_predictors: list[str] = Field(default_factory=list)
-    context: str
-    category: str
-    key_details: str
-
-
-class SuccessAnalysis(BaseModel):
-    success_pattern: str
-    contributing_predictors: list[str] = Field(default_factory=list)
-    context: str
-    category: str
-    key_details: str
-
-
-class FailureExamplePayload(BaseModel):
-    input: JsonValue
-    expected: JsonValue
-    prediction: JsonValue | None
-    metric_score: float
-    metric_feedback: str | None = None
-    trace: list[PredictorTraceRecord]
-    error: str | None = None
-
-
-class SuccessExamplePayload(BaseModel):
-    input: JsonValue
-    expected: JsonValue
-    prediction: JsonValue | None
-    metric_score: float
-    metric_feedback: str | None = None
-    trace: list[PredictorTraceRecord]
-
-
-class FailurePromptPayload(BaseModel):
-    program_structure: str
-    predictor_flow: str
-    predictor_prompts: dict[str, str]
-    failed_example: FailureExamplePayload
-    success_threshold: float
-
-
-class SuccessPromptPayload(BaseModel):
-    program_structure: str
-    predictor_flow: str
-    predictor_prompts: dict[str, str]
-    successful_example: SuccessExamplePayload
-    success_threshold: float
-
-
-class HypothesisPromptPayload(BaseModel):
-    error_summaries: list[JsonObject]
-    success_summaries: list[JsonObject]
-    predictor_prompts: dict[str, str]
-    program_structure: str
-    predictor_flow: str
-    num_hypotheses: int
-
-
-class PredictorTraceRecord(BaseModel):
-    name: str
-    prompt: str
-    inputs: JsonValue
-    outputs: JsonValue
-
-    model_config = ConfigDict(frozen=True)
-
-
-class TrainExampleRecord(BaseModel):
-    example: Example
-    inputs: JsonValue
-    expected: JsonValue
-    prediction: JsonValue | None
-    metric_score: float
-    metric_feedback: str | None = None
-    is_success: bool
-    traces: list[PredictorTraceRecord] = Field(default_factory=list)
-    error: str | None = None
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    def failure_payload(self, snapshot: ProgramSnapshot, success_threshold: float) -> FailurePromptPayload:
-        return FailurePromptPayload(
-            program_structure=snapshot.structure,
-            predictor_flow=snapshot.flow_description,
-            predictor_prompts=snapshot.prompts,
-            failed_example=FailureExamplePayload(
-                input=self.inputs,
-                expected=self.expected,
-                prediction=self.prediction,
-                metric_score=self.metric_score,
-                metric_feedback=self.metric_feedback,
-                trace=self.traces,
-                error=self.error,
-            ),
-            success_threshold=success_threshold,
-        )
-
-    def success_payload(self, snapshot: ProgramSnapshot, success_threshold: float) -> SuccessPromptPayload:
-        return SuccessPromptPayload(
-            program_structure=snapshot.structure,
-            predictor_flow=snapshot.flow_description,
-            predictor_prompts=snapshot.prompts,
-            successful_example=SuccessExamplePayload(
-                input=self.inputs,
-                expected=self.expected,
-                prediction=self.prediction,
-                metric_score=self.metric_score,
-                metric_feedback=self.metric_feedback,
-                trace=self.traces,
-            ),
-            success_threshold=success_threshold,
-        )
-
-
-class HypothesisPromptChange(BaseModel):
-    new_prompt: str
-    rationale: str | None = None
-    change_magnitude: str | None = None
+    context: str = OutputField(
+        desc="Relevant characteristics of this example that help explain the success. "
+        "What about the input, intermediate outputs, or execution made this work?"
+    )
+    category: str = OutputField(
+        desc="Short label for this success type (e.g., 'clear_format_compliance', 'complete_reasoning', 'robust_handling')"
+    )
+    key_details: str = OutputField(
+        desc="What specifically worked well? What aspects of the prompts or execution should be preserved or amplified?"
+    )
 
 
 class HypothesisSpec(BaseModel):
-    observation: str
-    fixable_root_causes: list[str] = Field(default_factory=list)
-    non_fixable_root_causes: list[str] = Field(default_factory=list)
-    strategy: str
-    expected_impact: str
-    prompt_changes: dict[str, HypothesisPromptChange] = Field(default_factory=dict)
+    """Specification for a hypothesis to improve the program.
+
+    Each hypothesis represents a complete strategy for addressing ALL identified fixable issues.
+    Multiple hypotheses should offer different approaches to the same problems, not address different subsets.
+    """
+
+    observation: str = Field(description="Synthesized description of patterns found across all errors")
+    fixable_root_causes: list[str] = Field(
+        default_factory=list,
+        description="Specific fixable issues that this hypothesis addresses through prompt changes",
+    )
+    non_fixable_root_causes: list[str] = Field(
+        default_factory=list,
+        description="Issues that cannot be fixed with prompt changes (e.g., 'needs retrieval system', 'requires multi-step architecture')",
+    )
+    strategy: str = Field(
+        description="Description of the approach this hypothesis takes. What makes it different from alternative approaches?"
+    )
+    expected_impact: str = Field(
+        description="Specific prediction of which errors this should fix and why. Be concrete."
+    )
+    prompt_changes: dict[str, dict[str, str]] = Field(
+        default_factory=dict,
+        description="Mapping of predictor_name to changes: {new_prompt: complete replacement text, "
+        "rationale: why this fixes issues, change_magnitude: minimal|moderate|substantial}",
+    )
+
+
+class HypothesisGenerationSignature(Signature):
+    """Generate hypotheses for improving a DSPy program based on systematic error analysis.
+
+    You are a prompt engineering expert. Synthesize the analyses and generate hypotheses for fixing ALL fixable issues.
+
+    Step 1: Pattern Synthesis
+    - Identify common patterns across errors
+    - How successes differ from failures
+    - Which issues are fixable by prompt changes
+    - Which issues need architecture/tools/data (mark as non-fixable)
+
+    Step 2: Hypothesis Generation
+    Critical Requirements:
+    - Each hypothesis must address ALL fixable root causes together
+    - Multiple hypotheses should represent DIFFERENT STRATEGIES for fixing the same issues
+    - Different strategies include: minimal vs substantial changes, fix upstream vs make downstream robust,
+      add constraints vs add examples, different predictor combinations
+    - Bias toward minimal effective change (simplest intervention that works)
+    - Specify COMPLETE REPLACEMENT PROMPTS for each affected predictor
+
+    When to generate 0 hypotheses:
+    - All root causes are non-fixable (need architecture/data/tools)
+    - No clear improvement strategy emerges from the analysis
+    - Errors are too diverse/unclear to form actionable hypothesis
+
+    When to generate multiple hypotheses:
+    - There are genuinely different ways to address the same root causes
+    - You want to explore different intervention levels (minimal vs substantial)
+    - Different architectural approaches are viable
+
+    Important: Different hypotheses should NOT address different subsets of issues - they should all address ALL fixable issues.
+    Preserve what works (insights from success analyses). Consider predictor interactions and dependencies.
+    """
+
+    failure_analyses: str = InputField(
+        desc="Root cause summaries from failure analyses, showing patterns and issues to fix"
+    )
+    success_analyses: str = InputField(
+        desc="Success pattern summaries for contrast, showing what works well and should be preserved"
+    )
+    current_prompts: str = InputField(desc="Current predictor prompts in the program that may need modification")
+
+    hypotheses: list[HypothesisSpec] = OutputField(
+        desc="List of improvement hypotheses (0 to num_hypotheses). "
+        "Each addresses ALL fixable issues with a different strategy. "
+        "May be empty if no actionable improvements are found."
+    )
+
+
+class TrainExampleRecord(BaseModel):
+    """Record of a single training example evaluation."""
+
+    example: Example
+    prediction: Prediction | None
+    metric_score: float
+    metric_feedback: str | None = None
+    is_success: bool
+    error: str | None = None
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
 
 class CandidateRecord(BaseModel):
@@ -266,10 +263,8 @@ class APEX(Teleprompter):
         *,
         metric: MetricFn,
         analysis_lm: LM,
-        max_iterations: int,
+        max_iterations: int | None = None,
         hypothesis_lm: LM | None = None,
-        analysis_adapter: JSONAdapter | None = None,
-        hypothesis_adapter: JSONAdapter | None = None,
         verbosity: Verbosity | str | None = None,
         num_threads: int | None = None,
         num_hypotheses: int = 1,
@@ -278,17 +273,20 @@ class APEX(Teleprompter):
         success_threshold: float | None = None,
         min_metric: float = 0.0,
         max_metric: float = 1.0,
-        convergence_patience: int = 3,
+        convergence_patience: int | None = 3,
         seed: int | None = None,
     ) -> None:
-        if max_iterations <= 0:
-            raise ValueError("max_iterations must be > 0.")
+        # Validation: ensure at least one stopping condition is set
+        if max_iterations is None and convergence_patience is None:
+            raise ValueError("At least one of max_iterations or convergence_patience must be specified.")
+        if max_iterations is not None and max_iterations <= 0:
+            raise ValueError("max_iterations must be > 0 if specified.")
+        if convergence_patience is not None and convergence_patience <= 0:
+            raise ValueError("convergence_patience must be > 0 if specified.")
         if num_hypotheses < 0:
             raise ValueError("num_hypotheses must be >= 0.")
         if num_eval_runs <= 0:
             raise ValueError("num_eval_runs must be > 0.")
-        if convergence_patience <= 0:
-            raise ValueError("convergence_patience must be > 0.")
         if min_metric > max_metric:
             raise ValueError("min_metric cannot exceed max_metric.")
 
@@ -310,8 +308,6 @@ class APEX(Teleprompter):
         self.convergence_patience = convergence_patience
         self.seed = seed if seed is not None else random.randint(1, 1_000_000)
         self._rng = random.Random(self.seed)
-        self.analysis_adapter = analysis_adapter or JSONAdapter()
-        self.hypothesis_adapter = hypothesis_adapter or JSONAdapter()
 
     # --- Logging & progress helpers ---------------------------------------------
 
@@ -399,9 +395,11 @@ class APEX(Teleprompter):
         iteration_logs: list[ApexIterationLog] = []
 
         self._log(f"APEX: running with num_threads={self.num_threads}", Verbosity.NORMAL)
+        max_iter_str = f"{self.max_iterations}" if self.max_iterations is not None else "until convergence"
+        patience_str = f"{self.convergence_patience}" if self.convergence_patience is not None else "disabled"
         self._log(
-            f"APEX: Configuration - max_iterations={self.max_iterations}, num_hypotheses={self.num_hypotheses}, "
-            f"success_threshold={self.success_threshold:.2f}, convergence_patience={self.convergence_patience}",
+            f"APEX: Configuration - max_iterations={max_iter_str}, num_hypotheses={self.num_hypotheses}, "
+            f"success_threshold={self.success_threshold:.2f}, convergence_patience={patience_str}",
             Verbosity.HIGH,
         )
         self._log(f"APEX: Using seed={self.seed} for reproducibility", Verbosity.HIGH)
@@ -420,8 +418,16 @@ class APEX(Teleprompter):
 
         no_improvement_count = 0
         stop_reason = ""
+        iteration = 0
 
-        for iteration in range(1, self.max_iterations + 1):
+        while True:
+            iteration += 1
+
+            # Check max_iterations stopping condition
+            if self.max_iterations is not None and iteration > self.max_iterations:
+                stop_reason = "max_iterations"
+                self._log("APEX: Stopping due to max iterations reached", Verbosity.NORMAL)
+                break
             sampled_train = self._sample_trainset(trainset, iteration)
             self._log(
                 f"APEX: iteration {iteration} started (train sample={len(sampled_train)}, val size={len(valset)})",
@@ -433,30 +439,42 @@ class APEX(Teleprompter):
             baseline_for_analysis = current_program.deepcopy()
             snapshot = self._snapshot_program(baseline_for_analysis)
 
-            failures, successes = self._evaluate_train_examples(baseline_for_analysis, sampled_train, snapshot)
+            failures, successes = self._evaluate_train_examples(baseline_for_analysis, sampled_train)
             self._log(
                 f"APEX: Train evaluation complete - {len(failures)} failures, {len(successes)} successes",
                 Verbosity.HIGH,
             )
 
-            failure_summaries = cast(
-                list[FailureAnalysis],
-                self._analyze_examples(
-                    failures,
-                    snapshot,
-                    success_threshold=self.success_threshold,
-                    mode="failure",
-                ),
-            )
-            success_summaries = cast(
-                list[SuccessAnalysis],
-                self._analyze_successes(
-                    successes,
-                    snapshot,
-                    failure_count=len(failure_summaries),
-                    success_threshold=self.success_threshold,
-                ),
-            )
+            # If no failures, log and continue to next iteration
+            if not failures:
+                self._log(
+                    f"APEX: iteration {iteration} - No failures found! All examples succeeded. Skipping to next iteration.",
+                    Verbosity.NORMAL,
+                )
+                # Create an empty candidate record for this iteration
+                iteration_logs.append(
+                    ApexIterationLog(
+                        iteration=iteration,
+                        sampled_train_size=len(sampled_train),
+                        num_failures=0,
+                        num_successes=len(successes),
+                        hypotheses=[],
+                        candidates=[],
+                    )
+                )
+                # Count this as no improvement
+                no_improvement_count += 1
+                if self.convergence_patience is not None:
+                    if no_improvement_count >= self.convergence_patience:
+                        stop_reason = "patience"
+                        self._log(
+                            "APEX: Stopping due to convergence patience reached (all successes)", Verbosity.NORMAL
+                        )
+                        break
+                continue
+
+            failure_summaries = self._analyze_examples(failures, mode="failure")
+            success_summaries = self._analyze_successes(successes, failure_count=len(failure_summaries))
             if self._is_enabled(Verbosity.HIGH):
                 self._log(
                     f"APEX: iteration {iteration} analyzed {len(failure_summaries)} failure(s) and {len(success_summaries)} success(es)",
@@ -531,13 +549,15 @@ class APEX(Teleprompter):
                             "APEX: Detailed improved prompts:",
                             Verbosity.HIGH,
                         )
-                        for predictor_name, change in best_candidate.hypothesis.prompt_changes.items():
-                            self._log(
-                                f"  → {predictor_name}: {change.new_prompt[:300]}..."
-                                if len(change.new_prompt) > 300
-                                else f"  → {predictor_name}: {change.new_prompt}",
-                                Verbosity.HIGH,
-                            )
+                        for predictor_name, changes in best_candidate.hypothesis.prompt_changes.items():
+                            if isinstance(changes, dict) and "new_prompt" in changes:
+                                new_prompt = changes["new_prompt"]
+                                self._log(
+                                    f"  → {predictor_name}: {new_prompt[:300]}..."
+                                    if len(new_prompt) > 300
+                                    else f"  → {predictor_name}: {new_prompt}",
+                                    Verbosity.HIGH,
+                                )
 
             baseline_candidate = candidates[0]
             self._log(
@@ -555,14 +575,20 @@ class APEX(Teleprompter):
 
             if best_candidate_for_iteration is baseline_candidate:
                 no_improvement_count += 1
-                self._log(
-                    f"APEX: No improvement ({no_improvement_count}/{self.convergence_patience} patience)",
-                    Verbosity.HIGH,
-                )
-                if no_improvement_count >= self.convergence_patience:
-                    stop_reason = "patience"
-                    self._log("APEX: Stopping due to convergence patience reached", Verbosity.NORMAL)
-                    break
+                if self.convergence_patience is not None:
+                    self._log(
+                        f"APEX: No improvement ({no_improvement_count}/{self.convergence_patience} patience)",
+                        Verbosity.HIGH,
+                    )
+                    if no_improvement_count >= self.convergence_patience:
+                        stop_reason = "patience"
+                        self._log("APEX: Stopping due to convergence patience reached", Verbosity.NORMAL)
+                        break
+                else:
+                    self._log(
+                        f"APEX: No improvement in iteration {iteration} (patience disabled)",
+                        Verbosity.HIGH,
+                    )
             else:
                 no_improvement_count = 0
                 current_program = best_candidate_for_iteration.program
@@ -570,10 +596,6 @@ class APEX(Teleprompter):
                     "APEX: Updating program with hypothesis improvements",
                     Verbosity.HIGH,
                 )
-
-            if iteration == self.max_iterations:
-                stop_reason = "max_iterations"
-                self._log("APEX: Stopping due to max iterations reached", Verbosity.NORMAL)
 
         self._log(
             f"APEX: Optimization complete - stopped after {len(iteration_logs)} iterations ({stop_reason})",
@@ -627,7 +649,6 @@ class APEX(Teleprompter):
         self,
         program: Module,
         trainset: Iterable[Example],
-        snapshot: ProgramSnapshot,
     ) -> tuple[list[TrainExampleRecord], list[TrainExampleRecord]]:
         failure_records: list[TrainExampleRecord] = []
         success_records: list[TrainExampleRecord] = []
@@ -635,7 +656,7 @@ class APEX(Teleprompter):
         examples = list(trainset)
 
         def process(example: Example) -> TrainExampleRecord:
-            return self._run_single_example(program, example, snapshot.predictor_name_by_id)
+            return self._run_single_example(program, example)
 
         records = self._parallel_execute(
             examples,
@@ -655,33 +676,26 @@ class APEX(Teleprompter):
         self,
         program: Module,
         example: Example,
-        name_lookup: dict[int, str],
     ) -> TrainExampleRecord:
-        inputs_ex = example.inputs()
-        labels = example.labels()
-        input_kwargs = inputs_ex.toDict()
-        expected_kwargs = labels.toDict()
+        input_kwargs = example.inputs().toDict()
 
         prediction_obj: Prediction | None = None
-        trace_entries: list[TraceEntry] = []
         error_message: str | None = None
 
         with dspy.settings.context(trace=[]):
             try:
                 prediction_obj = program(**input_kwargs)
-                if prediction_obj is not None:
-                    prediction_obj = self._sanitize_prediction(prediction_obj)
             except Exception as exc:
                 self._log(f"APEX: Program execution failed on example: {str(exc)[:200]}", Verbosity.HIGH, "warning")
                 error_message = f"execution_error: {exc}"
-            finally:
-                trace_entries = cast(list[TraceEntry], list(dspy.settings.trace or []))
 
         metric_score = self.min_metric
         metric_feedback: str | None = None
         try:
             if prediction_obj is not None:
-                metric_score, metric_feedback = self._evaluate_metric(example, prediction_obj, trace_entries)
+                metric_score, metric_feedback = self._evaluate_metric(
+                    example, prediction_obj, list(dspy.settings.trace or [])
+                )
             else:
                 metric_score = self.min_metric
                 if error_message:
@@ -695,18 +709,13 @@ class APEX(Teleprompter):
 
         metric_score = max(self.min_metric, min(self.max_metric, metric_score))
         is_success = metric_score >= self.success_threshold
-        prediction_json = self._serialize_prediction(prediction_obj) if prediction_obj is not None else None
-        traces = self._serialize_traces(trace_entries, name_lookup)
 
         return TrainExampleRecord(
             example=example,
-            inputs=self._serialize_mapping(input_kwargs),
-            expected=self._serialize_mapping(expected_kwargs),
-            prediction=prediction_json,
+            prediction=prediction_obj,
             metric_score=metric_score,
             metric_feedback=metric_feedback,
             is_success=is_success,
-            traces=traces,
             error=error_message,
         )
 
@@ -738,47 +747,38 @@ class APEX(Teleprompter):
     def _analyze_examples(
         self,
         records: list[TrainExampleRecord],
-        snapshot: ProgramSnapshot,
-        success_threshold: float,
         mode: str,
-    ) -> list[BaseModel]:
+    ) -> list[Prediction]:
         if not records:
             return []
 
-        prompt_builder = self._build_failure_prompt if mode == "failure" else self._build_success_prompt
         signature_class = FailureAnalysisSignature if mode == "failure" else SuccessAnalysisSignature
-
         analysis_lm = self.analysis_lm
-        analysis_adapter = self.analysis_adapter
 
-        def process(record: TrainExampleRecord) -> BaseModel:
-            payload = (
-                record.failure_payload(snapshot, success_threshold)
-                if mode == "failure"
-                else record.success_payload(snapshot, success_threshold)
-            )
-            prompt = prompt_builder(payload)
+        def process(record: TrainExampleRecord) -> Prediction:
+            with dspy.context(lm=analysis_lm):
+                predictor = dspy.Predict(signature_class)
 
-            with dspy.context(lm=analysis_lm, adapter=analysis_adapter):
-                predictor = dspy.Predict(signature_class())
-                result = predictor(analysis_prompt=prompt)
+                # Get input data from the example
+                inputs = record.example.inputs().toDict()
+                expected = record.example.labels().toDict()
 
-            if mode == "failure":
-                return FailureAnalysis(
-                    root_cause=result.root_cause,
-                    involved_predictors=result.involved_predictors or [],
-                    context=result.context,
-                    category=result.category,
-                    key_details=result.key_details,
-                )
-            else:
-                return SuccessAnalysis(
-                    success_pattern=result.success_pattern,
-                    contributing_predictors=result.contributing_predictors or [],
-                    context=result.context,
-                    category=result.category,
-                    key_details=result.key_details,
-                )
+                # Prepare input based on signature
+                if mode == "failure":
+                    result = predictor(
+                        problem=str(inputs),
+                        prediction=str(record.prediction) if record.prediction else "",
+                        expected=str(expected),
+                        error=record.error or "",
+                    )
+                else:
+                    result = predictor(
+                        problem=str(inputs),
+                        prediction=str(record.prediction) if record.prediction else "",
+                        expected=str(expected),
+                    )
+
+            return result
 
         analyses = self._parallel_execute(
             records,
@@ -789,12 +789,12 @@ class APEX(Teleprompter):
 
         if self._is_enabled(Verbosity.HIGH):
             for index, analysis in enumerate(analyses, start=1):
-                if isinstance(analysis, FailureAnalysis):
+                if mode == "failure":
                     self._log(
                         f"APEX: failure analysis #{index} ({analysis.category}) → {analysis.root_cause}",
                         Verbosity.HIGH,
                     )
-                elif isinstance(analysis, SuccessAnalysis):
+                else:
                     self._log(
                         f"APEX: success analysis #{index} ({analysis.category}) → {analysis.success_pattern}",
                         Verbosity.HIGH,
@@ -804,29 +804,19 @@ class APEX(Teleprompter):
     def _analyze_successes(
         self,
         success_records: list[TrainExampleRecord],
-        snapshot: ProgramSnapshot,
         failure_count: int,
-        success_threshold: float,
-    ) -> list[SuccessAnalysis]:
+    ) -> list[Prediction]:
         if not success_records or failure_count == 0:
             return []
         if len(success_records) > failure_count:
             success_records = self._rng.sample(success_records, k=failure_count)
-        return cast(
-            list[SuccessAnalysis],
-            self._analyze_examples(
-                success_records,
-                snapshot,
-                success_threshold=success_threshold,
-                mode="success",
-            ),
-        )
+        return self._analyze_examples(success_records, mode="success")
 
     def _generate_hypotheses(
         self,
         *,
-        failure_summaries: list[FailureAnalysis],
-        success_summaries: list[SuccessAnalysis],
+        failure_summaries: list[Prediction],
+        success_summaries: list[Prediction],
         snapshot: ProgramSnapshot,
     ) -> list[HypothesisSpec]:
         if not failure_summaries or self.num_hypotheses == 0:
@@ -841,19 +831,26 @@ class APEX(Teleprompter):
             Verbosity.HIGH,
         )
 
-        payload = HypothesisPromptPayload(
-            error_summaries=[analysis.model_dump() for analysis in shuffled_failures],
-            success_summaries=[analysis.model_dump() for analysis in success_summaries],
-            predictor_prompts=snapshot.prompts,
-            program_structure=snapshot.structure,
-            predictor_flow=snapshot.flow_description,
-            num_hypotheses=self.num_hypotheses,
+        # Format the analyses for the hypothesis generation
+        failure_text = "\n".join([f"- {f.root_cause} (category: {f.category})" for f in failure_summaries])
+        success_text = (
+            "\n".join([f"- {s.success_pattern} (category: {s.category})" for s in success_summaries])
+            if success_summaries
+            else "No success patterns available"
         )
-        prompt = self._build_hypothesis_prompt(payload)
 
-        with dspy.context(lm=self.hypothesis_lm, adapter=self.hypothesis_adapter):
-            predictor = dspy.Predict(HypothesisGenerationSignature())
-            result = predictor(analysis_prompt=prompt)
+        prompt_text = "\n".join(
+            [
+                f"- {name}: {prompt[:200]}..." if len(prompt) > 200 else f"- {name}: {prompt}"
+                for name, prompt in snapshot.prompts.items()
+            ]
+        )
+
+        with dspy.context(lm=self.hypothesis_lm):
+            predictor = dspy.Predict(HypothesisGenerationSignature)
+            result = predictor(
+                failure_analyses=failure_text, success_analyses=success_text, current_prompts=prompt_text
+            )
 
         # Get the hypotheses directly from the typed result
         validated_specs = result.hypotheses if result.hypotheses else []
@@ -864,18 +861,20 @@ class APEX(Teleprompter):
                     Verbosity.HIGH,
                 )
                 # Log the actual prompt changes per predictor
-                for predictor_name, change in spec.prompt_changes.items():
-                    self._log(
-                        f"  → {predictor_name}: {change.new_prompt[:200]}..."
-                        if len(change.new_prompt) > 200
-                        else f"  → {predictor_name}: {change.new_prompt}",
-                        Verbosity.HIGH,
-                    )
-                    if change.rationale:
+                for predictor_name, changes in spec.prompt_changes.items():
+                    if isinstance(changes, dict) and "new_prompt" in changes:
+                        new_prompt = changes["new_prompt"]
                         self._log(
-                            f"     Rationale: {change.rationale}",
+                            f"  → {predictor_name}: {new_prompt[:200]}..."
+                            if len(new_prompt) > 200
+                            else f"  → {predictor_name}: {new_prompt}",
                             Verbosity.HIGH,
                         )
+                        if changes.get("rationale"):
+                            self._log(
+                                f"     Rationale: {changes['rationale']}",
+                                Verbosity.HIGH,
+                            )
         return validated_specs[: self.num_hypotheses]
 
     # --- Candidate evaluation -----------------------------------------------------
@@ -965,11 +964,13 @@ class APEX(Teleprompter):
     def _apply_hypothesis(self, baseline: Module, hypothesis: HypothesisSpec) -> Module:
         candidate = baseline.deepcopy()
         name_to_predictor = dict(candidate.named_predictors())
-        for predictor_name, change in hypothesis.prompt_changes.items():
+        for predictor_name, changes in hypothesis.prompt_changes.items():
             if predictor_name not in name_to_predictor:
                 raise ValueError(f"Hypothesis references unknown predictor '{predictor_name}'.")
             predictor = name_to_predictor[predictor_name]
-            predictor.signature.instructions = change.new_prompt
+            # changes is a dict with 'new_prompt' and optionally 'rationale'
+            if isinstance(changes, dict) and "new_prompt" in changes:
+                predictor.signature.instructions = changes["new_prompt"]
         return candidate
 
     def _select_best_candidate(self, candidates: list[CandidateRecord]) -> CandidateRecord:
@@ -997,74 +998,3 @@ class APEX(Teleprompter):
             prompts=prompts,
             predictor_name_by_id=lookup,
         )
-
-    def _serialize_traces(
-        self,
-        trace_entries: list[TraceEntry],
-        name_lookup: dict[int, str],
-    ) -> list[PredictorTraceRecord]:
-        records: list[PredictorTraceRecord] = []
-        for predictor, inputs, prediction in trace_entries:
-            name = name_lookup.get(id(predictor), predictor.__class__.__name__)
-            prompt = getattr(getattr(predictor, "signature", None), "instructions", "")
-            records.append(
-                PredictorTraceRecord(
-                    name=name,
-                    prompt=prompt,
-                    inputs=self._serialize_mapping(inputs),
-                    outputs=self._serialize_prediction(prediction),
-                )
-            )
-        return records
-
-    def _serialize_mapping(self, mapping: Mapping[str, Any]) -> JsonObject:
-        return {str(key): self._serialize_value(value) for key, value in mapping.items()}
-
-    def _serialize_prediction(self, prediction: Prediction) -> JsonObject:
-        return self._serialize_mapping(prediction.toDict())
-
-    def _serialize_value(self, value: Any) -> JsonValue:
-        if hasattr(value, "message"):
-            message_value = value.message
-            if message_value is not None:
-                return self._serialize_value(message_value)
-        if hasattr(value, "choices"):
-            choices_value = value.choices
-            if choices_value is not None:
-                return self._serialize_value(list(choices_value))
-        if hasattr(value, "content") and not isinstance(value, str | bytes):
-            content_value = value.content
-            if isinstance(content_value, list):
-                joined = "".join(part if isinstance(part, str) else str(part.get("text", "")) for part in content_value)
-                return joined
-            return self._serialize_value(content_value)
-        if isinstance(value, str | int | float | bool) or value is None:
-            return value
-        if isinstance(value, list):
-            return [self._serialize_value(v) for v in value]
-        if isinstance(value, Mapping):
-            return {str(key): self._serialize_value(val) for key, val in value.items()}
-        if hasattr(value, "model_dump"):
-            return self._serialize_value(value.model_dump())
-        if hasattr(value, "toDict"):
-            return self._serialize_value(value.toDict())
-        if hasattr(value, "dict"):
-            return self._serialize_value(value.dict())
-        return str(value)
-
-    def _sanitize_prediction(self, prediction: Prediction) -> Prediction:
-        sanitized: dict[str, JsonValue] = {}
-        for key in prediction.keys():
-            sanitized[key] = self._serialize_value(prediction[key])
-        return Prediction(**sanitized)
-
-    # --- Prompt builders & invocation helpers ------------------------------------
-
-    def _build_failure_prompt(self, payload: FailurePromptPayload) -> str:
-        return render_failure_prompt(payload.model_dump())
-
-    def _build_success_prompt(self, payload: SuccessPromptPayload) -> str:
-        return render_success_prompt(payload.model_dump())
-
-    def _build_hypothesis_prompt(self, payload: HypothesisPromptPayload) -> str:
-        return render_hypothesis_prompt(payload.model_dump())
