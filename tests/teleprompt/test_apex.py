@@ -206,6 +206,71 @@ def test_apex_sampling_callable_receives_iteration():
     assert len(analysis_lm.history) == 2
 
 
+def test_apex_execution_flow_captures_branching_dependencies():
+    class BranchingModule(dspy.Module):
+        def __init__(self):
+            super().__init__()
+            self.a = dspy.Predict("x -> a")
+            self.b = dspy.Predict("a -> b")
+            self.c = dspy.Predict("a -> c")
+            self.d = dspy.Predict("b, c -> d")
+
+        def forward(self, x: str) -> dspy.Prediction:
+            out_a = self.a(x=x)
+            out_b = self.b(a=out_a.a)
+            out_c = self.c(a=out_a.a)
+            return self.d(b=out_b.b, c=out_c.c)
+
+    apex = APEX(
+        metric=metric,
+        analysis_lm=DummyLM([make_analysis_response()], adapter=dspy.JSONAdapter()),
+        hypothesis_lm=DummyLM([make_hypothesis_response()], adapter=dspy.JSONAdapter()),
+        max_iterations=1,
+        num_hypotheses=0,
+        train_sample=None,
+        num_eval_runs=1,
+        convergence_patience=1,
+        seed=0,
+        verbosity="none",
+    )
+
+    branching_program = BranchingModule()
+
+    execution_lm = DummyLM(
+        [
+            {"a": "A"},
+            {"b": "B"},
+            {"c": "C"},
+            {"d": "D"},
+        ]
+    )
+
+    with dspy.settings.context(lm=execution_lm, trace=[], max_trace_size=50):
+        branching_program(x="input")
+        trace = list(dspy.settings.trace or [])
+
+    execution_flow = apex._extract_execution_flow(trace, branching_program)
+
+    assert [entry.predictor_name for entry in execution_flow] == ["a", "b", "c", "d"]
+
+    entries = {entry.predictor_name: entry for entry in execution_flow}
+    assert entries["a"].dependencies == []
+    assert entries["b"].dependencies == ["a"]
+    assert entries["c"].dependencies == ["a"]
+    assert entries["d"].dependencies == ["b", "c"]
+    assert entries["d"].input_sources == {"b": ["b"], "c": ["c"]}
+
+    graph = apex._format_execution_flow_as_graph(execution_flow)
+    assert "Program DAG" in graph
+    assert "↳ a" in graph
+    assert "a (Predict)" in graph
+    assert "depends on: Input" in graph
+    assert "feeds: b, c" in graph
+    assert "d (Predict)" in graph
+    assert "depends on: b, c" in graph
+    assert "feeds: Output" in graph
+
+
 def test_apex_uses_configured_num_threads(monkeypatch):
     calls: list[int] = []
 
