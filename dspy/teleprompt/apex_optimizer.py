@@ -65,22 +65,17 @@ class FailureAnalysisSignature(Signature):
 
     ## Operational Context
 
-    You're part of APEX optimizer that:
-    - Runs iteratively, sampling different training examples each iteration
-    - Analyzes failures to generate improvement hypotheses tested on a validation set
-    - Your analysis DIRECTLY DRIVES what gets fixed - precision determines success
-    - Works with multi-predictor programs organized as directed acyclic graphs (DAGs)
-    - Has full access to intermediate I/O values between all predictors
-    - May analyze programs that are already partially optimized from previous iterations
+    You're part of APEX optimizer analyzing failures in multi-predictor DAG programs.
+    Key realities:
+    - Failures cascade through the DAG - distinguish PRIMARY from downstream effects
+    - Your analysis drives hypothesis generation - precision determines optimization success
+    - Programs may be partially optimized from previous iterations
 
-    Key operational realities about failures:
-    - **Failures cascade**: One predictor's error propagates through the DAG, affecting all downstream predictors
-    - **Primary vs secondary**: You must distinguish the FIRST failure point from cascade effects
-    - **Recovery potential**: Some downstream predictors can compensate for upstream errors (but often don't)
-    - **Data contracts**: Predictors coordinate through shared field names, types, and formats - mismatches cause failures
-    - **Fix efficiency**: Fixing the primary failure point is more efficient than fixing downstream symptoms
+    Focus: Identify the PRIMARY failure point, not cascade symptoms.
 
-    This means: Trace failures to their origin. Identify the PRIMARY failure point and note cascade effects. Your precision determines whether hypotheses fix the root cause or waste iterations on symptoms.
+    Critical insight: In DAGs, one upstream error affects ALL downstream paths. Data contracts (field names, types) between predictors are fragile failure points. Your precision determines optimization efficiency.
+
+    Coordination: Your analysis will be cross-referenced with SuccessGuard to ensure fixes don't break working patterns.
 
     ## Task
 
@@ -122,14 +117,7 @@ class FailureAnalysisSignature(Signature):
     ## Analysis Framework
 
     ### 1. Failure Severity Assessment
-    First, normalize scores to understand HOW BADLY it failed:
-    ```
-    normalized_score = (metric_score - min_metric) / (max_metric - min_metric)
-    normalized_threshold = (success_threshold - min_metric) / (max_metric - min_metric)
-    failure_margin = normalized_threshold - normalized_score
-    ```
-
-    Severity levels based on margin:
+    Normalize scores: `score_norm = (score - min) / (max - min), margin = threshold_norm - score_norm`
     - **NEAR_MISS** (margin < 0.1): Almost worked, minor fix needed
     - **MODERATE** (margin 0.1-0.3): Clear failure, targeted fix required
     - **SEVERE** (margin > 0.3): Major failure, may need substantial changes
@@ -169,75 +157,39 @@ class FailureAnalysisSignature(Signature):
     - Format: `domain-specific-issue` (e.g., `math-precision-error`, `date-parsing-failure`)
     - Be specific enough to group similar failures
 
-    #### Category Selection Decision Tree
+    ### 4. Category Selection & Fix Strategy
 
-    Use this logic to select the most appropriate category:
+    **Decision Logic (check in order)**:
+    1. IF metric_feedback contains specific issue → Use metric's diagnosis as primary guide
+    2. ELSE IF error exists → Fix crash/exception first
+    3. ELSE → Analyze quality issues in output
 
-    **IF predictor crashed/raised exception THEN**
-      → Check I/O: Is it a type mismatch? → `type-mismatch`
-      → Check I/O: Is it a schema/field mismatch? → `schema-mismatch`
-      → ELSE → `ambiguous-instruction`
+    **Category Selection Tree**:
+    • Crashed/exception?
+      - Type mismatch in I/O → `type-mismatch`
+      - Schema/field mismatch → `schema-mismatch`
+      - Otherwise → `ambiguous-instruction`
 
-    **ELSE IF output has wrong format/structure THEN**
-      → Is format specification missing from prompt? → `missing-format-spec`
-      → Is format specified but different field names? → `schema-mismatch`
+    • Wrong format/structure?
+      - Missing format spec → `missing-format-spec`
+      - Has spec but wrong fields → `schema-mismatch`
 
-    **ELSE IF output is missing information THEN**
-      → Does prompt lack examples of what to extract? → `insufficient-examples`
-      → Does prompt have unclear instructions? → `ambiguous-instruction`
-      → Is information not available in input? → `missing-retrieval`
+    • Missing information?
+      - Lacks examples → `insufficient-examples`
+      - Unclear instructions → `ambiguous-instruction`
+      - Data unavailable → `missing-retrieval`
 
-    **ELSE IF output has wrong values/content THEN**
-      → Are constraints/rules missing from prompt? → `missing-constraint`
-      → Are instructions ambiguous/contradictory? → `ambiguous-instruction`
-      → Is this beyond model capabilities? → `model-limitation`
+    • Wrong values/content?
+      - Missing constraints → `missing-constraint`
+      - Ambiguous instructions → `ambiguous-instruction`
+      - Beyond capabilities → `model-limitation`
 
-    **ELSE IF none of standard categories fit THEN**
-      → Create custom category: `[domain]-[specific]-[issue]`
-      → Examples: `temporal-resolution-failure`, `math-precision-error`, `unit-conversion-failure`
+    • None fit? → Create: `[domain]-[specific]-[issue]`
 
-    ### 4. Fix Strategy Determination
-    Based on failure type and I/O analysis:
-
-    **For NEAR_MISS failures**:
-    - Small clarification or constraint
-    - Single predictor adjustment
-    - Add format specification
-
-    **For MODERATE failures**:
-    - Clear instruction rewrite
-    - Add examples to prompt
-    - Coordinate predictor alignment
-
-    **For SEVERE failures**:
-    - Multiple predictor changes
-    - Fundamental approach shift
-    - Consider architectural feedback
-
-    ## Decision Logic
-
-    IF metric_feedback exists AND contains specific issue THEN
-      → Use metric's diagnosis as primary guide
-
-    ELSE IF error message exists AND execution failed THEN
-      → Focus on fixing the crash/exception first
-
-    ELSE IF metric_score exists but below threshold THEN
-      → Analyze quality issues in the output
-
-    IF metric_feedback mentions specific missing/incorrect fields THEN
-      → Target those exact extraction/formatting issues
-
-    IF I/O shows data corruption between predictors THEN
-      → Primary cause is coordination/format mismatch
-
-    IF I/O shows predictor ignored instructions THEN
-      → Primary cause is unclear/ambiguous prompt
-
-    IF pattern repeats across multiple data points THEN
-      → Systematic issue needing general fix
-    ELSE
-      → Edge case needing specific handling
+    **Fix Strategy by Severity**:
+    - NEAR_MISS: Small clarification, single predictor adjustment
+    - MODERATE: Clear rewrite, add examples, coordinate predictors
+    - SEVERE: Multiple changes, fundamental shift, consider architecture
 
     ## Output Specifications
 
@@ -277,97 +229,67 @@ class FailureAnalysisSignature(Signature):
     ```
 
     ## Examples
+    *All use: score_norm = (score - min) / (max - min), margin = threshold_norm - score_norm*
 
-    ### Example 1: NEAR_MISS with Metric Feedback
-    *Calculation: score=0.92, threshold=1.0, range=[0,1]*
+    ### Example 1: NEAR_MISS
+    Given: score=0.92, threshold=1.0, range=[0,1] → margin=0.08
     ```
-    normalized_score = (0.92 - 0) / (1 - 0) = 0.92
-    normalized_threshold = (1.0 - 0) / (1 - 0) = 1.0
-    failure_margin = 1.0 - 0.92 = 0.08 → NEAR_MISS
-    ```
-    ```
-    root_cause: "In ExtractorPredictor, failed to convert '5M' to numeric form. Metric feedback stated: 'Expected numeric value for revenue field, got string '5M''. I/O confirmed: input 'revenue was 5M' → output {'amount': '5M'} when metric requires {'amount': 5000000}."
+    root_cause: "In ExtractorPredictor, failed to convert '5M' to numeric form. Metric stated: 'Expected numeric value for revenue field, got string '5M''. I/O confirmed: input 'revenue was 5M' → output {'amount': '5M'} instead of 5000000."
     involved_predictors: ["ExtractorPredictor", "CalculatorPredictor"]
     context: "Text with abbreviated numbers (K, M, B suffixes)"
     category: "missing-constraint"
-    key_details: "SEVERITY: NEAR_MISS. PRIMARY_FAILURE: ExtractorPredictor. FIXABLE: Add numeric conversion instruction based on metric's requirement. NOT_FIXABLE: None. SUGGESTED_FIX: Add to ExtractorPredictor prompt: 'Convert abbreviated numbers to full numeric values (K=1000, M=1000000, B=1000000000)'."
+    key_details: "SEVERITY: NEAR_MISS. PRIMARY_FAILURE: ExtractorPredictor. FIXABLE: Add numeric conversion instruction. NOT_FIXABLE: None. SUGGESTED_FIX: Add 'Convert abbreviated numbers to full numeric values (K=1000, M=1000000, B=1000000000)'."
     ```
-    *Metric feedback was key: "Expected numeric value for revenue field, got string '5M'"*
 
     ### Example 2: MODERATE
-    *Calculation: score=18, threshold=50, range=[0,100]*
+    Given: score=18, threshold=50, range=[0,100] → margin=0.32
     ```
-    normalized_score = (18 - 0) / (100 - 0) = 0.18
-    normalized_threshold = (50 - 0) / (100 - 0) = 0.50
-    failure_margin = 0.50 - 0.18 = 0.32 → MODERATE (close to boundary, but > 0.3)
-    ```
-    ```
-    root_cause: "In ValidatorPredictor, crashed with KeyError on 'user_id' because ExtractorPredictor output {'userId': ...} but Validator expects {'user_id': ...}. Clear field name mismatch in data contract."
+    root_cause: "In ValidatorPredictor, crashed with KeyError on 'user_id' because ExtractorPredictor output {'userId': ...} but Validator expects {'user_id': ...}."
     involved_predictors: ["ExtractorPredictor", "ValidatorPredictor"]
     context: "All user data extraction tasks"
     category: "schema-mismatch"
-    key_details: "SEVERITY: MODERATE. PRIMARY_FAILURE: ExtractorPredictor. FIXABLE: Standardize field naming in both prompts. NOT_FIXABLE: None. SUGGESTED_FIX: Change ExtractorPredictor to output 'user_id' or change ValidatorPredictor to expect 'userId'."
+    key_details: "SEVERITY: MODERATE. PRIMARY_FAILURE: ExtractorPredictor. FIXABLE: Standardize field naming. NOT_FIXABLE: None. SUGGESTED_FIX: Change ExtractorPredictor to output 'user_id'."
     ```
 
     ### Example 3: SEVERE
-    *Calculation: score=0.15, threshold=0.7, range=[0,1]*
+    Given: score=0.15, threshold=0.7, range=[0,1] → margin=0.55
     ```
-    normalized_score = (0.15 - 0) / (1 - 0) = 0.15
-    normalized_threshold = (0.7 - 0) / (1 - 0) = 0.70
-    failure_margin = 0.70 - 0.15 = 0.55 → SEVERE (margin > 0.3)
-    ```
-    ```
-    root_cause: "In SummarizerPredictor, produced empty output because it received malformed JSON from ParserPredictor that couldn't be processed. Parser ignored JSON format specification entirely."
+    root_cause: "In SummarizerPredictor, produced empty output because ParserPredictor provided malformed JSON. Parser ignored JSON format specification."
     involved_predictors: ["ParserPredictor", "SummarizerPredictor", "FormatterPredictor"]
     context: "Complex nested data structures"
     category: "ambiguous-instruction"
-    key_details: "SEVERITY: SEVERE. PRIMARY_FAILURE: ParserPredictor. FIXABLE: Complete rewrite of ParserPredictor prompt with clear JSON schema. NOT_FIXABLE: None if data is available. SUGGESTED_FIX: Replace vague 'extract data' with explicit JSON schema and examples."
+    key_details: "SEVERITY: SEVERE. PRIMARY_FAILURE: ParserPredictor. FIXABLE: Complete rewrite with JSON schema. NOT_FIXABLE: None. SUGGESTED_FIX: Replace vague 'extract data' with explicit JSON schema and examples."
     ```
+
+    *Key lesson: Always trace cascades to their origin - fixing downstream symptoms wastes iterations*
 
     ### Example 4: Custom Category
     ```
-    root_cause: "In DateExtractor, failed to parse relative dates like 'next Tuesday' because prompt lacks temporal context handling. I/O shows input 'meeting next Tuesday' → output {'date': 'Tuesday'} missing actual date."
+    root_cause: "In DateExtractor, failed to parse relative dates. I/O shows 'meeting next Tuesday' → {'date': 'Tuesday'} missing absolute date."
     involved_predictors: ["DateExtractor", "SchedulerPredictor"]
     context: "Natural language with relative time references"
     category: "temporal-resolution-failure"
-    key_details: "SEVERITY: MODERATE. PRIMARY_FAILURE: DateExtractor. FIXABLE: Add current date context and relative date parsing rules. NOT_FIXABLE: None. SUGGESTED_FIX: Add to prompt: 'Given today is [DATE], resolve relative dates to absolute dates'."
+    key_details: "SEVERITY: MODERATE. PRIMARY_FAILURE: DateExtractor. FIXABLE: Add temporal context. NOT_FIXABLE: None. SUGGESTED_FIX: Add 'Given today is [DATE], resolve relative dates to absolute dates'."
     ```
 
-    ### Example 5: Contradictory Signals (Metric vs I/O)
-    *Calculation: score=0.65, threshold=0.8, range=[0,1]*
+    ### Example 5: Metric vs I/O Contradiction
+    Given: score=0.65, threshold=0.8, range=[0,1] → margin=0.15
     ```
-    normalized_score = (0.65 - 0) / (1 - 0) = 0.65
-    normalized_threshold = (0.8 - 0) / (1 - 0) = 0.80
-    failure_margin = 0.80 - 0.65 = 0.15 → MODERATE
-    ```
-    ```
-    root_cause: "In FormatterPredictor, JSON structure correct per I/O analysis but metric feedback states: 'Values in wrong units - expected metric units, got imperial'. I/O shows correct JSON format: {'distance': 100, 'weight': 150} but metric requirement for metric units (meters, kg) not specified in any predictor prompt."
+    root_cause: "In FormatterPredictor, JSON correct but metric states: 'Values in wrong units - expected metric, got imperial'. Hidden requirement not in prompts."
     involved_predictors: ["FormatterPredictor"]
     context: "Measurement data requiring specific unit conventions"
     category: "missing-constraint"
-    key_details: "SEVERITY: MODERATE. PRIMARY_FAILURE: FormatterPredictor. FIXABLE: Add unit specification based on metric requirement. NOT_FIXABLE: Metric expectation discovery. SUGGESTED_FIX: Add 'All measurements must be in metric units (meters, kilograms, celsius)' to FormatterPredictor."
+    key_details: "SEVERITY: MODERATE. PRIMARY_FAILURE: FormatterPredictor. FIXABLE: Add unit specification. NOT_FIXABLE: Metric expectation discovery. SUGGESTED_FIX: Add 'All measurements must be in metric units'."
     ```
-    *Key insight: Metric feedback revealed hidden requirement that I/O analysis alone couldn't detect*
 
-    ## Coordination Note
-
-    Your failure categories will be cross-referenced against success patterns from SuccessGuard to ensure fixes don't break working mechanisms. Be precise with category selection.
-
-    ## Quality Checklist & Critical Reminders
+    ## Quality Checklist
 
     Before returning analysis, verify:
-    ☐ Did I check metric_feedback FIRST for diagnostic insights?
-    ☐ Did I identify the FIRST point of failure using I/O data?
-    ☐ Is the root_cause the fundamental issue, not a symptom?
-    ☐ Have I provided specific evidence from the I/O values?
-    ☐ Is my suggested fix actionable and specific?
-    ☐ Have I correctly assessed severity based on normalized score margin?
-
-    Remember:
-    - Your analysis directly drives what gets fixed - be precise, evidence-based, and actionable
-    - Focus on ROOT CAUSE not symptoms; one failure may cascade - identify the origin
-    - Use I/O data as evidence; empty error field doesn't mean no error - check metric_score
-    - Consider failure severity when suggesting fixes - match fix scope to severity band"""
+    ☐ Metric feedback checked FIRST?
+    ☐ PRIMARY failure point identified (not cascades)?
+    ☐ Root cause fundamental (not symptom)?
+    ☐ I/O evidence provided?
+    ☐ Fix actionable and severity-appropriate?"""
 
     problem: str = InputField(desc="The problem statement or input to the program")
     prediction: str = InputField(desc="The model's actual prediction/output")
@@ -408,24 +330,17 @@ class SuccessAnalysisSignature(Signature):
 
     ## Operational Context
 
-    You're part of APEX optimizer that:
-    - Runs iteratively, sampling different training examples each iteration
-    - Analyzes successes to create PROTECTIVE CONSTRAINTS for hypothesis generation
-    - Your analysis directly controls what the optimizer WON'T change
-    - Works with multi-predictor programs organized as directed acyclic graphs (DAGs)
-    - Has full access to intermediate I/O values between all predictors
-    - May analyze programs that are already partially optimized from previous iterations
-    - You're analyzing a SAMPLE, not all successes - focus on generalizable patterns
+    You're part of APEX optimizer creating PROTECTIVE CONSTRAINTS for hypothesis generation.
+    Key realities:
+    - Success patterns vary: single-predictor excellence vs multi-predictor coordination vs input luck
+    - Data contracts (field names, types) between predictors are FRAGILE
+    - Your constraints determine what hypothesis generator can/cannot change
 
-    Key operational realities about success patterns:
-    - **Coordination matters**: Success often requires multiple predictors working together through data contracts
-    - **Data contracts**: Predictors coordinate via field names, types, formats - these are FRAGILE
-    - **Success types vary**: Single predictor excellence vs multi-predictor coordination vs lucky data match
-    - **Recovery chains**: Sometimes one predictor compensates for another's weakness (preserve recovery, not weakness)
-    - **Amplification patterns**: Each predictor may enhance previous outputs (preserve sequence)
-    - **Partial success**: One predictor strong, another weak - preserve only the strong pattern
+    Focus: Surgical preservation - protect core mechanisms, not implementation details.
 
-    This means: Be surgical - over-preservation blocks optimization, under-preservation breaks working code. Your constraints directly determine what hypothesis generator can/cannot change.
+    Critical insight: In DAGs, preserving upstream patterns protects ALL downstream branches. Data contracts (field names, types) are invisible failure points - a single changed field name can cascade-break the entire graph. Your precision determines if improvements are possible.
+
+    Coordination: Your analysis will be cross-referenced with FailureDetective to ensure preservation doesn't block necessary fixes.
 
     ## Task
 
@@ -472,14 +387,7 @@ class SuccessAnalysisSignature(Signature):
     ## Analysis Framework
 
     ### 1. Success Quality Assessment
-    First, normalize scores to 0-1 range for accurate comparison:
-    ```
-    normalized_score = (metric_score - min_metric) / (max_metric - min_metric)
-    normalized_threshold = (success_threshold - min_metric) / (max_metric - min_metric)
-    score_margin = normalized_score - normalized_threshold
-    ```
-
-    Quality bands based on margin:
+    Normalize scores: `score_norm = (score - min) / (max - min), margin = score_norm - threshold_norm`
     - **MARGINAL** (margin < 0.1): Barely passing, be VERY selective about preservation
     - **SOLID** (margin 0.1-0.3): Good success, preserve core mechanisms
     - **EXCELLENT** (margin >= 0.3): High-quality pattern, strong preservation candidate
@@ -513,80 +421,66 @@ class SuccessAnalysisSignature(Signature):
 
     Note: FRAGILE !== MUST PRESERVE. Something can be fragile but not worth preserving (e.g., a hacky workaround).
 
-    ## Preservation Category Tests
+    ### 4. Preservation Decision Tree
 
-    Use these operational tests to classify what goes where:
+    **Quick Tests for Classification**:
+    MUST PRESERVE tests:
+    • Would removing break success? AND no alternative exists?
+    • Does metric specifically praise this mechanism?
+    • Is this the causal mechanism (not just correlated)?
 
-    **To determine MUST PRESERVE:**
-    - Would removing this mechanism break the success? → YES = MUST PRESERVE
-    - Is this the ONLY way to achieve this outcome? → YES = MUST PRESERVE
-    - Does metric feedback specifically praise this? → YES = MUST PRESERVE
-    - Does I/O show this transformation was critical? → YES = MUST PRESERVE
+    FRAGILE tests:
+    • Exact string/format required? (e.g., field names in JSON)
+    • Would ANY change break downstream?
+    • Is this a data contract between predictors?
 
-    **To identify FRAGILE elements:**
-    - Is exact string/format/value required for success? → YES = FRAGILE
-    - Would ANY change to this break downstream predictors? → YES = FRAGILE
-    - Is this a data contract term between predictors? → YES = FRAGILE
-    - Does I/O show exact matching required? → YES = FRAGILE
+    CAN MODIFY tests:
+    • Multiple valid implementations possible?
+    • Only cosmetic/explanatory text?
+    • Success independent of exact phrasing?
 
-    **To confirm CAN MODIFY:**
-    - Could this be reworded without changing behavior? → YES = CAN MODIFY
-    - Is this cosmetic/explanatory text only? → YES = CAN MODIFY
-    - Do multiple valid implementations exist? → YES = CAN MODIFY
-    - Does success NOT depend on exact phrasing? → YES = CAN MODIFY
+    **EXCELLENT (margin ≥ 0.3)**:
+    • Metric praises mechanism
+      → PRESERVE: That exact mechanism
+      → FRAGILE: Praised implementation details
+      → MODIFY: Unrelated aspects
 
-    ## Preservation Decision Tree
+    • Predictor coordination succeeds
+      → PRESERVE: Both approaches + data contract
+      → FRAGILE: Field names, types, sequence
+      → MODIFY: Internal implementation
 
-    Use this explicit logic to determine what to preserve based on quality margin:
+    • Robust handling observed
+      → PRESERVE: Pattern as template
+      → MODIFY: Minor refinements
 
-    ### For EXCELLENT scores (margin >= 0.3):
-    **IF metric feedback praises specific mechanism** THEN
-      → **MUST PRESERVE**: That exact mechanism and its approach
-      → **FRAGILE**: Any implementation details metric specifically mentioned
-      → **CAN MODIFY**: Unrelated aspects not praised by metric
+    **SOLID (margin 0.1-0.3)**:
+    • One predictor strong
+      → PRESERVE: Only that predictor's approach
+      → FRAGILE: Critical field names if data flows downstream
+      → MODIFY: Other predictors freely
 
-    **ELSE IF success from predictor coordination** THEN
-      → **MUST PRESERVE**: Both predictors' core approaches
-      → **MUST PRESERVE**: Their interaction/data contract
-      → **FRAGILE**: Field names, data types, transformation sequence
-      → **CAN MODIFY**: Implementation details within each predictor
+    • Clean data flow
+      → PRESERVE: Core transformation logic
+      → FRAGILE: Data contracts only
+      → MODIFY: Error messages, descriptions
 
-    **ELSE IF robust data handling observed** THEN
-      → **MUST PRESERVE**: Gold standard pattern as template
-      → **CAN MODIFY**: Minor refinements that maintain robustness
+    • Recovery mechanism works
+      → PRESERVE: Recovery approach only
+      → MODIFY: Upstream that causes need for recovery
 
-    ### For SOLID scores (margin 0.1-0.3):
-    **IF one predictor carried the success** THEN
-      → **MUST PRESERVE**: Only that predictor's approach
-      → **CAN MODIFY**: Other predictors (they weren't tested)
-      → **FRAGILE**: Whatever made the strong predictor work
+    **MARGINAL (margin < 0.1)**:
+    • Lucky input match
+      → PRESERVE: Nothing - accidental success
+      → MODIFY: Everything needs improvement
 
-    **ELSE IF clean data flow between predictors** THEN
-      → **MUST PRESERVE**: Core mechanism and coordination
-      → **CAN MODIFY**: Allow refinement of implementation details
-      → **FRAGILE**: Data contracts (if any)
+    • Inherent limitation reached
+      → PRESERVE: Awareness of limitation only
+      → MODIFY: Seek workarounds
 
-    **ELSE IF success despite messy intermediates** THEN
-      → **MUST PRESERVE**: Only the recovery/compensation mechanism
-      → **CAN MODIFY**: Upstream predictors to prevent messiness
-      → **FRAGILE**: Recovery logic specifics
-
-    ### For MARGINAL scores (margin < 0.1):
-    **IF input was pre-formatted/lucky match** THEN
-      → **PRESERVE**: Nothing (luck isn't worth preserving)
-      → **CAN MODIFY**: All predictors (weren't truly tested)
-      → **FRAGILE**: N/A
-      → **NOTE**: Recommend improving rather than preserving
-
-    **ELSE IF this is genuinely best possible for input type** THEN
-      → **MINIMAL PRESERVE**: Note inherent limitation
-      → **CAN MODIFY**: Look for alternative approaches
-      → **FRAGILE**: Context-specific constraints only
-
-    **ELSE IF barely worked despite good effort** THEN
-      → **CONDITIONAL PRESERVE**: Only if no better approach exists
-      → **CAN MODIFY**: Everything - seek improvements
-      → **FRAGILE**: Minimal
+    • Barely worked
+      → PRESERVE: Outcome requirement only
+      → MODIFY: Method entirely
 
     ## Output Specifications
 
@@ -642,136 +536,68 @@ class SuccessAnalysisSignature(Signature):
     ```
 
     ## Examples
+    *All use: score_norm = (score - min) / (max - min), margin = score_norm - threshold_norm*
 
-    ### Example 1: EXCELLENT Score with Metric Feedback
-    *Calculation: score=0.95, threshold=0.5, range=[0,1]*
+    ### Example 1: EXCELLENT
+    Given: score=0.95, threshold=0.5, range=[0,1] → margin=0.45
     ```
-    normalized_score = (0.95 - 0) / (1 - 0) = 0.95
-    normalized_threshold = (0.5 - 0) / (1 - 0) = 0.5
-    score_margin = 0.95 - 0.5 = 0.45 → EXCELLENT
-    ```
-    ```
-    success_pattern: "ExtractorPredictor correctly parsed complex JSON due to schema specification, Validator verified all required fields. Metric praised: 'Perfect extraction - all nested objects preserved with correct types and structure'."
+    success_pattern: "ExtractorPredictor parsed JSON via schema specification, Validator verified all fields. Metric: 'Perfect extraction - all nested objects preserved'."
     contributing_predictors: ["ExtractorPredictor", "Validator"]
-    context: "Structured data extraction with nested objects and arrays"
+    context: "Structured data with nested objects and arrays"
     category: "explicit-format-following"
-    key_details: "MUST PRESERVE: JSON schema specification and validation logic that metric identified as perfect. CAN MODIFY: Error messages, descriptive text. FRAGILE: Field names 'user_id', 'timestamp' in data contract. RELIABILITY: High - metric confirmed consistent success across varied inputs"
+    key_details: "MUST PRESERVE: JSON schema and validation logic. CAN MODIFY: Error messages, descriptive text. FRAGILE: Field names 'user_id', 'timestamp' in data contract. RELIABILITY: High - consistent across varied inputs"
     ```
-    *Metric feedback: "Perfect extraction - all nested objects preserved with correct types and structure"*
 
-    ### Example 2: SOLID Score
-    *Calculation: score=72, threshold=50, range=[0,100]*
+    ### Example 2: SOLID
+    Given: score=72, threshold=50, range=[0,100] → margin=0.22
     ```
-    normalized_score = (72 - 0) / (100 - 0) = 0.72
-    normalized_threshold = (50 - 0) / (100 - 0) = 0.50
-    score_margin = 0.72 - 0.50 = 0.22 → SOLID
-    ```
-    ```
-    success_pattern: "Cleaner successfully recovered from Extractor's malformed JSON by detecting and fixing quote escaping issues"
+    success_pattern: "Cleaner recovered from Extractor's malformed JSON by fixing quote escaping. I/O: {'text': 'She said \"hello\"'} → escaped correctly."
     contributing_predictors: ["Cleaner"]
     context: "Text with embedded quotes and special characters"
     category: "robust-error-handling"
-    key_details: "MUST PRESERVE: Quote escaping detection in Cleaner. CAN MODIFY: Extractor prompt to prevent malformation. FRAGILE: Regex pattern for quote detection. RELIABILITY: Medium - works for common cases but may miss edge cases"
+    key_details: "MUST PRESERVE: Quote escaping detection. CAN MODIFY: Extractor prompt to prevent malformation. FRAGILE: Regex pattern for quotes. RELIABILITY: Medium - may miss edge cases"
     ```
-    *I/O analysis revealed Extractor output: {"text": "She said "hello""} → Cleaner fixed to: {"text": "She said \\"hello\\""}"*
 
-    ### Example 3: MARGINAL Score
-    *Calculation: score=0.52, threshold=0.5, range=[0,1]*
+    ### Example 3: MARGINAL
+    Given: score=0.52, threshold=0.5, range=[0,1] → margin=0.02
     ```
-    normalized_score = (0.52 - 0) / (1 - 0) = 0.52
-    normalized_threshold = (0.5 - 0) / (1 - 0) = 0.5
-    score_margin = 0.52 - 0.5 = 0.02 → MARGINAL
-    ```
-    ```
-    success_pattern: "Succeeded only because input was already in expected format, predictors did minimal processing"
+    success_pattern: "Succeeded only because input was pre-formatted. Predictors did minimal processing."
     contributing_predictors: []
-    context: "Pre-formatted JSON input that matched output requirements"
+    context: "Pre-formatted JSON matching output requirements"
     category: "input-pattern-match"
-    key_details: "MUST PRESERVE: Nothing specific. CAN MODIFY: All predictor prompts need improvement. FRAGILE: N/A. RELIABILITY: Low - only works when input is pre-formatted"
+    key_details: "MUST PRESERVE: Nothing. CAN MODIFY: All prompts need improvement. FRAGILE: N/A. RELIABILITY: Low - only works when pre-formatted"
     ```
-    *I/O showed input passed through unchanged - predictors weren't truly tested*
 
     ### Example 4: Custom Category
-    *Calculation: score=0.85, threshold=0.5, range=[0,1]*
     ```
-    normalized_score = (0.85 - 0) / (1 - 0) = 0.85
-    normalized_threshold = (0.5 - 0) / (1 - 0) = 0.5
-    score_margin = 0.85 - 0.5 = 0.35 → EXCELLENT
-    ```
-    ```
-    success_pattern: "MathSolver correctly computed complex derivatives using step-by-step symbolic manipulation, Verifier confirmed accuracy to 6 decimal places"
+    success_pattern: "MathSolver computed derivatives using step-by-step symbolic manipulation, Verifier confirmed accuracy."
     contributing_predictors: ["MathSolver", "Verifier"]
     context: "Calculus problems requiring symbolic differentiation"
     category: "mathematical-precision-success"
-    key_details: "MUST PRESERVE: Step-by-step computation approach and precision requirements. CAN MODIFY: Output formatting, explanation style. FRAGILE: Mathematical notation parsing rules. RELIABILITY: High for standard calculus, may struggle with exotic functions"
+    key_details: "MUST PRESERVE: Step-by-step computation approach. CAN MODIFY: Output formatting. FRAGILE: Mathematical notation parsing. RELIABILITY: High for standard calculus"
     ```
-    *I/O showed correct chain rule application: d/dx(sin(x²)) → 2x·cos(x²) with all steps shown*
 
-    ### Example 5: Successful but Suboptimal
-    *Calculation: score=0.65, threshold=0.5, range=[0,1]*
+    ### Example 5: Suboptimal Success
+    Given: score=0.65, threshold=0.5, range=[0,1] → margin=0.15
     ```
-    normalized_score = (0.65 - 0) / (1 - 0) = 0.65
-    normalized_threshold = (0.5 - 0) / (1 - 0) = 0.5
-    score_margin = 0.65 - 0.5 = 0.15 → SOLID (but concerning pattern)
-    ```
-    ```
-    success_pattern: "FormatterPredictor succeeded through expensive retry logic after initial failures, taking 3 attempts to produce valid JSON"
+    success_pattern: "FormatterPredictor succeeded through expensive retry logic (3 attempts). Works but inefficient."
     contributing_predictors: ["FormatterPredictor"]
     context: "Malformed input requiring multiple parse attempts"
     category: "robust-error-handling"
-    key_details: "MUST PRESERVE: Nothing - approach works but inefficient. CAN MODIFY: Replace retry logic with better initial parsing. FRAGILE: N/A. RELIABILITY: Low - expensive and may timeout on complex inputs. RECOMMENDATION: Preserve outcome requirement but not method."
+    key_details: "MUST PRESERVE: Nothing - approach inefficient. CAN MODIFY: Replace retry with better parsing. FRAGILE: N/A. RELIABILITY: Low - may timeout. NOTE: Preserve outcome requirement not method."
     ```
-    *I/O showed: attempt1="invalid", attempt2="invalid", attempt3="valid JSON" - success through brute force*
-    *Key insight: Success doesn't always mean the approach is worth preserving*
 
-    ## Coordination Note
+    *Key lesson: Success ≠ worth preserving. Expensive workarounds should be replaced, not protected*
 
-    Your success patterns will be used as PROTECTIVE CONSTRAINTS by the hypothesis generator. FailureDetective's fix suggestions will be checked against your preservation requirements to prevent breaking working mechanisms. Be surgical and precise.
-
-    ## Common Analysis Pitfalls to Avoid
-
-    **1. Over-preservation of Implementation Details**
-    - BAD: "MUST PRESERVE: Uses 'for' loop with index variable 'i'"
-    - GOOD: "MUST PRESERVE: Iterative validation approach"
-    - Principle: Preserve the WHAT (mechanism), not the HOW (implementation)
-
-    **2. Confusing Correlation with Causation**
-    - BAD: "Success because input was short"
-    - GOOD: "Success because parser handles single-line JSON well"
-    - Principle: Identify the processing mechanism, not input characteristics
-
-    **3. Preserving Workarounds Instead of Outcomes**
-    - BAD: "MUST PRESERVE: Retry logic that eventually works"
-    - GOOD: "CAN MODIFY: Replace brittle retry with robust parsing"
-    - Principle: Preserve the outcome requirement, not inefficient methods
-
-    **4. Blanket Preservation Without Justification**
-    - BAD: "MUST PRESERVE: Everything in ExtractorPredictor"
-    - GOOD: "MUST PRESERVE: JSON schema specification. CAN MODIFY: Error messages"
-    - Principle: Be surgical - identify exact critical elements
-
-    **5. Ignoring Quality Margin Guidance**
-    - BAD: Strong preservation on MARGINAL success (margin 0.02)
-    - GOOD: Minimal/no preservation on lucky matches
-    - Principle: Preservation strength should match quality margin
-
-    ## Quality Checklist & Critical Reminders
+    ## Quality Checklist
 
     Before returning analysis, verify:
-    □ Did I check metric_feedback FIRST for what worked well?
-    □ Did I calculate margin to determine preservation stringency?
-    □ Is the success pattern CAUSAL not just descriptive?
-    □ Are preservation requirements SURGICAL not blanket?
-    □ Is the context SPECIFIC enough to define pattern domain?
-    □ Will this help hypothesis generator avoid breaking changes?
-    □ Have I avoided over-preserving accidental/lucky successes?
-
-    Remember:
-    - You're creating guardrails, not roadblocks - preserve core success mechanisms while leaving room for improvement
-    - You see ONE success from a sample - don't overgeneralize to all cases
-    - Focus on CAUSAL mechanisms, not correlations; preservation requirements directly constrain optimization
-    - Empty contributing_predictors list is fine if success is input-driven
-    - Balance preservation with optimization flexibility - match preservation strength to quality margin"""
+    ☐ Metric feedback checked FIRST?
+    ☐ Margin calculated for preservation stringency?
+    ☐ Success pattern CAUSAL (not correlation)?
+    ☐ Preservation SURGICAL (mechanism not implementation)?
+    ☐ Avoided preserving workarounds over outcomes?
+    ☐ Preservation strength matches quality margin?"""
 
     problem: str = InputField(desc="The problem statement or input to the program")
     prediction: str = InputField(desc="The model's actual prediction/output")
@@ -880,15 +706,15 @@ class HypothesisGenerationSignature(Signature):
 
     ## Understanding Program Flow
 
-    From program_flow, understand:
+    Key insight: The program_flow shows predictor dependencies. Changes to upstream predictors affect all downstream branches - coordinate changes accordingly.
 
-    - Graph structure: Shows a directed acyclic graph of predictor dependencies from inputs through intermediate nodes to outputs
-    - Topology: Edges indicate data flow; a node may have multiple parents or children. Respect the DAG when reasoning about impacts
-    - Execution order: Consider valid topological orders when coordinating changes across branches
-    - Cascade potential: Changes to upstream predictors propagate along all outgoing edges and can affect multiple downstream branches
-    - Bottlenecks: Identify hub predictors whose outputs feed many successors—they are high-leverage intervention points
+    ## Success Pattern Preservation
 
-    This helps identify when a MINIMAL fix suffices vs when MODERATE coordinated changes are needed.
+    From success_analyses, identify what works. Your hypotheses must:
+    - Preserve successful mechanisms identified by SuccessGuard
+    - Respect FRAGILE elements (exact field names, data contracts)
+    - Only modify what's marked as safe to change
+    - If conflict exists between fix and preservation, find alternative approach
 
     ## Hypothesis Generation Strategy
 
@@ -918,16 +744,6 @@ class HypothesisGenerationSignature(Signature):
     Only when patterns show no smaller fix possible
     Note: High risk - only if confident no alternative exists
 
-    ## Success Preservation
-
-    From success_analyses, identify patterns that work. When generating hypotheses:
-
-    1. Note which predictors/approaches succeed
-    1. Ensure changes don’t contradict successful patterns
-    1. If conflict exists, find alternative approach or skip
-    1. In rationale, state what successful patterns are preserved
-
-    Key: We see pattern summaries, not specific instructions, so preserve general approaches that work.
 
     ## Output Format
 
@@ -1039,16 +855,6 @@ class HypothesisGenerationSignature(Signature):
 
     Better to return [] than low-quality hypotheses that won’t survive validation.
 
-    ## Success Preservation
-
-    From success_analyses, identify patterns that work. When generating hypotheses:
-
-    1. Note which predictors/approaches succeed
-    1. Ensure changes don’t contradict successful patterns
-    1. If conflict exists, find alternative approach or skip
-    1. In rationale, explicitly state what successful patterns are preserved
-
-    Remember: Successful patterns in the sample likely generalize to validation set. Breaking them risks degrading overall performance even if training errors decrease.
 
     ## Example Hypothesis
 
