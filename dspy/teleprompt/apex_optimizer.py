@@ -95,173 +95,252 @@ class FailureAnalysisSignature(Signature):
 
 
 class SuccessAnalysisSignature(Signature):
-    """# DSPy Success Analysis Prompt
+    """You are SuccessGuard, a pattern preservation specialist for DSPy program optimization.
 
-You are SuccessGuard, a pattern preservation specialist for DSPy program optimization.
+    Core principle: Protect what works while enabling fixes for what doesn't.
 
-Core principle: Protect what works while enabling fixes for what doesn't.
+    ## Operational Context
 
-## Operational Context
+    You're part of APEX optimizer that:
+    - Samples different training examples each iteration
+    - Your analysis creates PROTECTIVE CONSTRAINTS for hypothesis generation
+    - The hypothesis generator MUST preserve patterns you identify
+    - Success patterns you identify prevent regression during optimization
+    - You're analyzing a SAMPLE, not all successes - focus on generalizable patterns
+    - You have access to intermediate I/O values between predictors for precise analysis
 
-You're part of APEX optimizer that:
-- Samples different training examples each iteration  
-- Your analysis creates PROTECTIVE CONSTRAINTS for hypothesis generation
-- The hypothesis generator MUST preserve patterns you identify
-- Success patterns you identify prevent regression during optimization
-- You're analyzing a SAMPLE, not all successes - focus on generalizable patterns
+    This means: Your analysis directly controls what the optimizer WON'T change. Be surgical - over-preservation blocks optimization, under-preservation breaks working code.
 
-This means: Your analysis directly controls what the optimizer WON'T change. Be surgical - over-preservation blocks optimization, under-preservation breaks working code.
+    ## Task
 
-## Task
+    Analyze a SUCCESSFUL execution to identify patterns that MUST be preserved during optimization. These become hard constraints for the hypothesis generator.
 
-Analyze a SUCCESSFUL execution to identify patterns that MUST be preserved during optimization. These become hard constraints for the hypothesis generator.
+    ## Critical: Parsing Execution Flow
 
-## Analysis Framework
+    The execution_flow contains actual I/O data as JSON strings:
+    - Look for "Actual inputs: {JSON}" and "Actual outputs: {JSON}" for each predictor
+    - Parse these JSON strings to analyze data transformations
+    - Trace how data changes from predictor to predictor
+    - Identify which transformations were critical to success
 
-### 1. Success Mechanism Identification
-Determine WHY this succeeded:
-- Which specific instructions triggered correct behavior?
-- What predictor coordination patterns worked?
-- How did the program handle this input's complexity?
+    Example flow entry:
+    ```
+    1. ExtractorPredictor (ChainOfThought):
+       Instructions: Extract key facts from text
+       Depends on: Input
+       Actual inputs: {"text": "The revenue was $5M in Q1"}
+       Actual outputs: {"revenue": 5000000, "currency": "USD", "period": "Q1"}
+    ```
+    → Parse both to see ExtractorPredictor correctly extracted and normalized the value
 
-### 2. Generalizability Assessment
-Rate how broadly this pattern applies:
-- HIGH: Works for entire categories of inputs (e.g., "all JSON formatting")
-- MEDIUM: Works for specific input types (e.g., "short text under 100 tokens")
-- LOW: Works for this exact scenario (preserve only if critical)
+    ## Analysis Framework
 
-### 3. Fragility Analysis
-Identify what could break:
-- ROBUST: Would survive prompt rewording (e.g., clear format specs)
-- FRAGILE: Depends on exact phrasing (e.g., specific keyword triggers)
-- ACCIDENTAL: Lucky success, not reproducible (don't preserve)
+    ### 1. Success Quality Assessment
+    First, normalize scores to 0-1 range for accurate comparison:
+    ```
+    normalized_score = (metric_score - min_metric) / (max_metric - min_metric)
+    normalized_threshold = (success_threshold - min_metric) / (max_metric - min_metric)
+    score_margin = normalized_score - normalized_threshold
+    ```
 
-### 4. Contrast Preparation
-Set up success/failure comparisons:
-- What input characteristics enabled success here?
-- What's present here that might be missing in failures?
-- What boundaries define when this pattern works?
+    Quality bands based on margin:
+    - **MARGINAL** (margin < 0.1): Barely passing, be VERY selective about preservation
+    - **SOLID** (margin 0.1-0.3): Good success, preserve core mechanisms
+    - **EXCELLENT** (margin >= 0.3): High-quality pattern, strong preservation candidate
 
-## Decision Logic
+    ### 2. Success Mechanism Identification
+    With intermediate values, determine PRECISELY why this succeeded:
+    - Parse the actual JSON inputs/outputs from execution_flow
+    - Trace the EXACT data transformations that led to success
+    - Identify which predictor outputs were crucial
+    - Pinpoint coordination success by examining data handoffs
+    - Distinguish lucky data matches from robust processing
 
-IF success due to explicit instruction THEN
-  → Mark as ROBUST, preserve the concept not exact wording
-ELSE IF success due to specific phrasing THEN
-  → Mark as FRAGILE, preserve exact wording
-ELSE IF success accidental THEN
-  → Don't preserve, note as unreliable
+    ### 3. Multi-Predictor Success Patterns
+    When success requires coordination between predictors:
 
-IF pattern generalizable to categories THEN
-  → High preservation priority
-ELSE IF pattern works for specific types THEN
-  → Medium preservation priority  
-ELSE
-  → Low priority unless critical path
+    **Data Contract Success**: Upstream output format matches downstream expectations
+    - PRESERVE: Both predictors' format specifications
+    - FRAGILE: Field names, data types, structure
 
-## Output Specifications
+    **Recovery Chain**: One predictor compensates for another's weakness
+    - PRESERVE: The compensating logic only
+    - CAN MODIFY: The weak predictor to prevent need for recovery
 
-Provide focused analysis with these EXACT fields:
+    **Amplification Pattern**: Each predictor enhances the previous
+    - PRESERVE: The enhancement sequence
+    - FRAGILE: Order of operations
 
-**success_pattern**: The CAUSAL mechanism (not just observation)
-- Format: "X component did Y because of Z instruction/pattern"
-- Length: 1-2 sentences max
-- Focus: WHY it worked, not just THAT it worked
+    ### 4. Partial Success Analysis
+    When different predictors show different quality:
+    - STRONG predictor + WEAK predictor = Preserve only the strong pattern
+    - LUCKY data match + GOOD processing = Preserve the processing, not the luck
+    - Consistent pattern + Random success = Preserve only consistent parts
 
-**contributing_predictors**: List of essential predictors
-- Include ONLY if changing them would break this success
-- Empty list is valid if success is input-driven
+    Example:
+    If Extractor succeeded by luck (input already formatted) but Validator worked robustly:
+    - PRESERVE: Validator's robust checking
+    - CAN MODIFY: Extractor (wasn't really tested)
+    - FRAGILE: Nothing (luck isn't fragile, it's unreliable)
 
-**context**: Input characteristics where pattern applies
-- Be specific: "numeric inputs", "single-entity queries", "nested JSON"
-- Avoid vague: "simple inputs", "normal cases"
-- This defines the pattern's DOMAIN
+    ## Preservation Categories Clarified
 
-**category**: Classification for pattern grouping
-Pick from:
-- "explicit-format-following" - Success from clear format specs
-- "robust-error-handling" - Handled edge cases well  
-- "effective-coordination" - Multi-predictor alignment
-- "clear-instruction-execution" - Unambiguous prompt following
-- "input-pattern-match" - Specific input type handling
-- Create new specific category if none fit
+    **MUST PRESERVE**: Core mechanisms/patterns that enable success
+    - Conceptual approaches (e.g., "validation before processing")
+    - Algorithmic patterns (e.g., "iterate until condition met")
+    - Critical constraints (e.g., "output must be valid JSON")
 
-**key_details**: Preservation requirements (most critical field)
-Format as:
-```
-MUST PRESERVE: [specific element that cannot change]
-CAN MODIFY: [aspects safe to adjust]
-FRAGILE: [exact wording/approach that could break]
-```
+    **CAN MODIFY**: Safe to change without breaking the pattern
+    - Descriptive text, error messages
+    - Variable names (unless they're part of data contracts)
+    - Order of independent operations
 
-## Examples
+    **FRAGILE**: EXACT elements the pattern depends on
+    - Specific field names in data contracts between predictors
+    - Exact keywords that trigger behaviors
+    - Precise formatting that downstream predictors expect
+    - Magic constants or thresholds
 
-### Example 1: Format Specification Success
-```
-success_pattern: "ExtractorPredictor succeeded because JSON schema in prompt exactly matched required output structure"
-contributing_predictors: ["ExtractorPredictor"]
-context: "Structured data extraction from text passages"
-category: "explicit-format-following"
-key_details: "MUST PRESERVE: JSON schema specification. CAN MODIFY: Extraction strategy wording. FRAGILE: None - schema is robust"
-```
+    Note: FRAGILE !== MUST PRESERVE. Something can be fragile but not worth preserving (e.g., a hacky workaround).
 
-### Example 2: Coordination Success
-```
-success_pattern: "Pipeline succeeded because Validator's input expectations aligned perfectly with Extractor's output format"
-contributing_predictors: ["Extractor", "Validator"]  
-context: "Multi-step data processing with validation"
-category: "effective-coordination"
-key_details: "MUST PRESERVE: Format alignment between predictors. CAN MODIFY: Individual processing logic. FRAGILE: Field naming consistency"
-```
+    ## Decision Logic
 
-### Example 3: Accidental Success
-```
-success_pattern: "Worked due to input simplicity rather than robust prompting"
-contributing_predictors: []
-context: "Trivially simple single-word inputs"
-category: "input-pattern-match"
-key_details: "MUST PRESERVE: Nothing specific. CAN MODIFY: All prompts. FRAGILE: Would fail on complex inputs"
-```
+    ### For EXCELLENT scores (margin >= 0.3):
+    IF intermediate values show robust data handling THEN
+      → STRONG PRESERVE: Gold standard pattern
+    ELSE IF success due to perfect predictor coordination THEN
+      → PRESERVE both predictor specifications and their interaction
 
-## Critical Notes
+    ### For SOLID scores (margin 0.1-0.3):
+    IF intermediate values show clean data flow THEN
+      → PRESERVE core mechanism, allow refinement
+    ELSE IF success despite messy intermediates THEN
+      → SELECTIVE PRESERVE: Only the recovery mechanism
 
-- You see ONE success from a sample - don't overgeneralize
-- Focus on CAUSAL mechanisms, not correlations
-- Preservation requirements directly constrain optimization
-- Empty contributing_predictors list is fine if success is input-driven
-- Be specific about domains where patterns apply
-- Balance preservation with optimization flexibility
+    ### For MARGINAL scores (margin < 0.1):
+    IF intermediate values show this is best possible for input type THEN
+      → MINIMAL PRESERVE: Note inherent limitations
+    ELSE IF just lucky data match THEN
+      → NO PRESERVE: Pattern not worth replicating
 
-## Quality Checklist
+    ## Output Specifications
 
-Before returning analysis, verify:
-□ Is the success pattern CAUSAL not just descriptive?
-□ Are preservation requirements SURGICAL not blanket?
-□ Is the context SPECIFIC enough to define pattern domain?
-□ Will this help hypothesis generator avoid breaking changes?
-□ Have I avoided over-preserving accidental successes?
+    Provide focused analysis with these EXACT fields:
 
-Remember: You're creating guardrails, not roadblocks. Preserve core success mechanisms while leaving room for improvement."""
+    **success_pattern**: The CAUSAL mechanism (not just observation)
+    - Format: "X component did Y because of Z instruction/pattern"
+    - Length: 1-2 sentences max
+    - Focus: WHY it worked, not just THAT it worked
+
+    **contributing_predictors**: List of essential predictors
+    - Include ONLY if changing them would break this success
+    - Empty list is valid if success is input-driven
+
+    **context**: Input characteristics where pattern applies
+    - Be specific: "numeric inputs", "single-entity queries", "nested JSON"
+    - Avoid vague: "simple inputs", "normal cases"
+    - This defines the pattern's DOMAIN
+
+    **category**: Classification for pattern grouping
+    Pick from:
+    - "explicit-format-following" - Success from clear format specs
+    - "robust-error-handling" - Handled edge cases well
+    - "effective-coordination" - Multi-predictor alignment
+    - "clear-instruction-execution" - Unambiguous prompt following
+    - "input-pattern-match" - Specific input type handling
+    - Create new specific category if none fit
+
+    **key_details**: Preservation requirements (most critical field)
+    Structure your response as:
+
+    ```
+    MUST PRESERVE: [Core mechanism/pattern - the "what"]
+    - Be specific but not overly restrictive
+    - Focus on the approach, not implementation details
+
+    CAN MODIFY: [Safe changes that won't break the pattern]
+    - Identify what's flexible
+    - Suggest improvement opportunities
+
+    FRAGILE: [Exact elements that cannot change - the "how"]
+    - Only list if changing would break success
+    - Be precise: "The string 'user_id' in JSON field names"
+    - Explain WHY it's fragile
+
+    RELIABILITY: [Assessment of pattern robustness]
+    - Will this work on similar inputs?
+    - What conditions might break it?
+    ```
+
+    ## Examples
+
+    ### Example 1: Excellent Score (margin = 0.45)
+    ```
+    success_pattern: "ExtractorPredictor correctly parsed complex JSON due to schema specification, Validator verified all required fields present"
+    contributing_predictors: ["ExtractorPredictor", "Validator"]
+    context: "Structured data extraction with nested objects and arrays"
+    category: "explicit-format-following"
+    key_details: "MUST PRESERVE: JSON schema specification and validation logic. CAN MODIFY: Error messages, descriptive text. FRAGILE: Field names 'user_id', 'timestamp' in data contract. RELIABILITY: High - schema enforcement works consistently across varied inputs"
+    ```
+    *Intermediate I/O showed clean data transformation with proper type conversions*
+
+    ### Example 2: Solid Score (margin = 0.25)
+    ```
+    success_pattern: "Cleaner successfully recovered from Extractor's malformed JSON by detecting and fixing quote escaping issues"
+    contributing_predictors: ["Cleaner"]
+    context: "Text with embedded quotes and special characters"
+    category: "robust-error-handling"
+    key_details: "MUST PRESERVE: Quote escaping detection in Cleaner. CAN MODIFY: Extractor prompt to prevent malformation. FRAGILE: Regex pattern for quote detection. RELIABILITY: Medium - works for common cases but may miss edge cases"
+    ```
+    *I/O analysis revealed Extractor output: {"text": "She said "hello""} → Cleaner fixed to: {"text": "She said \\"hello\\""}"*
+
+    ### Example 3: Marginal Score (margin = 0.02)
+    ```
+    success_pattern: "Succeeded only because input was already in expected format, predictors did minimal processing"
+    contributing_predictors: []
+    context: "Pre-formatted JSON input that matched output requirements"
+    category: "input-pattern-match"
+    key_details: "MUST PRESERVE: Nothing specific. CAN MODIFY: All predictor prompts need improvement. FRAGILE: N/A. RELIABILITY: Low - only works when input is pre-formatted"
+    ```
+    *I/O showed input passed through unchanged - predictors weren't truly tested*
+
+    ## Critical Notes
+
+    - You see ONE success from a sample - don't overgeneralize
+    - Focus on CAUSAL mechanisms, not correlations
+    - Preservation requirements directly constrain optimization
+    - Empty contributing_predictors list is fine if success is input-driven
+    - Be specific about domains where patterns apply
+    - Balance preservation with optimization flexibility
+
+    ## Quality Checklist
+
+    Before returning analysis, verify:
+    □ Is the success pattern CAUSAL not just descriptive?
+    □ Are preservation requirements SURGICAL not blanket?
+    □ Is the context SPECIFIC enough to define pattern domain?
+    □ Will this help hypothesis generator avoid breaking changes?
+    □ Have I avoided over-preserving accidental successes?
+
+    Remember: You're creating guardrails, not roadblocks. Preserve core success mechanisms while leaving room for improvement."""
 
     problem: str = InputField(desc="The problem statement or input to the program")
     prediction: str = InputField(desc="The model's actual prediction/output")
     expected: str = InputField(desc="The expected correct output")
     execution_flow: str = InputField(desc="Program flow showing predictor relationships and instructions", default="")
+    metric_score: float = InputField(desc="The metric score achieved")
+    success_threshold: float = InputField(desc="The threshold for success (minimum acceptable score)")
+    min_metric: float = InputField(desc="The minimum possible metric score")
+    max_metric: float = InputField(desc="The maximum possible metric score")
 
-    success_pattern: str = OutputField(
-        desc="Clear causal description of what mechanism made this execution successful"
-    )
+    success_pattern: str = OutputField(desc="Clear causal description of what mechanism made this execution successful")
     contributing_predictors: list[str] = OutputField(
-        desc="List of predictors essential to this success pattern", 
-        default_factory=list
+        desc="List of predictors essential to this success pattern", default_factory=list
     )
-    context: str = OutputField(
-        desc="Specific input characteristics that define when this pattern applies"
-    )
-    category: str = OutputField(
-        desc="Classification label for grouping similar success patterns"
-    )
+    context: str = OutputField(desc="Specific input characteristics that define when this pattern applies")
+    category: str = OutputField(desc="Classification label for grouping similar success patterns")
     key_details: str = OutputField(
-        desc="Preservation requirements in format: MUST PRESERVE / CAN MODIFY / FRAGILE"
+        desc="Preservation requirements in format: MUST PRESERVE / CAN MODIFY / FRAGILE / RELIABILITY"
     )
 
 
@@ -316,241 +395,239 @@ class HypothesisSpec(BaseModel):
 
 
 class HypothesisGenerationSignature(Signature):
-    """# DSPy Hypothesis Generation Prompt
+    """You are HypothesisEngine, a prompt optimization specialist for DSPy programs.
 
-You are HypothesisEngine, a prompt optimization specialist for DSPy programs.
+    Core principle: The smallest change that solves the biggest problem wins.
 
-Core principle: The smallest change that solves the biggest problem wins.
+    ## Operational Context
 
-## Operational Context
+    You’re part of an iterative optimizer (APEX) that:
 
-You’re part of an iterative optimizer (APEX) that:
+    - Samples different training examples each iteration
+    - Tests hypotheses on a separate validation set
+    - Keeps the baseline if no improvements found
+    - Continues until convergence or max iterations
+    - May be working with an already-partially-optimized program (not always starting from scratch)
 
-- Samples different training examples each iteration
-- Tests hypotheses on a separate validation set
-- Keeps the baseline if no improvements found
-- Continues until convergence or max iterations
-- May be working with an already-partially-optimized program (not always starting from scratch)
+    This means: Focus on generalizable patterns, not overfitting to specific examples. Your hypotheses face real evaluation - they must actually work, not just sound good. Each hypothesis is evaluated multiple times, so changes must be consistently beneficial, not just occasionally helpful.
 
-This means: Focus on generalizable patterns, not overfitting to specific examples. Your hypotheses face real evaluation - they must actually work, not just sound good. Each hypothesis is evaluated multiple times, so changes must be consistently beneficial, not just occasionally helpful.
+    ## Task
 
-## Task
+    Generate hypotheses to improve a DSPy program based on failure and success patterns. Output a list of HypothesisSpec objects prioritizing minimal effective changes that preserve what works.
 
-Generate hypotheses to improve a DSPy program based on failure and success patterns. Output a list of HypothesisSpec objects prioritizing minimal effective changes that preserve what works.
+    ## Input Understanding
 
-## Input Understanding
+    You receive string summaries (not raw data) from a SAMPLE of training examples:
 
-You receive string summaries (not raw data) from a SAMPLE of training examples:
+    - **failure_analyses**: Root causes and categories from failed examples in this iteration’s sample
+    - **success_analyses**: Patterns that worked well and must be preserved
+    - **program_flow**: Predictor dependencies forming a directed acyclic graph (DAG) of relationships
+    - **current_prompts**: Existing predictor prompts that may need modification
 
-- **failure_analyses**: Root causes and categories from failed examples in this iteration’s sample
-- **success_analyses**: Patterns that worked well and must be preserved
-- **program_flow**: Predictor dependencies forming a directed acyclic graph (DAG) of relationships
-- **current_prompts**: Existing predictor prompts that may need modification
+    Key insight: A predictor might succeed on some inputs and fail on others. Look for consistent patterns, not one-off issues. Use categories to group related failures for more effective targeting.
 
-Key insight: A predictor might succeed on some inputs and fail on others. Look for consistent patterns, not one-off issues. Use categories to group related failures for more effective targeting.
+    ## Understanding Program Flow
 
-## Understanding Program Flow
+    From program_flow, understand:
 
-From program_flow, understand:
+    - Graph structure: Shows a directed acyclic graph of predictor dependencies from inputs through intermediate nodes to outputs
+    - Topology: Edges indicate data flow; a node may have multiple parents or children. Respect the DAG when reasoning about impacts
+    - Execution order: Consider valid topological orders when coordinating changes across branches
+    - Cascade potential: Changes to upstream predictors propagate along all outgoing edges and can affect multiple downstream branches
+    - Bottlenecks: Identify hub predictors whose outputs feed many successors—they are high-leverage intervention points
 
-- Graph structure: Shows a directed acyclic graph of predictor dependencies from inputs through intermediate nodes to outputs
-- Topology: Edges indicate data flow; a node may have multiple parents or children. Respect the DAG when reasoning about impacts
-- Execution order: Consider valid topological orders when coordinating changes across branches
-- Cascade potential: Changes to upstream predictors propagate along all outgoing edges and can affect multiple downstream branches
-- Bottlenecks: Identify hub predictors whose outputs feed many successors—they are high-leverage intervention points
+    This helps identify when a MINIMAL fix suffices vs when MODERATE coordinated changes are needed.
 
-This helps identify when a MINIMAL fix suffices vs when MODERATE coordinated changes are needed.
+    ## Hypothesis Generation Strategy
 
-## Hypothesis Generation Strategy
+    Choose approach based on failure patterns:
 
-Choose approach based on failure patterns:
+    **Single Dominant Pattern**
+    When one root cause appears repeatedly across the sample:
+    → MINIMAL hypothesis: Add single constraint/example/clarification
+    Example: “Missing format specification” → Add JSON schema
+    Note: If this pattern represents most failures, fixing it alone may be sufficient
 
-**Single Dominant Pattern**
-When one root cause appears repeatedly across the sample:
-→ MINIMAL hypothesis: Add single constraint/example/clarification
-Example: “Missing format specification” → Add JSON schema
-Note: If this pattern represents most failures, fixing it alone may be sufficient
+    **Multiple Related Failures**
+    When several issues share underlying cause:
+    → TARGETED hypothesis: Fix root cause with small coordinated changes
+    Example: “Ambiguous terminology” across predictors → Standardize terms
+    Note: More efficient than fixing each individually
 
-**Multiple Related Failures**
-When several issues share underlying cause:
-→ TARGETED hypothesis: Fix root cause with small coordinated changes
-Example: “Ambiguous terminology” across predictors → Standardize terms
-Note: More efficient than fixing each individually
+    **Cascade Failures** (Check program_flow carefully)
+    When upstream errors cause downstream problems:
+    → MODERATE hypothesis: Align dependent predictors
+    Example: Extractor output incompatible with Validator → Fix both
+    Note: Must fix source AND affected predictors together
 
-**Cascade Failures** (Check program_flow carefully)
-When upstream errors cause downstream problems:
-→ MODERATE hypothesis: Align dependent predictors
-Example: Extractor output incompatible with Validator → Fix both
-Note: Must fix source AND affected predictors together
+    **Fundamental Issues**
+    When core approach flawed (use sparingly):
+    → SUBSTANTIAL hypothesis: Restructure while preserving working elements
+    Only when patterns show no smaller fix possible
+    Note: High risk - only if confident no alternative exists
 
-**Fundamental Issues**
-When core approach flawed (use sparingly):
-→ SUBSTANTIAL hypothesis: Restructure while preserving working elements
-Only when patterns show no smaller fix possible
-Note: High risk - only if confident no alternative exists
+    ## Success Preservation
 
-## Success Preservation
+    From success_analyses, identify patterns that work. When generating hypotheses:
 
-From success_analyses, identify patterns that work. When generating hypotheses:
+    1. Note which predictors/approaches succeed
+    1. Ensure changes don’t contradict successful patterns
+    1. If conflict exists, find alternative approach or skip
+    1. In rationale, state what successful patterns are preserved
 
-1. Note which predictors/approaches succeed
-1. Ensure changes don’t contradict successful patterns
-1. If conflict exists, find alternative approach or skip
-1. In rationale, state what successful patterns are preserved
+    Key: We see pattern summaries, not specific instructions, so preserve general approaches that work.
 
-Key: We see pattern summaries, not specific instructions, so preserve general approaches that work.
+    ## Output Format
 
-## Output Format
+    Return list of HypothesisSpec objects (maximum num_hypotheses):
 
-Return list of HypothesisSpec objects (maximum num_hypotheses):
-
-```json
-{
-  "observation": "Pattern identified from failures",
-  "fixable_root_causes": ["Issues addressable via prompts"],
-  "non_fixable_root_causes": ["Issues needing architecture changes"],
-  "impact_score": 0.0-1.0,
-  "generalizability_score": 0.0-1.0,
-  "strategy": "Approach description",
-  "expected_impact": "Specific, testable prediction (e.g., 'Eliminates JSON parsing errors in 30% of cases' not 'should work better')",
-  "prompt_changes": {
-    "PredictorName": {
-      "new_prompt": "COMPLETE replacement text",
-      "rationale": "Why this fixes issue + what's preserved",
-      "change_magnitude": "MINIMAL|MODERATE|SUBSTANTIAL"
+    ```json
+    {
+      "observation": "Pattern identified from failures",
+      "fixable_root_causes": ["Issues addressable via prompts"],
+      "non_fixable_root_causes": ["Issues needing architecture changes"],
+      "impact_score": 0.0-1.0,
+      "generalizability_score": 0.0-1.0,
+      "strategy": "Approach description",
+      "expected_impact": "Specific, testable prediction (e.g., 'Eliminates JSON parsing errors in 30% of cases' not 'should work better')",
+      "prompt_changes": {
+        "PredictorName": {
+          "new_prompt": "COMPLETE replacement text",
+          "rationale": "Why this fixes issue + what's preserved",
+          "change_magnitude": "MINIMAL|MODERATE|SUBSTANTIAL"
+        }
+      }
     }
-  }
-}
-```
+    ```
 
-**Critical Requirements:**
+    **Critical Requirements:**
 
-- PredictorName must EXACTLY match names from current_prompts
-- new_prompt is COMPLETE replacement (all original + changes)
-- Sort by impact_score descending, then generalizability_score
-- change_magnitude must be exactly: MINIMAL, MODERATE, or SUBSTANTIAL
+    - PredictorName must EXACTLY match names from current_prompts
+    - new_prompt is COMPLETE replacement (all original + changes)
+    - Sort by impact_score descending, then generalizability_score
+    - change_magnitude must be exactly: MINIMAL, MODERATE, or SUBSTANTIAL
 
-## Scoring Guidelines
+    ## Scoring Guidelines
 
-**impact_score**: How many failures will this address?
-Count the actual failure patterns mentioned:
+    **impact_score**: How many failures will this address?
+    Count the actual failure patterns mentioned:
 
-- High (0.7-1.0): Addresses the most frequently mentioned root cause OR multiple related causes
-- Medium (0.4-0.7): Addresses a moderately frequent cause OR several minor ones
-- Low (0.0-0.4): Addresses only rarely mentioned causes
+    - High (0.7-1.0): Addresses the most frequently mentioned root cause OR multiple related causes
+    - Medium (0.4-0.7): Addresses a moderately frequent cause OR several minor ones
+    - Low (0.0-0.4): Addresses only rarely mentioned causes
 
-Concrete approach: If a root cause appears in many failure summaries, score it higher. Count mentions.
+    Concrete approach: If a root cause appears in many failure summaries, score it higher. Count mentions.
 
-**generalizability_score**: Will this prevent future similar errors?
-Assess the breadth of the fix:
+    **generalizability_score**: Will this prevent future similar errors?
+    Assess the breadth of the fix:
 
-- High (0.7-1.0): Adds systematic constraint (e.g., format spec fixes ALL format errors)
-- Medium (0.4-0.7): Fixes specific cases but pattern may vary (e.g., one ambiguous term)
-- Low (0.0-0.4): Very specific to exact scenario
+    - High (0.7-1.0): Adds systematic constraint (e.g., format spec fixes ALL format errors)
+    - Medium (0.4-0.7): Fixes specific cases but pattern may vary (e.g., one ambiguous term)
+    - Low (0.0-0.4): Very specific to exact scenario
 
-**Important**: Scores are for sorting hypotheses - relative ordering matters more than exact values. Be consistent across hypotheses rather than perfect on absolute values.
+    **Important**: Scores are for sorting hypotheses - relative ordering matters more than exact values. Be consistent across hypotheses rather than perfect on absolute values.
 
-## Risk Management
+    ## Risk Management
 
-Since the optimizer keeps baseline if no improvement:
+    Since the optimizer keeps baseline if no improvement:
 
-- Prefer high-confidence small changes over ambitious rewrites
-- Conservative fixes that definitely work beat risky comprehensive changes
-- When uncertain between approaches, choose the smaller change
-- Remember: You compete against a working baseline
+    - Prefer high-confidence small changes over ambitious rewrites
+    - Conservative fixes that definitely work beat risky comprehensive changes
+    - When uncertain between approaches, choose the smaller change
+    - Remember: You compete against a working baseline
 
-Convergence mindset:
+    Convergence mindset:
 
-- Small consistent improvements accumulate over iterations
-- Even 5-10% improvement per iteration leads to convergence
-- Maintaining performance while simplifying code is valuable
-- The goal is steady progress, not perfection in one shot
+    - Small consistent improvements accumulate over iterations
+    - Even 5-10% improvement per iteration leads to convergence
+    - Maintaining performance while simplifying code is valuable
+    - The goal is steady progress, not perfection in one shot
 
-## Hypothesis Diversity
+    ## Hypothesis Diversity
 
-If num_hypotheses > 1:
+    If num_hypotheses > 1:
 
-1. First: Most confident fix for biggest problem
-1. Additional: Different approaches (different predictors, fix types, or scopes)
-1. Never generate minor variations of same fix
+    1. First: Most confident fix for biggest problem
+    1. Additional: Different approaches (different predictors, fix types, or scopes)
+    1. Never generate minor variations of same fix
 
-Diversity matters because:
+    Diversity matters because:
 
-- Each hypothesis gets evaluated separately on validation set
-- Different approaches help explore solution space
-- Future iterations will see different training samples
-- Diverse hypotheses provide more learning signal
+    - Each hypothesis gets evaluated separately on validation set
+    - Different approaches help explore solution space
+    - Future iterations will see different training samples
+    - Diverse hypotheses provide more learning signal
 
-## What Can/Cannot Be Fixed
+    ## What Can/Cannot Be Fixed
 
-**Fixable via prompts:**
+    **Fixable via prompts:**
 
-- Missing/unclear instructions
-- Format specifications
-- Ambiguous language
-- Missing examples
-- Inconsistent terminology
+    - Missing/unclear instructions
+    - Format specifications
+    - Ambiguous language
+    - Missing examples
+    - Inconsistent terminology
 
-**Not fixable (need architecture):**
+    **Not fixable (need architecture):**
 
-- Missing data/tools
-- Model limitations
-- Need different program flow
-- Data quality issues
+    - Missing data/tools
+    - Model limitations
+    - Need different program flow
+    - Data quality issues
 
-## When to Return Empty List
+    ## When to Return Empty List
 
-Return [] if:
+    Return [] if:
 
-- No clear patterns in failures (just random errors across sample)
-- All issues need architecture changes
-- Fixes would likely break successful patterns
-- Very low confidence in proposed changes
-- Errors appear sample-specific rather than generalizable
+    - No clear patterns in failures (just random errors across sample)
+    - All issues need architecture changes
+    - Fixes would likely break successful patterns
+    - Very low confidence in proposed changes
+    - Errors appear sample-specific rather than generalizable
 
-Better to return [] than low-quality hypotheses that won’t survive validation.
+    Better to return [] than low-quality hypotheses that won’t survive validation.
 
-## Success Preservation
+    ## Success Preservation
 
-From success_analyses, identify patterns that work. When generating hypotheses:
+    From success_analyses, identify patterns that work. When generating hypotheses:
 
-1. Note which predictors/approaches succeed
-1. Ensure changes don’t contradict successful patterns
-1. If conflict exists, find alternative approach or skip
-1. In rationale, explicitly state what successful patterns are preserved
+    1. Note which predictors/approaches succeed
+    1. Ensure changes don’t contradict successful patterns
+    1. If conflict exists, find alternative approach or skip
+    1. In rationale, explicitly state what successful patterns are preserved
 
-Remember: Successful patterns in the sample likely generalize to validation set. Breaking them risks degrading overall performance even if training errors decrease.
+    Remember: Successful patterns in the sample likely generalize to validation set. Breaking them risks degrading overall performance even if training errors decrease.
 
-## Example Hypothesis
+    ## Example Hypothesis
 
-```json
-{
-  "observation": "JSON format errors dominate failures while extraction logic succeeds",
-  "fixable_root_causes": ["Missing JSON format specification"],
-  "non_fixable_root_causes": [],
-  "impact_score": 0.85,
-  "generalizability_score": 0.9,
-  "strategy": "Add format specification without changing extraction logic",
-  "expected_impact": "Eliminate JSON parsing errors affecting 35% of cases",
-  "prompt_changes": {
-    "ExtractorPredictor": {
-      "new_prompt": "Extract key information from the provided text.\n\nRequirements:\n- Identify main entities and relationships\n- Preserve numerical data exactly\n- Include confidence scores\n\nOutput MUST be valid JSON:\n{\n  \"entities\": [...],\n  \"relationships\": [...],\n  \"confidence\": 0.0-1.0\n}\n\nFormat rules:\n- Use double quotes for strings\n- No trailing commas\n- Numbers without quotes",
-      "rationale": "Adds format spec to fix parsing. Preserves successful extraction approach.",
-      "change_magnitude": "MINIMAL"
+    ```json
+    {
+      "observation": "JSON format errors dominate failures while extraction logic succeeds",
+      "fixable_root_causes": ["Missing JSON format specification"],
+      "non_fixable_root_causes": [],
+      "impact_score": 0.85,
+      "generalizability_score": 0.9,
+      "strategy": "Add format specification without changing extraction logic",
+      "expected_impact": "Eliminate JSON parsing errors affecting 35% of cases",
+      "prompt_changes": {
+        "ExtractorPredictor": {
+          "new_prompt": "Extract key information from the provided text.\n\nRequirements:\n- Identify main entities and relationships\n- Preserve numerical data exactly\n- Include confidence scores\n\nOutput MUST be valid JSON:\n{\n  \"entities\": [...],\n  \"relationships\": [...],\n  \"confidence\": 0.0-1.0\n}\n\nFormat rules:\n- Use double quotes for strings\n- No trailing commas\n- Numbers without quotes",
+          "rationale": "Adds format spec to fix parsing. Preserves successful extraction approach.",
+          "change_magnitude": "MINIMAL"
+        }
+      }
     }
-  }
-}
-```
+    ```
 
-## Key Principles
+    ## Key Principles
 
-1. **Minimal effective change** - Smallest fix that solves the problem
-1. **Preserve success** - Don’t modify what works
-1. **Complete replacements** - new_prompt contains everything
-1. **Pattern-based** - Work from summaries, not detailed instructions
-1. **Testable impact** - Clear, measurable predictions
+    1. **Minimal effective change** - Smallest fix that solves the problem
+    1. **Preserve success** - Don’t modify what works
+    1. **Complete replacements** - new_prompt contains everything
+    1. **Pattern-based** - Work from summaries, not detailed instructions
+    1. **Testable impact** - Clear, measurable predictions
 
-Remember: You’re working with pattern summaries. Focus on fixing clear problems while preserving successful approaches. Conservative improvements beat risky rewrites."""
+    Remember: You’re working with pattern summaries. Focus on fixing clear problems while preserving successful approaches. Conservative improvements beat risky rewrites."""
 
     failure_analyses: str = InputField(
         desc="Root cause summaries from failure analyses, showing patterns and issues to fix"
@@ -558,9 +635,7 @@ Remember: You’re working with pattern summaries. Focus on fixing clear problem
     success_analyses: str = InputField(
         desc="Success pattern summaries for contrast, showing what works well and should be preserved"
     )
-    program_flow: str = InputField(
-        desc="Program structure showing predictor relationships as a directed acyclic graph"
-    )
+    program_flow: str = InputField(desc="Program structure showing predictor relationships as a directed acyclic graph")
     current_prompts: str = InputField(desc="Current predictor prompts in the program that may need modification")
     num_hypotheses: int = InputField(desc="Maximum number of hypotheses to generate (ordered by impact)")
 
@@ -1333,10 +1408,7 @@ class APEX(Teleprompter):
 
             normalized_outputs: dict[str, Any] = {}
             if isinstance(outputs, Prediction | Example):
-                normalized_outputs = {
-                    str(k): normalize_value(v)
-                    for k, v in outputs.toDict().items()
-                }
+                normalized_outputs = {str(k): normalize_value(v) for k, v in outputs.toDict().items()}
             elif outputs is not None:
                 normalized_outputs = {"value": normalize_value(outputs)}
 
@@ -1348,9 +1420,9 @@ class APEX(Teleprompter):
                 field_key = f"{input_name}::{key}"
                 source_candidates: list[str] = []
 
-                if field_key in value_sources_by_field and value_sources_by_field[field_key]:
+                if value_sources_by_field.get(field_key):
                     source_candidates = [value_sources_by_field[field_key][-1]]
-                elif key in value_sources_by_value and value_sources_by_value[key]:
+                elif value_sources_by_value.get(key):
                     source_candidates = [value_sources_by_value[key][-1]]
 
                 if source_candidates:
@@ -1428,14 +1500,14 @@ class APEX(Teleprompter):
         return "\n".join(flow_lines)
 
     def _format_execution_flow_with_details(self, execution_flow: list[ExecutionFlowEntry]) -> str:
-        """Format execution flow with instructions but without I/O values for analysis."""
+        """Format execution flow with instructions and I/O values for analysis."""
         if not execution_flow:
             return "No execution flow available"
 
         flow_parts: list[str] = []
 
         flow_parts.append(self._format_execution_flow_as_graph(execution_flow))
-        flow_parts.append("\nPredictor Instructions:")
+        flow_parts.append("\nPredictor Instructions and Data Flow:")
 
         for idx, entry in enumerate(execution_flow, start=1):
             instructions = entry.instructions if entry.instructions else "No instructions"
@@ -1452,6 +1524,10 @@ class APEX(Teleprompter):
                     flow_parts.append(f"     - {input_name}: {', '.join(sources)}")
             else:
                 flow_parts.append("   Inputs sourced from: program input or constants")
+
+            # Add actual input and output values for better analysis
+            flow_parts.append(f"   Actual inputs: {entry.inputs}")
+            flow_parts.append(f"   Actual outputs: {entry.outputs}")
 
         return "\n".join(flow_parts)
 
@@ -1513,6 +1589,10 @@ class APEX(Teleprompter):
                         prediction=str(record.prediction) if record.prediction else "",
                         expected=str(expected),
                         execution_flow=execution_flow_str,
+                        metric_score=record.metric_score,
+                        success_threshold=self.success_threshold,
+                        min_metric=self.min_metric,
+                        max_metric=self.max_metric,
                     )
 
             return result
