@@ -93,6 +93,16 @@ class FailureAnalysisSignature(Signature):
        Actual outputs: {"revenue": "5M dollars"}  ← FAILURE: Should be 5000000
     ```
 
+    ## Critical: Using Metric Feedback
+
+    The metric_feedback field contains the metric's explanation of WHY it assigned this score.
+    This is often the most direct insight into what went wrong:
+    - May specify exactly which fields were missing or incorrect
+    - Could explain formatting issues the metric detected
+    - Might indicate partial success (e.g., "3 of 5 entities extracted correctly")
+
+    ALWAYS check metric_feedback FIRST before analyzing execution flow - it often contains the answer!
+
     ## Analysis Framework
 
     ### 1. Failure Severity Assessment
@@ -170,11 +180,17 @@ class FailureAnalysisSignature(Signature):
 
     ## Decision Logic
 
-    IF error message exists AND execution failed THEN
+    IF metric_feedback exists AND contains specific issue THEN
+      → Use metric's diagnosis as primary guide
+
+    ELSE IF error message exists AND execution failed THEN
       → Focus on fixing the crash/exception first
 
-    IF metric_score exists but below threshold THEN
+    ELSE IF metric_score exists but below threshold THEN
       → Analyze quality issues in the output
+
+    IF metric_feedback mentions specific missing/incorrect fields THEN
+      → Target those exact extraction/formatting issues
 
     IF I/O shows data corruption between predictors THEN
       → Primary cause is coordination/format mismatch
@@ -226,14 +242,15 @@ class FailureAnalysisSignature(Signature):
 
     ## Examples
 
-    ### Example 1: NEAR_MISS (margin = 0.08)
+    ### Example 1: NEAR_MISS with Metric Feedback (margin = 0.08)
     ```
-    root_cause: "In ExtractorPredictor, output format was string '5M' instead of number 5000000 because prompt lacks numeric conversion instruction. I/O showed: input 'revenue was 5M' → output {'amount': '5M'} when expecting {'amount': 5000000}."
+    root_cause: "In ExtractorPredictor, failed to convert '5M' to numeric form. Metric feedback stated: 'Expected numeric value for revenue field, got string '5M''. I/O confirmed: input 'revenue was 5M' → output {'amount': '5M'} when metric requires {'amount': 5000000}."
     involved_predictors: ["ExtractorPredictor", "CalculatorPredictor"]
     context: "Text with abbreviated numbers (K, M, B suffixes)"
     category: "missing-constraint"
-    key_details: "SEVERITY: NEAR_MISS. PRIMARY_FAILURE: ExtractorPredictor. FIXABLE: Add instruction 'Convert abbreviated numbers to full numeric values'. NOT_FIXABLE: None. SUGGESTED_FIX: Add to ExtractorPredictor prompt: 'Convert K=1000, M=1000000, B=1000000000'."
+    key_details: "SEVERITY: NEAR_MISS. PRIMARY_FAILURE: ExtractorPredictor. FIXABLE: Add numeric conversion instruction based on metric's requirement. NOT_FIXABLE: None. SUGGESTED_FIX: Add to ExtractorPredictor prompt: 'Convert abbreviated numbers to full numeric values (K=1000, M=1000000, B=1000000000)'."
     ```
+    *Metric feedback was key: "Expected numeric value for revenue field, got string '5M'"*
 
     ### Example 2: MODERATE (margin = 0.22)
     ```
@@ -290,6 +307,9 @@ class FailureAnalysisSignature(Signature):
         desc="Program flow showing predictor relationships, instructions, and I/O data", default=""
     )
     metric_score: float = InputField(desc="The metric score achieved")
+    metric_feedback: str = InputField(
+        desc="Detailed feedback from the metric explaining why it gave this score", default="N/A"
+    )
     success_threshold: float = InputField(desc="The threshold for success (minimum acceptable score)")
     min_metric: float = InputField(desc="The minimum possible metric score")
     max_metric: float = InputField(desc="The maximum possible metric score")
@@ -331,6 +351,16 @@ class SuccessAnalysisSignature(Signature):
     ## Task
 
     Analyze a SUCCESSFUL execution to identify patterns that MUST be preserved during optimization. These become hard constraints for the hypothesis generator.
+
+    ## Critical: Using Metric Feedback
+
+    The metric_feedback field contains the metric's explanation of WHY it gave a high score.
+    This often highlights what specifically worked well:
+    - May praise specific aspects (e.g., "All 5 required entities extracted with correct formatting")
+    - Could explain partial success (e.g., "4 of 5 fields correct, minor formatting issue")
+    - Might indicate exceptional performance (e.g., "Perfect match including edge cases")
+
+    Use metric_feedback to understand WHAT made this successful and worth preserving!
 
     ## Critical: Parsing Execution Flow
 
@@ -495,15 +525,15 @@ class SuccessAnalysisSignature(Signature):
 
     ## Examples
 
-    ### Example 1: Excellent Score (margin = 0.45)
+    ### Example 1: Excellent Score with Metric Feedback (margin = 0.45)
     ```
-    success_pattern: "ExtractorPredictor correctly parsed complex JSON due to schema specification, Validator verified all required fields present"
+    success_pattern: "ExtractorPredictor correctly parsed complex JSON due to schema specification, Validator verified all required fields. Metric praised: 'Perfect extraction - all nested objects preserved with correct types and structure'."
     contributing_predictors: ["ExtractorPredictor", "Validator"]
     context: "Structured data extraction with nested objects and arrays"
     category: "explicit-format-following"
-    key_details: "MUST PRESERVE: JSON schema specification and validation logic. CAN MODIFY: Error messages, descriptive text. FRAGILE: Field names 'user_id', 'timestamp' in data contract. RELIABILITY: High - schema enforcement works consistently across varied inputs"
+    key_details: "MUST PRESERVE: JSON schema specification and validation logic that metric identified as perfect. CAN MODIFY: Error messages, descriptive text. FRAGILE: Field names 'user_id', 'timestamp' in data contract. RELIABILITY: High - metric confirmed consistent success across varied inputs"
     ```
-    *Intermediate I/O showed clean data transformation with proper type conversions*
+    *Metric feedback: "Perfect extraction - all nested objects preserved with correct types and structure"*
 
     ### Example 2: Solid Score (margin = 0.25)
     ```
@@ -560,6 +590,9 @@ class SuccessAnalysisSignature(Signature):
     expected: str = InputField(desc="The expected correct output")
     execution_flow: str = InputField(desc="Program flow showing predictor relationships and instructions", default="")
     metric_score: float = InputField(desc="The metric score achieved")
+    metric_feedback: str = InputField(
+        desc="Detailed feedback from the metric explaining why it gave this score", default="N/A"
+    )
     success_threshold: float = InputField(desc="The threshold for success (minimum acceptable score)")
     min_metric: float = InputField(desc="The minimum possible metric score")
     max_metric: float = InputField(desc="The maximum possible metric score")
@@ -1814,6 +1847,7 @@ class APEX(Teleprompter):
                         error=record.error or "",
                         execution_flow=execution_flow_str,
                         metric_score=record.metric_score,
+                        metric_feedback=record.metric_feedback or "N/A",
                         success_threshold=self.success_threshold,
                         min_metric=self.min_metric,
                         max_metric=self.max_metric,
@@ -1825,6 +1859,7 @@ class APEX(Teleprompter):
                         expected=str(expected),
                         execution_flow=execution_flow_str,
                         metric_score=record.metric_score,
+                        metric_feedback=record.metric_feedback or "N/A",
                         success_threshold=self.success_threshold,
                         min_metric=self.min_metric,
                         max_metric=self.max_metric,
