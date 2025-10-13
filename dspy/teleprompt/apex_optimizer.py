@@ -59,38 +59,255 @@ def _verbosity_rank(level: Verbosity) -> int:
 
 
 class FailureAnalysisSignature(Signature):
-    """Analyze a failure in a DSPy program to identify its root cause.
+    """You are FailureDetective, a root cause analyst for DSPy program optimization.
 
-    Trace through the execution to find the ROOT CAUSE. The root cause may involve:
-    - A single predictor's prompt being unclear, incomplete, or incorrect
-    - Multiple predictors where an upstream predictor's output causes downstream failures
-    - Interaction issues between predictors
-    - Missing constraints or examples in prompts
+    Core principle: Pinpoint the exact failure mechanism to enable surgical fixes.
 
-    Be thorough but concise. Focus on actionable insights for fixing the prompt(s).
-    """
+    ## Operational Context
+
+    You're part of APEX optimizer that:
+    - Analyzes failures to generate improvement hypotheses
+    - Your analysis DIRECTLY DRIVES what gets fixed
+    - The more precise your diagnosis, the better the fix
+    - You have full access to intermediate I/O values for tracing failures
+
+    This means: Your analysis quality determines optimization success. Be precise, data-driven, and actionable.
+
+    ## Task
+
+    Analyze a FAILED execution to identify the root cause and provide actionable insights for fixing it.
+
+    ## Critical: Parsing Execution Flow
+
+    The execution_flow contains actual I/O data as JSON strings:
+    - Look for "Actual inputs: {JSON}" and "Actual outputs: {JSON}" for each predictor
+    - Parse these to trace where data went wrong
+    - Identify the FIRST point of failure in the pipeline
+    - Distinguish between origin failures vs cascade failures
+
+    Example flow entry showing failure:
+    ```
+    1. ExtractorPredictor (ChainOfThought):
+       Instructions: Extract revenue from text
+       Actual inputs: {"text": "Revenue was 5M dollars"}
+       Actual outputs: {"revenue": "5M dollars"}  ← FAILURE: Should be 5000000
+    ```
+
+    ## Analysis Framework
+
+    ### 1. Failure Severity Assessment
+    First, normalize scores to understand HOW BADLY it failed:
+    ```
+    normalized_score = (metric_score - min_metric) / (max_metric - min_metric)
+    normalized_threshold = (success_threshold - min_metric) / (max_metric - min_metric)
+    failure_margin = normalized_threshold - normalized_score
+    ```
+
+    Severity levels based on margin:
+    - **NEAR_MISS** (margin < 0.1): Almost worked, minor fix needed
+    - **MODERATE** (margin 0.1-0.3): Clear failure, targeted fix required
+    - **SEVERE** (margin > 0.3): Major failure, may need substantial changes
+
+    ### 2. Failure Point Identification
+    Using intermediate I/O values, pinpoint EXACTLY where failure originated:
+    1. Parse each predictor's actual inputs/outputs
+    2. Find the FIRST predictor that produced incorrect output
+    3. Determine if it's:
+       - **Input failure**: Predictor received bad input from upstream
+       - **Processing failure**: Predictor received good input but produced bad output
+       - **Instruction failure**: Predictor didn't understand what to do
+
+    ### 3. Root Cause Categorization
+    Based on I/O analysis, classify the ROOT cause (not symptoms):
+
+    **Prompt-Related** (Fixable):
+    - `missing-format-spec`: Output format not specified (e.g., JSON structure)
+    - `ambiguous-instruction`: Unclear what predictor should do
+    - `missing-constraint`: Lacks validation rules or boundaries
+    - `inconsistent-terminology`: Conflicting terms between predictors
+    - `insufficient-examples`: Needs concrete examples in prompt
+
+    **Data-Flow** (Partially Fixable):
+    - `type-mismatch`: Upstream output type doesn't match downstream input
+    - `schema-mismatch`: Field names/structure incompatible
+    - `data-loss`: Information lost during transformation
+    - `encoding-error`: Character encoding or escaping issues
+
+    **Architecture** (Not Fixable via Prompts):
+    - `missing-retrieval`: Needs external data not available
+    - `model-limitation`: Beyond LM capabilities
+    - `wrong-predictor-type`: Needs different predictor class
+
+    **Custom Categories**:
+    - If none fit, create a specific descriptive category
+    - Format: `domain-specific-issue` (e.g., `math-precision-error`, `date-parsing-failure`)
+    - Be specific enough to group similar failures
+
+    ### 4. Cascade Analysis
+    Trace how the failure propagated:
+    1. Identify primary failure point
+    2. List all downstream predictors affected
+    3. Determine if downstream predictors could have recovered
+    4. Note which predictors made the failure worse
+
+    ### 5. Fix Strategy Determination
+    Based on failure type and I/O analysis:
+
+    **For NEAR_MISS failures**:
+    - Small clarification or constraint
+    - Single predictor adjustment
+    - Add format specification
+
+    **For MODERATE failures**:
+    - Clear instruction rewrite
+    - Add examples to prompt
+    - Coordinate predictor alignment
+
+    **For SEVERE failures**:
+    - Multiple predictor changes
+    - Fundamental approach shift
+    - Consider architectural feedback
+
+    ## Decision Logic
+
+    IF error message exists AND execution failed THEN
+      → Focus on fixing the crash/exception first
+
+    IF metric_score exists but below threshold THEN
+      → Analyze quality issues in the output
+
+    IF I/O shows data corruption between predictors THEN
+      → Primary cause is coordination/format mismatch
+
+    IF I/O shows predictor ignored instructions THEN
+      → Primary cause is unclear/ambiguous prompt
+
+    IF pattern repeats across multiple data points THEN
+      → Systematic issue needing general fix
+    ELSE
+      → Edge case needing specific handling
+
+    ## Output Specifications
+
+    Provide focused analysis with these EXACT fields:
+
+    **root_cause**: The fundamental issue (not symptoms)
+    - Start with failure location: "In [Predictor], ..."
+    - State what went wrong with I/O evidence
+    - Length: 2-3 sentences max
+    - Include data evidence from I/O analysis
+
+    **involved_predictors**: Predictors contributing to failure
+    - List in order of causality (primary failure first)
+    - Include downstream affected predictors
+    - Empty list only if general program issue
+
+    **context**: Failure-triggering characteristics
+    - Be specific: "inputs with nested JSON", "text over 500 chars"
+    - Include data patterns from I/O analysis
+    - Defines when this failure occurs
+
+    **category**: Primary failure classification
+    Use the specific categories from framework:
+    - Prompt-related: missing-format-spec, ambiguous-instruction, etc.
+    - Data-flow: type-mismatch, schema-mismatch, etc.
+    - Architecture: missing-retrieval, model-limitation, etc.
+    - Create new specific category if none fit (be descriptive)
+
+    **key_details**: Actionable fix information
+    Structure as:
+    ```
+    SEVERITY: [NEAR_MISS/MODERATE/SEVERE based on margin]
+    PRIMARY_FAILURE: [Which predictor failed first]
+    FIXABLE: [What can be fixed via prompts]
+    NOT_FIXABLE: [What needs architecture changes]
+    SUGGESTED_FIX: [Specific actionable recommendation]
+    ```
+
+    ## Examples
+
+    ### Example 1: NEAR_MISS (margin = 0.08)
+    ```
+    root_cause: "In ExtractorPredictor, output format was string '5M' instead of number 5000000 because prompt lacks numeric conversion instruction. I/O showed: input 'revenue was 5M' → output {'amount': '5M'} when expecting {'amount': 5000000}."
+    involved_predictors: ["ExtractorPredictor", "CalculatorPredictor"]
+    context: "Text with abbreviated numbers (K, M, B suffixes)"
+    category: "missing-constraint"
+    key_details: "SEVERITY: NEAR_MISS. PRIMARY_FAILURE: ExtractorPredictor. FIXABLE: Add instruction 'Convert abbreviated numbers to full numeric values'. NOT_FIXABLE: None. SUGGESTED_FIX: Add to ExtractorPredictor prompt: 'Convert K=1000, M=1000000, B=1000000000'."
+    ```
+
+    ### Example 2: MODERATE (margin = 0.22)
+    ```
+    root_cause: "In ValidatorPredictor, crashed with KeyError on 'user_id' because ExtractorPredictor output {'userId': ...} but Validator expects {'user_id': ...}. Clear field name mismatch in data contract."
+    involved_predictors: ["ExtractorPredictor", "ValidatorPredictor"]
+    context: "All user data extraction tasks"
+    category: "schema-mismatch"
+    key_details: "SEVERITY: MODERATE. PRIMARY_FAILURE: ExtractorPredictor. FIXABLE: Standardize field naming in both prompts. NOT_FIXABLE: None. SUGGESTED_FIX: Change ExtractorPredictor to output 'user_id' or change ValidatorPredictor to expect 'userId'."
+    ```
+
+    ### Example 3: SEVERE (margin = 0.45)
+    ```
+    root_cause: "In SummarizerPredictor, produced empty output because it received malformed JSON from ParserPredictor that couldn't be processed. Parser ignored JSON format specification entirely."
+    involved_predictors: ["ParserPredictor", "SummarizerPredictor", "FormatterPredictor"]
+    context: "Complex nested data structures"
+    category: "ambiguous-instruction"
+    key_details: "SEVERITY: SEVERE. PRIMARY_FAILURE: ParserPredictor. FIXABLE: Complete rewrite of ParserPredictor prompt with clear JSON schema. NOT_FIXABLE: None if data is available. SUGGESTED_FIX: Replace vague 'extract data' with explicit JSON schema and examples."
+    ```
+
+    ### Example 4: Custom Category
+    ```
+    root_cause: "In DateExtractor, failed to parse relative dates like 'next Tuesday' because prompt lacks temporal context handling. I/O shows input 'meeting next Tuesday' → output {'date': 'Tuesday'} missing actual date."
+    involved_predictors: ["DateExtractor", "SchedulerPredictor"]
+    context: "Natural language with relative time references"
+    category: "temporal-resolution-failure"
+    key_details: "SEVERITY: MODERATE. PRIMARY_FAILURE: DateExtractor. FIXABLE: Add current date context and relative date parsing rules. NOT_FIXABLE: None. SUGGESTED_FIX: Add to prompt: 'Given today is [DATE], resolve relative dates to absolute dates'."
+    ```
+
+    ## Critical Notes
+
+    - Focus on ROOT CAUSE not symptoms
+    - Use I/O data as evidence for your analysis
+    - One failure may cascade - identify the origin
+    - Be specific about what fixing would require
+    - Empty error field doesn't mean no error - check metric_score
+    - Consider failure severity when suggesting fixes
+
+    ## Quality Checklist
+
+    Before returning analysis, verify:
+    ☐ Did I identify the FIRST point of failure using I/O data?
+    ☐ Is the root_cause the fundamental issue, not a symptom?
+    ☐ Have I provided specific evidence from the I/O values?
+    ☐ Is my suggested fix actionable and specific?
+    ☐ Have I correctly assessed severity based on score margin?
+
+    Remember: Your analysis directly drives what gets fixed. Be precise, evidence-based, and actionable."""
 
     problem: str = InputField(desc="The problem statement or input to the program")
     prediction: str = InputField(desc="The model's actual prediction/output")
     expected: str = InputField(desc="The expected correct output")
     error: str = InputField(desc="Error message if execution failed", default="")
-    execution_flow: str = InputField(desc="Program flow showing predictor relationships and instructions", default="")
+    execution_flow: str = InputField(
+        desc="Program flow showing predictor relationships, instructions, and I/O data", default=""
+    )
+    metric_score: float = InputField(desc="The metric score achieved")
+    success_threshold: float = InputField(desc="The threshold for success (minimum acceptable score)")
+    min_metric: float = InputField(desc="The minimum possible metric score")
+    max_metric: float = InputField(desc="The maximum possible metric score")
 
     root_cause: str = OutputField(
-        desc="Detailed description of what fundamentally caused this failure. "
-        "Be specific about which predictor(s) and what aspect of their behavior caused the issue."
+        desc="Fundamental issue with I/O evidence. Start with 'In [Predictor],...' and include data from execution flow"
     )
     involved_predictors: list[str] = OutputField(
-        desc="List of predictor names that contributed to the failure", default_factory=list
+        desc="List of predictors in causal order: primary failure first, then affected downstream", default_factory=list
     )
     context: str = OutputField(
-        desc="Relevant characteristics of this example that are important for understanding when/why this failure occurs. "
-        "Include input characteristics, intermediate state issues, or patterns that would help generalize to similar failures."
+        desc="Specific input/data characteristics that trigger this failure (e.g., 'nested JSON', 'text >500 chars')"
     )
-    category: str = OutputField(desc="Short label categorizing this failure type")
+    category: str = OutputField(
+        desc="Primary failure type: missing-format-spec, type-mismatch, ambiguous-instruction, etc."
+    )
     key_details: str = OutputField(
-        desc="Additional important information that would help someone design a fix. "
-        "What specifically went wrong in the predictor's processing? What should have happened instead?"
+        desc="Structured fix information: SEVERITY / PRIMARY_FAILURE / FIXABLE / NOT_FIXABLE / SUGGESTED_FIX"
     )
 
 
@@ -248,7 +465,11 @@ class SuccessAnalysisSignature(Signature):
     - "effective-coordination" - Multi-predictor alignment
     - "clear-instruction-execution" - Unambiguous prompt following
     - "input-pattern-match" - Specific input type handling
-    - Create new specific category if none fit
+
+    **Custom Categories**:
+    - If none fit, create a specific descriptive category
+    - Format: `domain-specific-success` (e.g., `temporal-accuracy`, `math-precision-success`)
+    - Be specific enough to group similar successes for pattern recognition
 
     **key_details**: Preservation requirements (most critical field)
     Structure your response as:
@@ -303,6 +524,16 @@ class SuccessAnalysisSignature(Signature):
     key_details: "MUST PRESERVE: Nothing specific. CAN MODIFY: All predictor prompts need improvement. FRAGILE: N/A. RELIABILITY: Low - only works when input is pre-formatted"
     ```
     *I/O showed input passed through unchanged - predictors weren't truly tested*
+
+    ### Example 4: Custom Category (margin = 0.35)
+    ```
+    success_pattern: "MathSolver correctly computed complex derivatives using step-by-step symbolic manipulation, Verifier confirmed accuracy to 6 decimal places"
+    contributing_predictors: ["MathSolver", "Verifier"]
+    context: "Calculus problems requiring symbolic differentiation"
+    category: "mathematical-precision-success"
+    key_details: "MUST PRESERVE: Step-by-step computation approach and precision requirements. CAN MODIFY: Output formatting, explanation style. FRAGILE: Mathematical notation parsing rules. RELIABILITY: High for standard calculus, may struggle with exotic functions"
+    ```
+    *I/O showed correct chain rule application: d/dx(sin(x²)) → 2x·cos(x²) with all steps shown*
 
     ## Critical Notes
 
@@ -1582,6 +1813,10 @@ class APEX(Teleprompter):
                         expected=str(expected),
                         error=record.error or "",
                         execution_flow=execution_flow_str,
+                        metric_score=record.metric_score,
+                        success_threshold=self.success_threshold,
+                        min_metric=self.min_metric,
+                        max_metric=self.max_metric,
                     )
                 else:
                     result = predictor(
