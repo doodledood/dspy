@@ -66,12 +66,21 @@ class FailureAnalysisSignature(Signature):
     ## Operational Context
 
     You're part of APEX optimizer that:
-    - Analyzes failures to generate improvement hypotheses
-    - Your analysis DIRECTLY DRIVES what gets fixed
-    - The more precise your diagnosis, the better the fix
-    - You have full access to intermediate I/O values for tracing failures
+    - Runs iteratively, sampling different training examples each iteration
+    - Analyzes failures to generate improvement hypotheses tested on a validation set
+    - Your analysis DIRECTLY DRIVES what gets fixed - precision determines success
+    - Works with multi-predictor programs organized as directed acyclic graphs (DAGs)
+    - Has full access to intermediate I/O values between all predictors
+    - May analyze programs that are already partially optimized from previous iterations
 
-    This means: Your analysis quality determines optimization success. Be precise, data-driven, and actionable.
+    Key operational realities about failures:
+    - **Failures cascade**: One predictor's error propagates through the DAG, affecting all downstream predictors
+    - **Primary vs secondary**: You must distinguish the FIRST failure point from cascade effects
+    - **Recovery potential**: Some downstream predictors can compensate for upstream errors (but often don't)
+    - **Data contracts**: Predictors coordinate through shared field names, types, and formats - mismatches cause failures
+    - **Fix efficiency**: Fixing the primary failure point is more efficient than fixing downstream symptoms
+
+    This means: Trace failures to their origin. Identify the PRIMARY failure point and note cascade effects. Your precision determines whether hypotheses fix the root cause or waste iterations on symptoms.
 
     ## Task
 
@@ -187,14 +196,7 @@ class FailureAnalysisSignature(Signature):
       → Create custom category: `[domain]-[specific]-[issue]`
       → Examples: `temporal-resolution-failure`, `math-precision-error`, `unit-conversion-failure`
 
-    ### 4. Cascade Analysis
-    Trace how the failure propagated:
-    1. Identify primary failure point
-    2. List all downstream predictors affected
-    3. Determine if downstream predictors could have recovered
-    4. Note which predictors made the failure worse
-
-    ### 5. Fix Strategy Determination
+    ### 4. Fix Strategy Determination
     Based on failure type and I/O analysis:
 
     **For NEAR_MISS failures**:
@@ -347,25 +349,25 @@ class FailureAnalysisSignature(Signature):
     ```
     *Key insight: Metric feedback revealed hidden requirement that I/O analysis alone couldn't detect*
 
-    ## Critical Notes
+    ## Coordination Note
 
-    - Focus on ROOT CAUSE not symptoms
-    - Use I/O data as evidence for your analysis
-    - One failure may cascade - identify the origin
-    - Be specific about what fixing would require
-    - Empty error field doesn't mean no error - check metric_score
-    - Consider failure severity when suggesting fixes
+    Your failure categories will be cross-referenced against success patterns from SuccessGuard to ensure fixes don't break working mechanisms. Be precise with category selection.
 
-    ## Quality Checklist
+    ## Quality Checklist & Critical Reminders
 
     Before returning analysis, verify:
+    ☐ Did I check metric_feedback FIRST for diagnostic insights?
     ☐ Did I identify the FIRST point of failure using I/O data?
     ☐ Is the root_cause the fundamental issue, not a symptom?
     ☐ Have I provided specific evidence from the I/O values?
     ☐ Is my suggested fix actionable and specific?
-    ☐ Have I correctly assessed severity based on score margin?
+    ☐ Have I correctly assessed severity based on normalized score margin?
 
-    Remember: Your analysis directly drives what gets fixed. Be precise, evidence-based, and actionable."""
+    Remember:
+    - Your analysis directly drives what gets fixed - be precise, evidence-based, and actionable
+    - Focus on ROOT CAUSE not symptoms; one failure may cascade - identify the origin
+    - Use I/O data as evidence; empty error field doesn't mean no error - check metric_score
+    - Consider failure severity when suggesting fixes - match fix scope to severity band"""
 
     problem: str = InputField(desc="The problem statement or input to the program")
     prediction: str = InputField(desc="The model's actual prediction/output")
@@ -407,14 +409,23 @@ class SuccessAnalysisSignature(Signature):
     ## Operational Context
 
     You're part of APEX optimizer that:
-    - Samples different training examples each iteration
-    - Your analysis creates PROTECTIVE CONSTRAINTS for hypothesis generation
-    - The hypothesis generator MUST preserve patterns you identify
-    - Success patterns you identify prevent regression during optimization
+    - Runs iteratively, sampling different training examples each iteration
+    - Analyzes successes to create PROTECTIVE CONSTRAINTS for hypothesis generation
+    - Your analysis directly controls what the optimizer WON'T change
+    - Works with multi-predictor programs organized as directed acyclic graphs (DAGs)
+    - Has full access to intermediate I/O values between all predictors
+    - May analyze programs that are already partially optimized from previous iterations
     - You're analyzing a SAMPLE, not all successes - focus on generalizable patterns
-    - You have access to intermediate I/O values between predictors for precise analysis
 
-    This means: Your analysis directly controls what the optimizer WON'T change. Be surgical - over-preservation blocks optimization, under-preservation breaks working code.
+    Key operational realities about success patterns:
+    - **Coordination matters**: Success often requires multiple predictors working together through data contracts
+    - **Data contracts**: Predictors coordinate via field names, types, formats - these are FRAGILE
+    - **Success types vary**: Single predictor excellence vs multi-predictor coordination vs lucky data match
+    - **Recovery chains**: Sometimes one predictor compensates for another's weakness (preserve recovery, not weakness)
+    - **Amplification patterns**: Each predictor may enhance previous outputs (preserve sequence)
+    - **Partial success**: One predictor strong, another weak - preserve only the strong pattern
+
+    This means: Be surgical - over-preservation blocks optimization, under-preservation breaks working code. Your constraints directly determine what hypothesis generator can/cannot change.
 
     ## Task
 
@@ -480,35 +491,9 @@ class SuccessAnalysisSignature(Signature):
     - Identify which predictor outputs were crucial
     - Pinpoint coordination success by examining data handoffs
     - Distinguish lucky data matches from robust processing
+    - Consider if success was single-predictor excellence, multi-predictor coordination, or input luck
 
-    ### 3. Multi-Predictor Success Patterns
-    When success requires coordination between predictors:
-
-    **Data Contract Success**: Upstream output format matches downstream expectations
-    - PRESERVE: Both predictors' format specifications
-    - FRAGILE: Field names, data types, structure
-
-    **Recovery Chain**: One predictor compensates for another's weakness
-    - PRESERVE: The compensating logic only
-    - CAN MODIFY: The weak predictor to prevent need for recovery
-
-    **Amplification Pattern**: Each predictor enhances the previous
-    - PRESERVE: The enhancement sequence
-    - FRAGILE: Order of operations
-
-    ### 4. Partial Success Analysis
-    When different predictors show different quality:
-    - STRONG predictor + WEAK predictor = Preserve only the strong pattern
-    - LUCKY data match + GOOD processing = Preserve the processing, not the luck
-    - Consistent pattern + Random success = Preserve only consistent parts
-
-    Example:
-    If Extractor succeeded by luck (input already formatted) but Validator worked robustly:
-    - PRESERVE: Validator's robust checking
-    - CAN MODIFY: Extractor (wasn't really tested)
-    - FRAGILE: Nothing (luck isn't fragile, it's unreliable)
-
-    ## Preservation Categories Clarified
+    ### 3. Preservation Categories Clarified
 
     **MUST PRESERVE**: Core mechanisms/patterns that enable success
     - Conceptual approaches (e.g., "validation before processing")
@@ -739,14 +724,9 @@ class SuccessAnalysisSignature(Signature):
     *I/O showed: attempt1="invalid", attempt2="invalid", attempt3="valid JSON" - success through brute force*
     *Key insight: Success doesn't always mean the approach is worth preserving*
 
-    ## Critical Notes
+    ## Coordination Note
 
-    - You see ONE success from a sample - don't overgeneralize
-    - Focus on CAUSAL mechanisms, not correlations
-    - Preservation requirements directly constrain optimization
-    - Empty contributing_predictors list is fine if success is input-driven
-    - Be specific about domains where patterns apply
-    - Balance preservation with optimization flexibility
+    Your success patterns will be used as PROTECTIVE CONSTRAINTS by the hypothesis generator. FailureDetective's fix suggestions will be checked against your preservation requirements to prevent breaking working mechanisms. Be surgical and precise.
 
     ## Common Analysis Pitfalls to Avoid
 
@@ -775,16 +755,23 @@ class SuccessAnalysisSignature(Signature):
     - GOOD: Minimal/no preservation on lucky matches
     - Principle: Preservation strength should match quality margin
 
-    ## Quality Checklist
+    ## Quality Checklist & Critical Reminders
 
     Before returning analysis, verify:
+    □ Did I check metric_feedback FIRST for what worked well?
+    □ Did I calculate margin to determine preservation stringency?
     □ Is the success pattern CAUSAL not just descriptive?
     □ Are preservation requirements SURGICAL not blanket?
     □ Is the context SPECIFIC enough to define pattern domain?
     □ Will this help hypothesis generator avoid breaking changes?
-    □ Have I avoided over-preserving accidental successes?
+    □ Have I avoided over-preserving accidental/lucky successes?
 
-    Remember: You're creating guardrails, not roadblocks. Preserve core success mechanisms while leaving room for improvement."""
+    Remember:
+    - You're creating guardrails, not roadblocks - preserve core success mechanisms while leaving room for improvement
+    - You see ONE success from a sample - don't overgeneralize to all cases
+    - Focus on CAUSAL mechanisms, not correlations; preservation requirements directly constrain optimization
+    - Empty contributing_predictors list is fine if success is input-driven
+    - Balance preservation with optimization flexibility - match preservation strength to quality margin"""
 
     problem: str = InputField(desc="The problem statement or input to the program")
     prediction: str = InputField(desc="The model's actual prediction/output")
