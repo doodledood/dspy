@@ -722,25 +722,25 @@ class HypothesisGenerationSignature(Signature):
 
     **Single Dominant Pattern**
     When one root cause appears repeatedly across the sample:
-    → MINIMAL hypothesis: Add single constraint/example/clarification
-    Example: “Missing format specification” → Add JSON schema
+    → minimal hypothesis: Add single constraint/example/clarification
+    Example: "Missing format specification" → Add JSON schema
     Note: If this pattern represents most failures, fixing it alone may be sufficient
 
     **Multiple Related Failures**
     When several issues share underlying cause:
-    → TARGETED hypothesis: Fix root cause with small coordinated changes
-    Example: “Ambiguous terminology” across predictors → Standardize terms
+    → moderate hypothesis: Fix root cause with small coordinated changes
+    Example: "Ambiguous terminology" across predictors → Standardize terms
     Note: More efficient than fixing each individually
 
     **Cascade Failures** (Check program_flow carefully)
     When upstream errors cause downstream problems:
-    → MODERATE hypothesis: Align dependent predictors
+    → moderate hypothesis: Align dependent predictors
     Example: Extractor output incompatible with Validator → Fix both
     Note: Must fix source AND affected predictors together
 
     **Fundamental Issues**
     When core approach flawed (use sparingly):
-    → SUBSTANTIAL hypothesis: Restructure while preserving working elements
+    → substantial hypothesis: Restructure while preserving working elements
     Only when patterns show no smaller fix possible
     Note: High risk - only if confident no alternative exists
 
@@ -762,7 +762,7 @@ class HypothesisGenerationSignature(Signature):
         "PredictorName": {
           "new_prompt": "COMPLETE replacement text",
           "rationale": "Why this fixes issue + what's preserved",
-          "change_magnitude": "MINIMAL|MODERATE|SUBSTANTIAL"
+          "change_magnitude": "minimal|moderate|substantial"
         }
       }
     }
@@ -773,7 +773,7 @@ class HypothesisGenerationSignature(Signature):
     - PredictorName must EXACTLY match names from current_prompts
     - new_prompt is COMPLETE replacement (all original + changes)
     - Sort by impact_score descending, then generalizability_score
-    - change_magnitude must be exactly: MINIMAL, MODERATE, or SUBSTANTIAL
+    - change_magnitude must be exactly: minimal, moderate, or substantial (lowercase)
 
     ## Scoring Guidelines
 
@@ -871,7 +871,7 @@ class HypothesisGenerationSignature(Signature):
         "ExtractorPredictor": {
           "new_prompt": "Extract key information from the provided text.\n\nRequirements:\n- Identify main entities and relationships\n- Preserve numerical data exactly\n- Include confidence scores\n\nOutput MUST be valid JSON:\n{\n  \"entities\": [...],\n  \"relationships\": [...],\n  \"confidence\": 0.0-1.0\n}\n\nFormat rules:\n- Use double quotes for strings\n- No trailing commas\n- Numbers without quotes",
           "rationale": "Adds format spec to fix parsing. Preserves successful extraction approach.",
-          "change_magnitude": "MINIMAL"
+          "change_magnitude": "minimal"
         }
       }
     }
