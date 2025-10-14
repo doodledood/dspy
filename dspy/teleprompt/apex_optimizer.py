@@ -700,7 +700,12 @@ class HypothesisGenerationSignature(Signature):
     - **failure_analyses**: Root causes and categories from failed examples in this iteration’s sample
     - **success_analyses**: Patterns that worked well and must be preserved
     - **program_flow**: Predictor dependencies forming a directed acyclic graph (DAG) of relationships
-    - **current_prompts**: Existing predictor prompts that may need modification
+    - **current_validation_score**: Latest validation score for the current baseline program. If unavailable, will be "N/A".
+    - **hypothesis_history**: Chronological record of prior hypotheses with validation scores, iteration numbers, and prompt
+      change rationales (no raw prompts). Use this trajectory to track which prompt adjustments boosted or hurt validation,
+      protect improvements by preserving successful rationales, and steer clear of ideas that previously regressed the score.
+      When unavailable, this field will be "N/A"; in that case rely on the current failure and success analyses to propose
+      minimal, high-leverage changes.
 
     Key insight: A predictor might succeed on some inputs and fail on others. Look for consistent patterns, not one-off issues. Use categories to group related failures for more effective targeting.
 
@@ -716,31 +721,40 @@ class HypothesisGenerationSignature(Signature):
     - Only modify what's marked as safe to change
     - If conflict exists between fix and preservation, find alternative approach
 
+    ## Leveraging Validation History
+
+    Treat hypothesis_history as a longitudinal study when present:
+    - Identify which prompt rationales coincided with validation gains and carry those principles forward
+    - Avoid reintroducing rationales that preceded regressions unless you can explicitly correct the flaw they introduced
+    - Combine current failure analyses with past rationales to craft refinements rather than wholesale rewrites when possible
+    If the history input is "N/A", you have no prior trajectory—lean entirely on the latest analyses to choose the smallest
+    effective adjustments.
+
     ## Hypothesis Generation Strategy
 
-    Choose approach based on failure patterns:
+    Choose approach based on failure patterns and validation trajectory:
 
     **Single Dominant Pattern**
-    When one root cause appears repeatedly across the sample:
-    → minimal hypothesis: Add single constraint/example/clarification
+    When one root cause appears repeatedly across the sample and history shows related tweaks improved validation:
+    → minimal hypothesis: Add single constraint/example/clarification that aligns with past successful rationales
     Example: "Missing format specification" → Add JSON schema
     Note: If this pattern represents most failures, fixing it alone may be sufficient
 
     **Multiple Related Failures**
-    When several issues share underlying cause:
-    → moderate hypothesis: Fix root cause with small coordinated changes
+    When several issues share underlying cause and prior rationales hint at partial fixes to refine:
+    → moderate hypothesis: Fix root cause with small coordinated changes that retain elements tied to higher validation scores
     Example: "Ambiguous terminology" across predictors → Standardize terms
     Note: More efficient than fixing each individually
 
     **Cascade Failures** (Check program_flow carefully)
-    When upstream errors cause downstream problems:
-    → moderate hypothesis: Align dependent predictors
+    When upstream errors cause downstream problems and history shows which predictors stayed stable:
+    → moderate hypothesis: Align dependent predictors while preserving the rationales tied to working components
     Example: Extractor output incompatible with Validator → Fix both
     Note: Must fix source AND affected predictors together
 
     **Fundamental Issues**
-    When core approach flawed (use sparingly):
-    → substantial hypothesis: Restructure while preserving working elements
+    When core approach flawed (use sparingly) and history shows repeated regressions despite incremental tweaks:
+    → substantial hypothesis: Restructure while preserving working elements explicitly credited in successful rationales
     Only when patterns show no smaller fix possible
     Note: High risk - only if confident no alternative exists
 
@@ -770,7 +784,7 @@ class HypothesisGenerationSignature(Signature):
 
     **Critical Requirements:**
 
-    - PredictorName must EXACTLY match names from current_prompts
+    - PredictorName must EXACTLY match existing predictor names referenced in program_flow or prior history
     - new_prompt is COMPLETE replacement (all original + changes)
     - Sort by impact_score descending, then generalizability_score
     - change_magnitude must be exactly: minimal, moderate, or substantial (lowercase)
@@ -894,7 +908,14 @@ class HypothesisGenerationSignature(Signature):
         desc="Success pattern summaries for contrast, showing what works well and should be preserved"
     )
     program_flow: str = InputField(desc="Program structure showing predictor relationships as a directed acyclic graph")
-    current_prompts: str = InputField(desc="Current predictor prompts in the program that may need modification")
+    current_validation_score: str = InputField(
+        desc="Latest validation score for the current baseline program; 'N/A' if unavailable",
+        default="N/A",
+    )
+    hypothesis_history: str = InputField(
+        desc="History of previously tested hypotheses with validation scores and change notes; 'N/A' if unavailable",
+        default="N/A",
+    )
     num_hypotheses: int = InputField(desc="Maximum number of hypotheses to generate (ordered by impact)")
 
     hypotheses: list[HypothesisSpec] = OutputField(
@@ -1020,6 +1041,7 @@ class APEX(Teleprompter):
         convergence_patience: int | None = 3,
         seed: int | None = None,
         checkpoint_dir: str | Path | None = None,
+        include_hypothesis_history: bool = True,
     ) -> None:
         if max_iterations is None and convergence_patience is None:
             raise ValueError("At least one of max_iterations or convergence_patience must be specified.")
@@ -1056,6 +1078,7 @@ class APEX(Teleprompter):
         self.convergence_patience = convergence_patience
         self.seed = seed if seed is not None else random.randint(1, 1_000_000)
         self._rng = random.Random(self.seed)
+        self.include_hypothesis_history = include_hypothesis_history
 
         self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
         if self.checkpoint_dir:
@@ -1082,6 +1105,55 @@ class APEX(Teleprompter):
                 logger.error(message)
             else:
                 logger.info(message)
+
+    @staticmethod
+    def _normalize_whitespace(text: str) -> str:
+        return " ".join(text.split())
+
+    def _build_hypothesis_history_text(
+        self,
+        candidate_history: Sequence[CandidateRecord] | None,
+    ) -> str:
+        if not self.include_hypothesis_history:
+            return "N/A"
+
+        lines: list[str] = ["Previous hypotheses evaluated (oldest first):"]
+
+        if not candidate_history:
+            lines.append("- No hypotheses have been tried yet.")
+            return "\n".join(lines)
+
+        sorted_candidates = sorted(
+            (candidate for candidate in candidate_history if candidate.hypothesis),
+            key=lambda candidate: candidate.iteration,
+        )
+
+        if not sorted_candidates:
+            lines.append("- No hypotheses have been tried yet.")
+            return "\n".join(lines)
+
+        for candidate in sorted_candidates:
+            score = candidate.overall_score
+            score_text = f"{score:.4f}" if score is not None else "N/A"
+            lines.append(f"- Iteration {candidate.iteration} (score={score_text}):")
+
+            changes = candidate.hypothesis.prompt_changes
+            if not changes:
+                lines.append("    * No prompt changes recorded")
+                continue
+
+            for predictor_name, change in changes.items():
+                rationale_text = (
+                    self._normalize_whitespace(change.rationale)
+                    if change.rationale
+                    else "No rationale provided"
+                )
+                magnitude = change.change_magnitude.value
+                lines.append(
+                    f"    * {predictor_name} [{magnitude}]: {rationale_text}"
+                )
+
+        return "\n".join(lines)
 
     def _parallel_execute(
         self,
@@ -1344,6 +1416,8 @@ class APEX(Teleprompter):
                     failure_summaries=failure_summaries,
                     success_summaries=success_summaries,
                     snapshot=snapshot,
+                    candidate_history=all_candidates,
+                    current_val_score=current_baseline_candidate.overall_score,
                 )
                 self._log(
                     f"APEX: iteration {iteration} produced {len(hypotheses)} hypothesis(es)",
@@ -1899,6 +1973,8 @@ class APEX(Teleprompter):
         failure_summaries: list[Prediction],
         success_summaries: list[Prediction],
         snapshot: ProgramSnapshot,
+        candidate_history: Sequence[CandidateRecord] | None = None,
+        current_val_score: float | None = None,
     ) -> list[HypothesisSpec]:
         if not failure_summaries or self.num_hypotheses == 0:
             self._log("APEX: No hypotheses to generate (no failures or num_hypotheses=0)", Verbosity.HIGH)
@@ -1919,14 +1995,14 @@ class APEX(Teleprompter):
             else "No success patterns available"
         )
 
-        prompt_text = "\n".join(
-            [
-                f"- {name}: {prompt[:200]}..." if len(prompt) > 200 else f"- {name}: {prompt}"
-                for name, prompt in snapshot.prompts.items()
-            ]
-        )
-
         program_flow = snapshot.flow_description
+
+        history_text = self._build_hypothesis_history_text(candidate_history)
+        current_val_text = (
+            f"{current_val_score:.4f}"
+            if current_val_score is not None
+            else "N/A"
+        )
 
         with dspy.context(lm=self.hypothesis_lm, adapter=self.hypothesis_adapter):
             predictor = dspy.Predict(HypothesisGenerationSignature)
@@ -1934,7 +2010,8 @@ class APEX(Teleprompter):
                 failure_analyses=failure_text,
                 success_analyses=success_text,
                 program_flow=program_flow,
-                current_prompts=prompt_text,
+                current_validation_score=current_val_text,
+                hypothesis_history=history_text,
                 num_hypotheses=self.num_hypotheses,
             )
 
