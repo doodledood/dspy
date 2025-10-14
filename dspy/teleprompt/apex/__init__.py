@@ -17,6 +17,7 @@ from dspy.teleprompt.apex.signatures import (
     HypothesisGenerationSignature,
     SuccessAnalysisSignature,
 )
+from dspy.teleprompt.apex.tracker import ExperimentTracker
 from dspy.teleprompt.apex.types import (
     ItemT,
     LogLevel,
@@ -35,6 +36,7 @@ __all__ = [
     "ChangeMagnitude",
     "CheckpointConfig",
     "ExecutionFlowEntry",
+    "ExperimentTracker",
     "FailureAnalysisSignature",
     "HypothesisGenerationSignature",
     "HypothesisSpec",

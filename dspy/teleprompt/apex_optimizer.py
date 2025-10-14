@@ -34,8 +34,11 @@ from dspy.teleprompt.apex import (
     TraceEntry,
     TrainExampleRecord,
     Verbosity,
+    tracking_utils,
     verbosity_rank,
 )
+from dspy.teleprompt.apex.tracked_module import track_module
+from dspy.teleprompt.apex.tracker import ExperimentTracker
 from dspy.teleprompt.teleprompt import Teleprompter
 from dspy.utils.parallelizer import ParallelExecutor
 
@@ -66,6 +69,9 @@ class APEX(Teleprompter):
         seed: int | None = None,
         checkpoint_dir: str | Path | None = None,
         include_hypothesis_history: bool = True,
+        use_mlflow: bool = False,
+        mlflow_tracking_uri: str | None = None,
+        mlflow_experiment_name: str | None = None,
     ) -> None:
         if max_iterations is None and convergence_patience is None:
             raise ValueError("At least one of max_iterations or convergence_patience must be specified.")
@@ -108,6 +114,14 @@ class APEX(Teleprompter):
         if self.checkpoint_dir:
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
             self._log(f"APEX: Checkpointing enabled at {self.checkpoint_dir}", Verbosity.NORMAL)
+
+        self.tracker = ExperimentTracker(
+            use_mlflow=use_mlflow,
+            mlflow_tracking_uri=mlflow_tracking_uri,
+            mlflow_experiment_name=mlflow_experiment_name,
+        )
+        if use_mlflow:
+            self._log("APEX: MLflow tracking enabled", Verbosity.NORMAL)
 
     def _is_enabled(self, level: Verbosity) -> bool:
         return verbosity_rank(self.verbosity) >= verbosity_rank(level)
@@ -306,9 +320,25 @@ class APEX(Teleprompter):
         if not valset:
             raise ValueError("calibration set (valset) must be provided and non-empty.")
 
-        checkpoint = None
-        if resume and self.checkpoint_dir:
-            checkpoint = self._load_checkpoint()
+        with self.tracker:
+            if self.tracker.is_active():
+                self.tracker.log_params(
+                    {
+                        "max_iterations": self.max_iterations,
+                        "num_hypotheses": self.num_hypotheses,
+                        "num_eval_runs": self.num_eval_runs,
+                        "success_threshold": self.success_threshold,
+                        "convergence_patience": self.convergence_patience,
+                        "seed": self.seed,
+                        "train_size": len(trainset),
+                        "val_size": len(valset),
+                        "verbosity": str(self.verbosity),
+                    }
+                )
+
+            checkpoint = None
+            if resume and self.checkpoint_dir:
+                checkpoint = self._load_checkpoint()
 
         if checkpoint:
             current_program = checkpoint.current_program
@@ -350,6 +380,14 @@ class APEX(Teleprompter):
             current_baseline_candidate = baseline_candidate
             self._log(f"APEX: Initial baseline score={baseline_candidate.overall_score:.4f}", Verbosity.NORMAL)
 
+            if self.tracker.is_active():
+                baseline_metrics = tracking_utils.format_baseline_metrics(
+                    baseline_score=baseline_candidate.overall_score,
+                    num_train=len(trainset),
+                    num_val=len(valset),
+                )
+                self.tracker.log_metrics(baseline_metrics, step=0)
+
             no_improvement_count = 0
             iteration = 0
 
@@ -382,6 +420,15 @@ class APEX(Teleprompter):
                     f"APEX: Sampled {len(sampled_train)} training examples from {len(trainset)} total", Verbosity.HIGH
                 )
                 baseline_for_analysis = current_program.deepcopy()
+
+                # Wrap the program with tracking if MLflow is active
+                if self.tracker.is_active():
+                    baseline_for_analysis = track_module(
+                        baseline_for_analysis,
+                        run_id=self.tracker.get_run_id(),
+                        iteration=iteration
+                    )
+
                 snapshot = self._snapshot_program(baseline_for_analysis)
 
                 failures, successes = self._evaluate_train_examples(baseline_for_analysis, sampled_train)
@@ -478,6 +525,22 @@ class APEX(Teleprompter):
                         candidates=candidates,
                     )
                 )
+
+                if self.tracker.is_active():
+                    iteration_data = tracking_utils.format_iteration_metrics(
+                        iteration=iteration,
+                        num_failures=len(failure_summaries),
+                        num_successes=len(success_summaries),
+                        hypotheses=hypotheses,
+                        candidates=candidates,
+                        best_score=best_candidate_for_iteration.overall_score,
+                    )
+                    self.tracker.log_iteration(iteration, iteration_data)
+
+                    for idx, candidate in enumerate(candidates):
+                        candidate_data = tracking_utils.format_candidate_data(candidate)
+                        self.tracker.log_candidate(candidate_data, iteration, idx)
+
 
                 if best_candidate_for_iteration.overall_score > best_candidate.overall_score:
                     best_candidate = best_candidate_for_iteration
@@ -589,6 +652,33 @@ class APEX(Teleprompter):
             f"APEX: Final score: {best_candidate.overall_score:.4f} (initial baseline: {baseline_candidate.overall_score:.4f})",
             Verbosity.NORMAL,
         )
+
+        if self.tracker.is_active():
+            summary = tracking_utils.format_optimization_summary(
+                best_candidate=best_candidate,
+                all_candidates=all_candidates,
+                iterations=iteration_logs,
+                stopped_after=stop_reason,
+                initial_score=baseline_candidate.overall_score,
+            )
+            self.tracker.log_metrics(summary)
+
+            if best_candidate.hypothesis:
+                best_program_data = {
+                    "overall_score": best_candidate.overall_score,
+                    "iteration": best_candidate.iteration,
+                    "hypothesis_strategy": best_candidate.hypothesis.strategy
+                    if hasattr(best_candidate.hypothesis, "strategy")
+                    else "unknown",
+                    "prompt_changes": {},
+                }
+                if best_candidate.hypothesis.prompt_changes:
+                    for pred_name, change in best_candidate.hypothesis.prompt_changes.items():
+                        best_program_data["prompt_changes"][pred_name] = {
+                            "new_prompt": change.new_prompt,
+                            "rationale": change.rationale if hasattr(change, "rationale") else "",
+                        }
+                self.tracker.log_best_program(best_program_data)
         if self._is_enabled(Verbosity.HIGH):
             total_candidates = sum(len(log.candidates) for log in iteration_logs)
             total_hypotheses = sum(len(log.hypotheses) for log in iteration_logs)
@@ -877,7 +967,6 @@ class APEX(Teleprompter):
             else:
                 flow_parts.append("   Inputs sourced from: program input or constants")
 
-            # Add actual input and output values for better analysis
             flow_parts.append(f"   Actual inputs: {entry.inputs}")
             flow_parts.append(f"   Actual outputs: {entry.outputs}")
 
@@ -928,18 +1017,19 @@ class APEX(Teleprompter):
                 execution_flow_str = self._format_execution_flow_with_details(record.execution_flow)
 
                 if mode == "failure":
-                    result = predictor(
-                        problem=str(inputs),
-                        prediction=str(record.prediction) if record.prediction else "",
-                        expected=str(expected),
-                        error=record.error or "",
-                        execution_flow=execution_flow_str,
-                        metric_score=record.metric_score,
-                        metric_feedback=record.metric_feedback or "N/A",
-                        success_threshold=self.success_threshold,
-                        min_metric=self.min_metric,
-                        max_metric=self.max_metric,
-                    )
+                    call_inputs = {
+                        "problem": str(inputs),
+                        "prediction": str(record.prediction) if record.prediction else "",
+                        "expected": str(expected),
+                        "error": record.error or "",
+                        "execution_flow": execution_flow_str,
+                        "metric_score": record.metric_score,
+                        "metric_feedback": record.metric_feedback or "N/A",
+                        "success_threshold": self.success_threshold,
+                        "min_metric": self.min_metric,
+                        "max_metric": self.max_metric,
+                    }
+                    result = predictor(**call_inputs)
                 else:
                     result = predictor(
                         problem=str(inputs),
@@ -1032,8 +1122,6 @@ class APEX(Teleprompter):
             )
 
         validated_specs = result.hypotheses if result.hypotheses else []
-
-        # Sort by impact_score (highest first), then by generalizability_score if tied
         validated_specs.sort(key=lambda h: (h.impact_score, h.generalizability_score), reverse=True)
 
         validated_specs = validated_specs[: self.num_hypotheses]
@@ -1123,10 +1211,14 @@ class APEX(Teleprompter):
         label = "baseline" if hypothesis is None else "hypothesis"
         cal_examples = list(calset)
 
+        # Wrap program with tracking if MLflow is active
+        if self.tracker.is_active():
+            program = track_module(program, run_id=self.tracker.get_run_id(), iteration=iteration)
+
         def process(example: Example) -> float:
             try:
                 per_runs: list[float] = []
-                for _ in range(self.num_eval_runs):
+                for run_idx in range(self.num_eval_runs):
                     with dspy.settings.context(trace=[]):
                         prediction = program(**example.inputs().toDict())
                         trace_entries = list(dspy.settings.trace or [])
@@ -1145,13 +1237,13 @@ class APEX(Teleprompter):
             level=Verbosity.NORMAL,
         )
 
-        # Filter out None values that may result from parallel execution errors
         valid_scores = [s for s in scores if s is not None]
         if not valid_scores:
             self._log(f"APEX: Warning - no valid scores obtained for {label}", Verbosity.NORMAL, "warning")
-            valid_scores = [self.min_metric]  # Use minimum metric as fallback
+            valid_scores = [self.min_metric]
 
         overall = sum(valid_scores) / len(valid_scores)
+
         return CandidateRecord(
             program=program,
             overall_score=overall,
@@ -1174,6 +1266,7 @@ class APEX(Teleprompter):
         best_score = max(c.overall_score for c in candidates)
         best_candidates = [c for c in candidates if c.overall_score == best_score]
         return self._rng.choice(best_candidates)
+
 
     def _snapshot_program(self, program: Module) -> ProgramSnapshot:
         prompts: dict[str, str] = {}
