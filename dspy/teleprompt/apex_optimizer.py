@@ -1075,8 +1075,6 @@ class APEX(Teleprompter):
     ) -> list[Prediction]:
         if not success_records or failure_count == 0:
             return []
-        if len(success_records) > failure_count:
-            success_records = self._rng.sample(success_records, k=failure_count)
         return self._analyze_examples(success_records, mode="success")
 
     def _generate_hypotheses(
