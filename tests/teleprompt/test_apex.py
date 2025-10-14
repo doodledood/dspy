@@ -517,8 +517,6 @@ def test_apex_end_to_end_fake_data():
     assert result.all_candidates[1].hypothesis is None  # First iteration baseline
     assert result.all_candidates[2].hypothesis is not None  # First iteration hypothesis
     assert result.all_candidates[3].hypothesis is None  # Second iteration baseline
-
-
 def test_apex_normal_verbosity_logs_candidates_only():
     trainset = [make_train_example("x")]
     calset = trainset
