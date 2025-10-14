@@ -6,8 +6,7 @@ import pytest
 
 import dspy
 from dspy import Example
-from dspy.teleprompt.apex import ChangeMagnitude, PromptChange
-from dspy.teleprompt.apex_optimizer import APEX
+from dspy.teleprompt.apex import APEX, ChangeMagnitude, PromptChange
 from dspy.utils.dummies import DummyLM
 
 
