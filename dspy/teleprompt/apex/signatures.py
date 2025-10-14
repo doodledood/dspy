@@ -597,6 +597,10 @@ class HypothesisGenerationSignature(Signature):
 
     - **failure_analyses**: Root causes and categories from failed examples in this iteration’s sample
     - **success_analyses**: Patterns that worked well and must be preserved
+      *Count them carefully.* The mix of success and failure analyses mirrors the
+      outcomes in this batch. A high success-to-failure ratio signals you should
+      propose very small, low-risk tweaks; a low ratio indicates broader fixes may be
+      justified.
     - **program_flow**: Predictor dependencies forming a directed acyclic graph (DAG) of relationships
     - **current_validation_score**: Latest validation score for the current baseline program. If unavailable, will be "N/A".
     - **hypothesis_history**: Chronological record of prior hypotheses with validation scores, iteration numbers, and prompt
