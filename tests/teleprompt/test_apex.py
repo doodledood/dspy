@@ -3,7 +3,12 @@ import pytest
 import dspy
 import dspy.teleprompt.apex_optimizer as apex_module
 from dspy import Example
-from dspy.teleprompt.apex import ChangeMagnitude, PromptChange
+from dspy.teleprompt.apex import (
+    CandidateRecord,
+    ChangeMagnitude,
+    HypothesisSpec,
+    PromptChange,
+)
 from dspy.teleprompt.apex_optimizer import APEX, Verbosity
 from dspy.utils.dummies import DummyLM
 
@@ -68,6 +73,176 @@ def metric(example: Example, prediction: dspy.Prediction, trace) -> float:
     expected = example.output
     predicted = prediction.output
     return 1.0 if expected == predicted else 0.0
+
+
+@pytest.mark.parametrize(
+    "kwargs, error_match",
+    [
+        ({"max_iterations": None, "convergence_patience": None}, "At least one"),
+        ({"max_iterations": 0}, "max_iterations"),
+        ({"convergence_patience": 0}, "convergence_patience"),
+        ({"num_hypotheses": -1}, "num_hypotheses"),
+        ({"num_eval_runs": 0}, "num_eval_runs"),
+        ({"min_metric": 1.1, "max_metric": 1.0}, "min_metric"),
+    ],
+)
+def test_apex_constructor_validation(kwargs, error_match):
+    analysis_lm = DummyLM([], adapter=dspy.JSONAdapter())
+
+    with pytest.raises(ValueError, match=error_match):
+        params = {
+            "metric": metric,
+            "analysis_lm": analysis_lm,
+            "hypothesis_lm": analysis_lm,
+            "max_iterations": 1,
+            "convergence_patience": 1,
+        }
+        params.update(kwargs)
+        APEX(**params)
+
+
+def test_apex_requires_non_empty_train_and_valset():
+    analysis_lm = DummyLM([], adapter=dspy.JSONAdapter())
+    optimizer = APEX(
+        metric=metric,
+        analysis_lm=analysis_lm,
+        hypothesis_lm=analysis_lm,
+        max_iterations=1,
+        convergence_patience=1,
+        verbosity="none",
+    )
+
+    student = PromptDrivenModule(initial_prompt="bad")
+
+    with pytest.raises(ValueError, match="trainset must be non-empty"):
+        optimizer.compile(student, trainset=[], valset=[make_train_example("x")])
+
+    with pytest.raises(ValueError, match="calibration set"):
+        optimizer.compile(student, trainset=[make_train_example("x")], valset=[])
+
+
+def test_apex_builds_history_text_when_enabled():
+    analysis_lm = DummyLM([], adapter=dspy.JSONAdapter())
+    optimizer = APEX(
+        metric=metric,
+        analysis_lm=analysis_lm,
+        hypothesis_lm=analysis_lm,
+        max_iterations=1,
+        convergence_patience=1,
+        verbosity="none",
+    )
+
+    hypothesis = HypothesisSpec(
+        observation="obs",
+        fixable_root_causes=["missing token"],
+        non_fixable_root_causes=[],
+        impact_score=0.5,
+        generalizability_score=0.2,
+        strategy="Improve prompt",
+        expected_impact="better",
+        prompt_changes={
+            "predictor": PromptChange(
+                new_prompt="better",
+                rationale="Clean whitespace",
+                change_magnitude=ChangeMagnitude.MINIMAL,
+            )
+        },
+    )
+
+    candidate = CandidateRecord(
+        program=PromptDrivenModule(initial_prompt="bad"),
+        overall_score=0.8,
+        per_example_scores=[0.8],
+        iteration=3,
+        hypothesis=hypothesis,
+    )
+
+    history_text = optimizer._build_hypothesis_history_text([candidate])
+
+    assert "Iteration 3" in history_text
+    assert "predictor" in history_text
+    assert "Clean whitespace" in history_text
+
+
+def test_apex_history_disabled_returns_na():
+    analysis_lm = DummyLM([], adapter=dspy.JSONAdapter())
+    optimizer = APEX(
+        metric=metric,
+        analysis_lm=analysis_lm,
+        hypothesis_lm=analysis_lm,
+        max_iterations=1,
+        convergence_patience=1,
+        verbosity="none",
+        include_hypothesis_history=False,
+    )
+
+    candidate = CandidateRecord(
+        program=PromptDrivenModule(initial_prompt="bad"),
+        overall_score=1.0,
+        per_example_scores=[1.0],
+        iteration=1,
+        hypothesis=None,
+    )
+
+    assert optimizer._build_hypothesis_history_text([candidate]) == "N/A"
+
+
+def test_apex_sample_callable_must_return_list():
+    analysis_lm = DummyLM([make_analysis_response()], adapter=dspy.JSONAdapter())
+    hypothesis_lm = DummyLM([make_hypothesis_response()], adapter=dspy.JSONAdapter())
+
+    optimizer = APEX(
+        metric=metric,
+        analysis_lm=analysis_lm,
+        hypothesis_lm=hypothesis_lm,
+        max_iterations=1,
+        num_hypotheses=1,
+        convergence_patience=1,
+        seed=1,
+        verbosity="none",
+        train_sample=lambda data, iteration: tuple(data),
+    )
+
+    student = PromptDrivenModule(initial_prompt="bad")
+
+    with pytest.raises(TypeError, match="Custom train_sample callable"):
+        optimizer.compile(
+            student,
+            trainset=[make_train_example("x"), make_train_example("y")],
+            valset=[make_train_example("x")],
+        )
+
+
+def test_apex_apply_hypothesis_rejects_unknown_predictor():
+    analysis_lm = DummyLM([], adapter=dspy.JSONAdapter())
+    optimizer = APEX(
+        metric=metric,
+        analysis_lm=analysis_lm,
+        hypothesis_lm=analysis_lm,
+        max_iterations=1,
+        convergence_patience=1,
+        verbosity="none",
+    )
+
+    hypothesis = HypothesisSpec(
+        observation="obs",
+        fixable_root_causes=[],
+        non_fixable_root_causes=[],
+        impact_score=0.1,
+        generalizability_score=0.1,
+        strategy="",
+        expected_impact="",
+        prompt_changes={
+            "unknown": PromptChange(
+                new_prompt="new",
+                rationale="",
+                change_magnitude=ChangeMagnitude.MINIMAL,
+            )
+        },
+    )
+
+    with pytest.raises(ValueError, match="unknown predictor"):
+        optimizer._apply_hypothesis(PromptDrivenModule(initial_prompt="bad"), hypothesis)
 
 
 def test_apex_improves_and_tracks_history():
@@ -462,6 +637,7 @@ def test_apex_end_to_end_fake_data():
         make_success_response("baseline prompt handles sample_success"),
         make_analysis_response("baseline prompt now mismatched"),
         make_success_response("good prompt stable"),
+        make_success_response("good prompt handles remaining cases"),
     ]
     analysis_lm = DummyLM(analysis_responses, adapter=dspy.JSONAdapter())
     hypothesis_lm = DummyLM(
@@ -503,7 +679,7 @@ def test_apex_end_to_end_fake_data():
     assert first_iter.candidates[1].hypothesis == first_iter.hypotheses[0]
     assert len(first_iter.candidates[0].per_example_scores) == len(calset)
     assert len(first_iter.candidates[1].per_example_scores) == len(calset)
-    assert second_iter.num_failures == 1 and second_iter.num_successes == 1
+    assert second_iter.num_failures == 1 and second_iter.num_successes == 2
     assert second_iter.hypotheses == []
     assert second_iter.candidates[0].hypothesis is None  # re-evaluated champion
     assert len(second_iter.candidates[0].per_example_scores) == len(calset)
