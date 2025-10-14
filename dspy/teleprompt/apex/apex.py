@@ -50,7 +50,66 @@ logger = logging.getLogger(__name__)
 
 
 class APEX(Teleprompter):
-    """APEX teleprompter implementing systematic prompt optimization."""
+    """Analysis-based Prompt Engineering eXpert (APEX) optimizer.
+
+    APEX orchestrates a map-reduce style optimization loop that mirrors how
+    human prompt engineers diagnose and remediate model errors.  Each iteration
+    samples a subset of the training data, records full DSPy execution traces,
+    and performs parallel failure/success analyses with an "analysis" language
+    model.  A separate "hypothesis" model synthesizes those summaries into
+    candidate prompt revisions which are then evaluated on a calibration set.
+    The highest-scoring candidate becomes the new baseline while the global
+    best-so-far is tracked for the final result.  Optional checkpointing and
+    MLflow logging make long-running jobs resumable and observable.
+
+    Args:
+        metric: Callable that scores (example, prediction, trace) tuples.  It may
+            return a float, bool, ``Prediction`` with a ``score`` field, or a
+            dict containing ``{"score": float, "feedback": str | None}``.
+        analysis_lm: Language model used for per-example root-cause and success
+            pattern analyses.
+        analysis_adapter: Adapter applied to ``analysis_lm`` calls.  Defaults to
+            :class:`~dspy.adapters.JSONAdapter` for structured outputs.
+        max_iterations: Hard limit on optimization iterations.  ``None`` means
+            run until ``convergence_patience`` is exhausted.
+        hypothesis_lm: Optional language model for hypothesis synthesis.  Falls
+            back to ``analysis_lm`` when omitted.
+        hypothesis_adapter: Adapter for hypothesis generation calls.  Defaults to
+            :class:`~dspy.adapters.JSONAdapter`.
+        verbosity: Verbosity level controlling console logging and progress
+            bars.  Accepts either a :class:`Verbosity` enum or its string name.
+        num_threads: Maximum number of worker threads used for example
+            evaluation and analysis.  Defaults to CPU count (falling back to
+            DSPy's global ``num_threads`` setting) and is clamped to ``>= 1``.
+        num_hypotheses: Maximum number of hypotheses to request per iteration.
+        num_eval_runs: Number of repeated executions per calibration example.
+            Median aggregation across runs stabilizes metric estimates.
+        train_sample: ``None`` to use the full (shuffled) train set, an integer
+            specifying how many examples to sample without replacement, or a
+            callable ``SamplerFn`` receiving ``(trainset, iteration)`` and
+            returning a list of :class:`~dspy.primitives.Example` objects.
+        success_threshold: Metric score at or above which a training example is
+            treated as a success.  Defaults to ``max_metric``.
+        min_metric: Lower bound used to clip metric outputs and to backstop
+            failures.
+        max_metric: Upper bound used to clip metric outputs and define the
+            default ``success_threshold``.
+        convergence_patience: Number of consecutive iterations without an
+            improved candidate before stopping.  ``None`` disables patience.
+        seed: Random seed for sampling, tie-breaking, and hypothesis ordering.
+        checkpoint_dir: Directory for serialized :class:`ApexCheckpoint`
+            snapshots.  When provided, checkpoints are saved at the start and
+            end of each iteration and can be reloaded via ``compile(...,
+            resume=True)``.
+        include_hypothesis_history: Whether hypothesis generation prompts are
+            augmented with a summary of previously tested changes.
+        use_mlflow: Enables MLflow tracking of iterations, candidates, and
+            scores via :class:`ExperimentTracker`.
+        mlflow_tracking_uri: Optional MLflow tracking URI forwarded to the
+            experiment tracker.
+        mlflow_experiment_name: Optional experiment name when MLflow logging is
+            enabled.
+    """
 
     def __init__(
         self,
@@ -317,6 +376,47 @@ class APEX(Teleprompter):
         valset: list[Example] | None = None,
         resume: bool = False,
     ) -> Module:
+        """Optimize ``student`` by iteratively refining its predictor prompts.
+
+        The compile loop performs the following operations until the iteration
+        budget or convergence patience is exhausted:
+
+        1. Sample the training set (according to ``train_sample``), execute the
+           current program on each example, and collect full execution traces.
+        2. Run the analysis language model on every failure (and a balanced set
+           of successes) to obtain structured root-cause and contrastive
+           summaries.
+        3. Ask the hypothesis model to synthesize those summaries into up to
+           ``num_hypotheses`` candidate prompt revisions.
+        4. Evaluate the baseline and each hypothesis on ``valset`` with
+           ``num_eval_runs`` repetitions per example and median aggregation.
+        5. Adopt the highest-scoring candidate as the new baseline while tracking
+           the global best for the final return value.
+
+        Checkpoints are optionally written at the beginning and end of each
+        iteration, enabling interrupted runs to resume when ``resume`` is
+        ``True`` and ``checkpoint_dir`` was specified during initialization.
+
+        Args:
+            student: Uncompiled DSPy :class:`~dspy.primitives.Module` to be
+                optimized.  The module is deep-copied before modification.
+            trainset: Labeled training examples used for error analysis and
+                success pattern mining.
+            teacher: Unsupported parameter required by the ``Teleprompter``
+                interface.  Passing a value raises ``ValueError``.
+            valset: Calibration examples that determine candidate scores.  Must
+                be non-empty.
+            resume: When ``True`` and checkpoints are available, resume from the
+                most recent saved state instead of starting from ``student``.
+
+        Returns:
+            Module: A deep copy of the program associated with the best overall
+                calibration score observed during optimization.
+
+        Raises:
+            ValueError: If ``teacher`` is provided or if either ``trainset`` or
+                ``valset`` is empty.
+        """
         if teacher is not None:
             raise ValueError("APEX does not support teacher programs.")
         if not trainset:
