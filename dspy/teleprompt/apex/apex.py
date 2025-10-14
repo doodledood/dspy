@@ -15,30 +15,34 @@ import dspy
 from dspy.adapters import Adapter, JSONAdapter
 from dspy.clients.lm import LM
 from dspy.primitives import Example, Module, Prediction
-from dspy.teleprompt.apex import (
+from . import tracking_utils
+from .models import (
     ApexCheckpoint,
     ApexIterationLog,
     ApexOptimizationResult,
     CandidateRecord,
     CheckpointConfig,
     ExecutionFlowEntry,
+    HypothesisSpec,
+    ProgramSnapshot,
+    TrainExampleRecord,
+)
+from .signatures import (
     FailureAnalysisSignature,
     HypothesisGenerationSignature,
-    HypothesisSpec,
+    SuccessAnalysisSignature,
+)
+from .tracked_module import track_module
+from .tracker import ExperimentTracker
+from .types import (
     ItemT,
     LogLevel,
     MetricFn,
-    ProgramSnapshot,
     SamplerFn,
-    SuccessAnalysisSignature,
     TraceEntry,
-    TrainExampleRecord,
     Verbosity,
-    tracking_utils,
     verbosity_rank,
 )
-from dspy.teleprompt.apex.tracked_module import track_module
-from dspy.teleprompt.apex.tracker import ExperimentTracker
 from dspy.teleprompt.teleprompt import Teleprompter
 from dspy.utils.parallelizer import ParallelExecutor
 

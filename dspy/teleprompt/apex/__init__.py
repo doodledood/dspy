@@ -1,4 +1,5 @@
 """APEX optimizer package."""
+from dspy.teleprompt.apex.apex import APEX
 from dspy.teleprompt.apex.models import (
     ApexCheckpoint,
     ApexIterationLog,
@@ -29,6 +30,7 @@ from dspy.teleprompt.apex.types import (
 )
 
 __all__ = [
+    "APEX",
     "ApexCheckpoint",
     "ApexIterationLog",
     "ApexOptimizationResult",
