@@ -3,7 +3,8 @@ import pytest
 import dspy
 import dspy.teleprompt.apex_optimizer as apex_module
 from dspy import Example
-from dspy.teleprompt.apex_optimizer import APEX, ChangeMagnitude, PromptChange, Verbosity
+from dspy.teleprompt.apex import ChangeMagnitude, PromptChange
+from dspy.teleprompt.apex_optimizer import APEX, Verbosity
 from dspy.utils.dummies import DummyLM
 
 

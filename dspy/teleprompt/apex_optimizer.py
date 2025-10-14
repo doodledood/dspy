@@ -1,4 +1,3 @@
-# ruff: noqa: RUF002
 from __future__ import annotations
 
 import json
@@ -7,7 +6,7 @@ import os
 import random
 from pathlib import Path
 from statistics import median
-from typing import Any, Iterable, Iterator, Sequence
+from typing import Any, Callable, Iterable, Iterator, Sequence
 
 import cloudpickle
 from tqdm.auto import tqdm
@@ -16,15 +15,11 @@ import dspy
 from dspy.adapters import Adapter, JSONAdapter
 from dspy.clients.lm import LM
 from dspy.primitives import Example, Module, Prediction
-from dspy.teleprompt.teleprompt import Teleprompter
-from dspy.utils.parallelizer import ParallelExecutor
-
 from dspy.teleprompt.apex import (
     ApexCheckpoint,
     ApexIterationLog,
     ApexOptimizationResult,
     CandidateRecord,
-    ChangeMagnitude,
     CheckpointConfig,
     ExecutionFlowEntry,
     FailureAnalysisSignature,
@@ -34,7 +29,6 @@ from dspy.teleprompt.apex import (
     LogLevel,
     MetricFn,
     ProgramSnapshot,
-    PromptChange,
     SamplerFn,
     SuccessAnalysisSignature,
     TraceEntry,
@@ -42,8 +36,11 @@ from dspy.teleprompt.apex import (
     Verbosity,
     verbosity_rank,
 )
+from dspy.teleprompt.teleprompt import Teleprompter
+from dspy.utils.parallelizer import ParallelExecutor
 
 logger = logging.getLogger(__name__)
+
 
 class APEX(Teleprompter):
     """APEX teleprompter implementing systematic prompt optimization."""
@@ -171,14 +168,10 @@ class APEX(Teleprompter):
 
             for predictor_name, change in changes.items():
                 rationale_text = (
-                    self._normalize_whitespace(change.rationale)
-                    if change.rationale
-                    else "No rationale provided"
+                    self._normalize_whitespace(change.rationale) if change.rationale else "No rationale provided"
                 )
                 magnitude = change.change_magnitude.value
-                lines.append(
-                    f"    * {predictor_name} [{magnitude}]: {rationale_text}"
-                )
+                lines.append(f"    * {predictor_name} [{magnitude}]: {rationale_text}")
 
         return "\n".join(lines)
 
@@ -1025,11 +1018,7 @@ class APEX(Teleprompter):
         program_flow = snapshot.flow_description
 
         history_text = self._build_hypothesis_history_text(candidate_history)
-        current_val_text = (
-            f"{current_val_score:.4f}"
-            if current_val_score is not None
-            else "N/A"
-        )
+        current_val_text = f"{current_val_score:.4f}" if current_val_score is not None else "N/A"
 
         with dspy.context(lm=self.hypothesis_lm, adapter=self.hypothesis_adapter):
             predictor = dspy.Predict(HypothesisGenerationSignature)
