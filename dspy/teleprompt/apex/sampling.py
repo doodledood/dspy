@@ -21,8 +21,7 @@ def sample_trainset(
 
     examples = list(trainset)
     if sampler is None:
-        rng.shuffle(examples)
-        return examples
+        sampler = len(examples)
 
     if isinstance(sampler, int):
         k = min(sampler, len(examples))

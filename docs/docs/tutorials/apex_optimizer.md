@@ -89,10 +89,10 @@ All candidates are tracked across iterations, so you can audit how prompts evolv
 | `max_iterations` | **required** | Hard iteration cap for the optimization loop. |
 | `num_hypotheses` | `1` | Max hypotheses generated per iteration. |
 | `num_eval_runs` | `1` | Evaluation repeats per calibration example (median reduces variance). |
-| `train_sample` | `None` | `None` = shuffle entire trainset, `int` = random subset size, `callable(trainset, iteration)` for custom sampling. |
+| `train_sample` | `20` | Number of train examples sampled per iteration. `None` = shuffle entire trainset, `int` = random subset size, `callable(trainset, iteration)` for custom sampling. |
 | `success_threshold` | `max_metric` | Score threshold for classifying successes. |
 | `min_metric`, `max_metric` | `0.0`, `1.0` | Bounds used to clamp metric scores. |
-| `convergence_patience` | `3` | Stop after this many consecutive non-improving iterations. |
+| `convergence_patience` | `5` | Stop after this many consecutive non-improving iterations. |
 | `seed` | random | RNG seed controlling sampling and tie-breaking. |
 
 ## Configuring the analysis models
