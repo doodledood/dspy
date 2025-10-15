@@ -3,15 +3,16 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import dspy
-import dspy.teleprompt.apex.apex as apex_module
+import dspy.teleprompt.apex.runtime as runtime_module
 from dspy import Example
 from dspy.teleprompt.apex import (
+    APEX,
     CandidateRecord,
     ChangeMagnitude,
     HypothesisSpec,
     PromptChange,
+    Verbosity,
 )
-from dspy.teleprompt.apex import APEX, Verbosity
 from dspy.utils.dummies import DummyLM
 
 
@@ -456,7 +457,7 @@ def test_apex_uses_configured_num_threads(monkeypatch):
         calls.append(self.num_threads)
         return [function(item) for item in data]
 
-    monkeypatch.setattr(apex_module.ParallelExecutor, "execute", fake_execute)
+    monkeypatch.setattr(runtime_module.ParallelExecutor, "execute", fake_execute)
 
     trainset = [make_train_example("x"), make_train_example("y")]
     calset = trainset
