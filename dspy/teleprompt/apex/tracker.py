@@ -22,15 +22,17 @@ class ExperimentTracker:
     def __init__(
         self,
         use_mlflow: bool = False,
-        mlflow_tracking_uri: str | None = None,
-        mlflow_experiment_name: str | None = None,
+        mlflow_tracking_uri: str | None = "http://127.0.0.1:5000",
+        mlflow_experiment_name: str | None = "APEX",
     ):
         """Initialize the experiment tracker.
 
         Args:
             use_mlflow: Whether to use MLflow for tracking
-            mlflow_tracking_uri: Optional MLflow tracking server URI
-            mlflow_experiment_name: Optional experiment name
+            mlflow_tracking_uri: Optional MLflow tracking server URI. Defaults to
+                ``"http://127.0.0.1:5000"``.
+            mlflow_experiment_name: Optional experiment name. Defaults to
+                ``"APEX"``.
         """
         self.use_mlflow = use_mlflow and MLFLOW_AVAILABLE
         self.mlflow_tracking_uri = mlflow_tracking_uri

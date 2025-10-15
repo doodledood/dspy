@@ -81,10 +81,11 @@ class APEX(Teleprompter):
         num_hypotheses: Maximum number of hypotheses to request per iteration.
         num_eval_runs: Number of repeated executions per calibration example.
             Median aggregation across runs stabilizes metric estimates.
-        train_sample: ``None`` to use the full (shuffled) train set, an integer
-            specifying how many examples to sample without replacement, or a
-            callable ``SamplerFn`` receiving ``(trainset, iteration)`` and
-            returning a list of :class:`~dspy.primitives.Example` objects.
+        train_sample: Defaults to ``20`` examples per iteration.  ``None`` uses
+            the full (shuffled) train set by sampling ``len(trainset)`` examples
+            without replacement, while a callable ``SamplerFn`` receives
+            ``(trainset, iteration)`` and returns a list of
+            :class:`~dspy.primitives.Example` objects.
         success_threshold: Metric score at or above which a training example is
             treated as a success.  Defaults to ``max_metric``.
         min_metric: Lower bound used to clip metric outputs and to backstop
@@ -92,7 +93,8 @@ class APEX(Teleprompter):
         max_metric: Upper bound used to clip metric outputs and define the
             default ``success_threshold``.
         convergence_patience: Number of consecutive iterations without an
-            improved candidate before stopping.  ``None`` disables patience.
+            improved candidate before stopping.  Defaults to ``5``. ``None``
+            disables patience.
         seed: Random seed for sampling, tie-breaking, and hypothesis ordering.
         checkpoint_dir: Directory for serialized :class:`ApexCheckpoint`
             snapshots.  When provided, checkpoints are saved at the start and
@@ -103,9 +105,9 @@ class APEX(Teleprompter):
         use_mlflow: Enables MLflow tracking of iterations, candidates, and
             scores via :class:`ExperimentTracker`.
         mlflow_tracking_uri: Optional MLflow tracking URI forwarded to the
-            experiment tracker.
+            experiment tracker.  Defaults to ``"http://127.0.0.1:5000"``.
         mlflow_experiment_name: Optional experiment name when MLflow logging is
-            enabled.
+            enabled.  Defaults to ``"APEX"``.
     """
 
     def __init__(
@@ -121,17 +123,17 @@ class APEX(Teleprompter):
         num_threads: int | None = None,
         num_hypotheses: int = 1,
         num_eval_runs: int = 1,
-        train_sample: None | int | SamplerFn = None,
+        train_sample: None | int | SamplerFn = 20,
         success_threshold: float | None = None,
         min_metric: float = 0.0,
         max_metric: float = 1.0,
-        convergence_patience: int | None = 3,
+        convergence_patience: int | None = 5,
         seed: int | None = None,
         checkpoint_dir: str | Path | None = None,
         include_hypothesis_history: bool = True,
         use_mlflow: bool = False,
-        mlflow_tracking_uri: str | None = None,
-        mlflow_experiment_name: str | None = None,
+        mlflow_tracking_uri: str | None = "http://127.0.0.1:5000",
+        mlflow_experiment_name: str | None = "APEX",
     ) -> None:
         if max_iterations is None and convergence_patience is None:
             raise ValueError("At least one of max_iterations or convergence_patience must be specified.")
@@ -462,11 +464,12 @@ class APEX(Teleprompter):
                         )
                         break
 
+                    sampler = self.train_sample if self.train_sample is not None else len(trainset)
                     sampled_train = sample_trainset(
                         trainset,
                         iteration=iteration,
                         rng=self._rng,
-                        sampler=self.train_sample,
+                        sampler=sampler,
                     )
                     self._log(
                         "APEX: iteration "
