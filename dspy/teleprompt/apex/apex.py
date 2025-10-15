@@ -1,21 +1,31 @@
 from __future__ import annotations
 
-import json
 import logging
 import os
 import random
 from pathlib import Path
-from statistics import median
-from typing import Any, Callable, Iterable, Iterator, Sequence
-
-import cloudpickle
-from tqdm.auto import tqdm
+from typing import Sequence
 
 import dspy
 from dspy.adapters import Adapter, JSONAdapter
 from dspy.clients.lm import LM
-from dspy.primitives import Example, Module, Prediction
+from dspy.primitives import Example, Module
+from dspy.teleprompt.teleprompt import Teleprompter
+
 from . import tracking_utils
+from .analysis import (
+    analyze_examples,
+    analyze_successes,
+    build_hypothesis_history_text,
+    generate_hypotheses,
+)
+from .checkpoint_manager import CheckpointManager
+from .evaluation import EvaluationEngine
+from .execution_flow import (
+    extract_execution_flow,
+    format_execution_flow_as_graph,
+    format_execution_flow_with_details,
+)
 from .models import (
     ApexCheckpoint,
     ApexIterationLog,
@@ -24,27 +34,14 @@ from .models import (
     CheckpointConfig,
     ExecutionFlowEntry,
     HypothesisSpec,
-    ProgramSnapshot,
-    TrainExampleRecord,
 )
-from .signatures import (
-    FailureAnalysisSignature,
-    HypothesisGenerationSignature,
-    SuccessAnalysisSignature,
-)
+from .runtime import RuntimeTools
+from .sampling import sample_trainset
+from .snapshot import snapshot_program
+from .state import OptimizationState
 from .tracked_module import track_module
 from .tracker import ExperimentTracker
-from .types import (
-    ItemT,
-    LogLevel,
-    MetricFn,
-    SamplerFn,
-    TraceEntry,
-    Verbosity,
-    verbosity_rank,
-)
-from dspy.teleprompt.teleprompt import Teleprompter
-from dspy.utils.parallelizer import ParallelExecutor
+from .types import LogLevel, MetricFn, SamplerFn, TraceEntry, Verbosity
 
 logger = logging.getLogger(__name__)
 
@@ -173,141 +170,71 @@ class APEX(Teleprompter):
         self._rng = random.Random(self.seed)
         self.include_hypothesis_history = include_hypothesis_history
 
-        self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else None
-        if self.checkpoint_dir:
-            self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-            self._log(f"APEX: Checkpointing enabled at {self.checkpoint_dir}", Verbosity.NORMAL)
+        self.runtime = RuntimeTools(verbosity=self.verbosity, num_threads=self.num_threads, logger=logger)
+        self.checkpoints = CheckpointManager(checkpoint_dir, runtime=self.runtime)
 
         self.tracker = ExperimentTracker(
             use_mlflow=use_mlflow,
             mlflow_tracking_uri=mlflow_tracking_uri,
             mlflow_experiment_name=mlflow_experiment_name,
         )
+        self.evaluator = EvaluationEngine(
+            metric=self.metric,
+            runtime=self.runtime,
+            tracker=self.tracker,
+            min_metric=self.min_metric,
+            max_metric=self.max_metric,
+            success_threshold=self.success_threshold,
+            num_eval_runs=self.num_eval_runs,
+            rng=self._rng,
+            log=self._dispatch_log,
+            is_enabled=self._is_enabled,
+        )
         if use_mlflow:
-            self._log("APEX: MLflow tracking enabled", Verbosity.NORMAL)
+            self.runtime.log("APEX: MLflow tracking enabled", Verbosity.NORMAL)
 
     def _is_enabled(self, level: Verbosity) -> bool:
-        return verbosity_rank(self.verbosity) >= verbosity_rank(level)
+        return self.runtime.is_enabled(level)
 
     def _log(self, message: str, level: Verbosity = Verbosity.NORMAL, log_level: LogLevel = "info") -> None:
-        """Log a message if verbosity level permits.
+        self.runtime.log(message, level=level, log_level=log_level)
 
-        Args:
-            message: The message to log
-            level: The verbosity level required to show this message
-            log_level: The logging level to use (strongly typed: info, warning, debug, error)
-        """
-        if self._is_enabled(level):
-            if log_level == "warning":
-                logger.warning(message)
-            elif log_level == "debug":
-                logger.debug(message)
-            elif log_level == "error":
-                logger.error(message)
-            else:
-                logger.info(message)
+    def _dispatch_log(
+        self,
+        message: str,
+        level: Verbosity = Verbosity.NORMAL,
+        log_level: LogLevel = "info",
+    ) -> None:
+        log_fn = self._log
+        try:
+            log_fn(message, level, log_level)  # type: ignore[misc]
+        except TypeError:
+            log_fn(message, level)  # type: ignore[misc]
 
-    @staticmethod
-    def _normalize_whitespace(text: str) -> str:
-        return " ".join(text.split())
+    def _extract_execution_flow(
+        self,
+        trace: list[TraceEntry],
+        program: Module,
+    ) -> list[ExecutionFlowEntry]:
+        return extract_execution_flow(trace, program)
+
+    def _format_execution_flow_as_graph(self, execution_flow: list[ExecutionFlowEntry]) -> str:
+        return format_execution_flow_as_graph(execution_flow)
+
+    def _format_execution_flow_with_details(self, execution_flow: list[ExecutionFlowEntry]) -> str:
+        return format_execution_flow_with_details(execution_flow)
 
     def _build_hypothesis_history_text(
         self,
         candidate_history: Sequence[CandidateRecord] | None,
     ) -> str:
-        if not self.include_hypothesis_history:
-            return "N/A"
-
-        lines: list[str] = ["Previous hypotheses evaluated (oldest first):"]
-
-        if not candidate_history:
-            lines.append("- No hypotheses have been tried yet.")
-            return "\n".join(lines)
-
-        sorted_candidates = sorted(
-            (candidate for candidate in candidate_history if candidate.hypothesis),
-            key=lambda candidate: candidate.iteration,
+        return build_hypothesis_history_text(
+            include_history=self.include_hypothesis_history,
+            candidate_history=candidate_history,
         )
 
-        if not sorted_candidates:
-            lines.append("- No hypotheses have been tried yet.")
-            return "\n".join(lines)
-
-        for candidate in sorted_candidates:
-            score = candidate.overall_score
-            score_text = f"{score:.4f}" if score is not None else "N/A"
-            lines.append(f"- Iteration {candidate.iteration} (score={score_text}):")
-
-            changes = candidate.hypothesis.prompt_changes
-            if not changes:
-                lines.append("    * No prompt changes recorded")
-                continue
-
-            for predictor_name, change in changes.items():
-                rationale_text = (
-                    self._normalize_whitespace(change.rationale) if change.rationale else "No rationale provided"
-                )
-                magnitude = change.change_magnitude.value
-                lines.append(f"    * {predictor_name} [{magnitude}]: {rationale_text}")
-
-        return "\n".join(lines)
-
-    def _parallel_execute(
-        self,
-        items: Iterable[ItemT],
-        func: Callable[[ItemT], Any],
-        *,
-        description: str,
-        level: Verbosity,
-    ) -> list[Any]:
-        items_list = list(items)
-        if not items_list:
-            return []
-        if self.num_threads <= 1 or len(items_list) <= 1:
-            results: list[Any] = []
-            for item in self._iter_with_progress(items_list, description=description, level=level):
-                results.append(func(item))
-            return results
-        executor = ParallelExecutor(
-            num_threads=self.num_threads,
-            disable_progress_bar=not self._is_enabled(level),
-            max_errors=max(len(items_list), 1),
-            provide_traceback=self._is_enabled(Verbosity.HIGH),
-        )
-        return executor.execute(func, items_list)
-
-    def _iter_with_progress(
-        self,
-        iterable: Iterable[ItemT],
-        *,
-        description: str,
-        level: Verbosity,
-        total: int | None = None,
-    ) -> Iterator[ItemT]:
-        if not self._is_enabled(level):
-            yield from iterable
-            return
-        progress_total = total
-        if progress_total is None and hasattr(iterable, "__len__"):
-            progress_total = len(iterable)  # type: ignore[arg-type]
-        with tqdm(iterable, total=progress_total, desc=description, leave=False) as progress:
-            yield from progress
-
-    def _save_checkpoint(
-        self,
-        iteration: int,
-        current_program: Module,
-        best_candidate: CandidateRecord,
-        all_candidates: list[CandidateRecord],
-        iteration_logs: list[ApexIterationLog],
-        no_improvement_count: int,
-        baseline_candidate: CandidateRecord,
-    ) -> None:
-        """Save checkpoint to disk."""
-        if not self.checkpoint_dir:
-            return
-
-        config = CheckpointConfig(
+    def _build_checkpoint_config(self) -> CheckpointConfig:
+        return CheckpointConfig(
             max_iterations=self.max_iterations,
             num_hypotheses=self.num_hypotheses,
             num_eval_runs=self.num_eval_runs,
@@ -319,53 +246,43 @@ class APEX(Teleprompter):
             seed=self.seed,
         )
 
-        checkpoint = ApexCheckpoint(
+    def _evaluate_candidates(
+        self,
+        *,
+        baseline: Module,
+        hypotheses: Sequence[HypothesisSpec],
+        calset: Sequence[Example],
+        iteration: int,
+        cached_baseline: CandidateRecord | None = None,
+    ) -> list[CandidateRecord]:
+        return self.evaluator.evaluate_candidates(
+            baseline=baseline,
+            hypotheses=hypotheses,
+            calset=calset,
             iteration=iteration,
-            current_program=current_program,
-            best_candidate=best_candidate,
-            all_candidates=all_candidates,
-            iteration_logs=iteration_logs,
-            no_improvement_count=no_improvement_count,
-            baseline_candidate=baseline_candidate,
-            rng_state=self._rng.getstate(),
-            config=config,
+            cached_baseline=cached_baseline,
         )
 
-        checkpoint_path = self.checkpoint_dir / f"checkpoint_iter_{iteration}.pkl"
-        with open(checkpoint_path, "wb") as f:
-            cloudpickle.dump(checkpoint, f)
+    def _evaluate_candidate(
+        self,
+        *,
+        program: Module,
+        calset: Sequence[Example],
+        iteration: int,
+        hypothesis: HypothesisSpec | None,
+    ) -> CandidateRecord:
+        return self.evaluator.evaluate_candidate(
+            program=program,
+            calset=calset,
+            iteration=iteration,
+            hypothesis=hypothesis,
+        )
 
-        latest_path = self.checkpoint_dir / "latest_checkpoint.json"
-        with open(latest_path, "w") as f:
-            json.dump({"iteration": iteration, "checkpoint_file": f"checkpoint_iter_{iteration}.pkl"}, f)
+    def _apply_hypothesis(self, baseline: Module, hypothesis: HypothesisSpec) -> Module:
+        return self.evaluator.apply_hypothesis(baseline, hypothesis)
 
-        self._log(f"APEX: Saved checkpoint at iteration {iteration}", Verbosity.HIGH)
-
-    def _load_checkpoint(self) -> ApexCheckpoint | None:
-        """Load the latest checkpoint if it exists."""
-        if not self.checkpoint_dir:
-            return None
-
-        latest_path = self.checkpoint_dir / "latest_checkpoint.json"
-        if not latest_path.exists():
-            return None
-
-        with open(latest_path) as f:
-            latest_info = json.load(f)
-
-        checkpoint_path = self.checkpoint_dir / latest_info["checkpoint_file"]
-        if not checkpoint_path.exists():
-            self._log(f"APEX: Checkpoint file {checkpoint_path} not found", Verbosity.HIGH, "warning")
-            return None
-
-        with open(checkpoint_path, "rb") as f:
-            checkpoint = cloudpickle.load(f)
-
-        if not isinstance(checkpoint, ApexCheckpoint):
-            raise TypeError(f"Invalid checkpoint type: expected ApexCheckpoint, got {type(checkpoint)}")
-
-        self._log(f"APEX: Loaded checkpoint from iteration {checkpoint.iteration}", Verbosity.NORMAL)
-        return checkpoint
+    def _select_best_candidate(self, candidates: Sequence[CandidateRecord]) -> CandidateRecord:
+        return self.evaluator.select_best_candidate(candidates)
 
     def compile(
         self,
@@ -425,7 +342,7 @@ class APEX(Teleprompter):
             raise ValueError("calibration set (valset) must be provided and non-empty.")
 
         checkpoint: ApexCheckpoint | None = None
-        optimized_program: Module | None = None
+        state: OptimizationState | None = None
 
         with self.tracker:
             if self.tracker.is_active():
@@ -443,100 +360,138 @@ class APEX(Teleprompter):
                     }
                 )
 
-            if resume and self.checkpoint_dir:
-                checkpoint = self._load_checkpoint()
+            if resume and self.checkpoints.enabled:
+                checkpoint = self.checkpoints.load()
+
             if checkpoint:
-                current_program = checkpoint.current_program
-                all_candidates = checkpoint.all_candidates
-                iteration_logs = checkpoint.iteration_logs
-                best_candidate = checkpoint.best_candidate
-                baseline_candidate = checkpoint.baseline_candidate
-                current_baseline_candidate = checkpoint.baseline_candidate
-                no_improvement_count = checkpoint.no_improvement_count
-                iteration = checkpoint.iteration
+                state = OptimizationState.from_checkpoint(checkpoint)
                 self._rng.setstate(checkpoint.rng_state)
-                self._log(f"APEX: Resuming from iteration {iteration}", Verbosity.NORMAL)
+                self._log(
+                    f"APEX: Resuming from iteration {state.iteration}",
+                    Verbosity.NORMAL,
+                )
             else:
                 current_program = student.deepcopy()
                 assert not getattr(current_program, "_compiled", False), "Student must be uncompiled."
 
-                all_candidates: list[CandidateRecord] = []
-                iteration_logs: list[ApexIterationLog] = []
-
-                self._log(f"APEX: running with num_threads={self.num_threads}", Verbosity.NORMAL)
-                max_iter_str = f"{self.max_iterations}" if self.max_iterations is not None else "until convergence"
-                patience_str = f"{self.convergence_patience}" if self.convergence_patience is not None else "disabled"
                 self._log(
-                    f"APEX: Configuration - max_iterations={max_iter_str}, num_hypotheses={self.num_hypotheses}, "
-                    f"success_threshold={self.success_threshold:.2f}, convergence_patience={patience_str}",
+                    f"APEX: running with num_threads={self.num_threads}",
+                    Verbosity.NORMAL,
+                )
+                max_iter_str = (
+                    f"{self.max_iterations}"
+                    if self.max_iterations is not None
+                    else "until convergence"
+                )
+                patience_str = (
+                    f"{self.convergence_patience}"
+                    if self.convergence_patience is not None
+                    else "disabled"
+                )
+                self._log(
+                    "APEX: Configuration - "
+                    f"max_iterations={max_iter_str}, "
+                    f"num_hypotheses={self.num_hypotheses}, "
+                    f"success_threshold={self.success_threshold:.2f}, "
+                    f"convergence_patience={patience_str}",
                     Verbosity.HIGH,
                 )
-                self._log(f"APEX: Using seed={self.seed} for reproducibility", Verbosity.HIGH)
+                self._log(
+                    f"APEX: Using seed={self.seed} for reproducibility",
+                    Verbosity.HIGH,
+                )
+                self._log(
+                    "APEX: Evaluating initial baseline on validation set",
+                    Verbosity.NORMAL,
+                )
 
-                self._log("APEX: Evaluating initial baseline on validation set", Verbosity.NORMAL)
-                baseline_candidate = self._evaluate_candidate(
+                baseline_candidate = self.evaluator.evaluate_candidate(
                     program=current_program.deepcopy(),
                     calset=valset,
                     iteration=0,
                     hypothesis=None,
                 )
-                all_candidates.append(baseline_candidate)
-                best_candidate = baseline_candidate
-                current_baseline_candidate = baseline_candidate
-                self._log(f"APEX: Initial baseline score={baseline_candidate.overall_score:.4f}", Verbosity.NORMAL)
+
+                state = OptimizationState.initialize(
+                    program=current_program,
+                    baseline=baseline_candidate,
+                )
+                self._log(
+                    f"APEX: Initial baseline score={state.baseline_candidate.overall_score:.4f}",
+                    Verbosity.NORMAL,
+                )
 
                 if self.tracker.is_active():
                     baseline_metrics = tracking_utils.format_baseline_metrics(
-                        baseline_score=baseline_candidate.overall_score,
+                        baseline_score=state.baseline_candidate.overall_score,
                         num_train=len(trainset),
                         num_val=len(valset),
                     )
                     self.tracker.log_metrics(baseline_metrics, step=0)
 
-                no_improvement_count = 0
-                iteration = 0
-
-                self._save_checkpoint(
+                self.checkpoints.save(
                     iteration=0,
-                    current_program=current_program,
-                    best_candidate=best_candidate,
-                    all_candidates=all_candidates,
-                    iteration_logs=iteration_logs,
-                    no_improvement_count=no_improvement_count,
-                    baseline_candidate=baseline_candidate,
+                    current_program=state.current_program,
+                    best_candidate=state.best_candidate,
+                    all_candidates=state.all_candidates,
+                    iteration_logs=state.iteration_logs,
+                    no_improvement_count=state.no_improvement_count,
+                    baseline_candidate=state.baseline_candidate,
+                    rng_state=self._rng.getstate(),
+                    config=self._build_checkpoint_config(),
                 )
 
-            stop_reason = ""
+            assert state is not None
 
-            while True:
-                try:
-                    iteration += 1
+            sampled_train: list[Example] = []
+            failure_summaries: list = []
+            success_summaries: list = []
+            hypotheses = []
+            iteration_candidates: list[CandidateRecord] | None = None
+
+            try:
+                while True:
+                    iteration_candidates = None
+                    iteration = state.start_next_iteration()
 
                     if self.max_iterations is not None and iteration > self.max_iterations:
-                        stop_reason = "max_iterations"
-                        self._log("APEX: Stopping due to max iterations reached", Verbosity.NORMAL)
+                        state.stop_reason = "max_iterations"
+                        self._log(
+                            "APEX: Stopping due to max iterations reached",
+                            Verbosity.NORMAL,
+                        )
                         break
-                    sampled_train = self._sample_trainset(trainset, iteration)
+
+                    sampled_train = sample_trainset(
+                        trainset,
+                        iteration=iteration,
+                        rng=self._rng,
+                        sampler=self.train_sample,
+                    )
                     self._log(
-                        f"APEX: iteration {iteration} started (train sample={len(sampled_train)}, val size={len(valset)})",
+                        "APEX: iteration "
+                        f"{iteration} started (train sample={len(sampled_train)}, val size={len(valset)})",
                         Verbosity.NORMAL,
                     )
                     self._log(
-                        f"APEX: Sampled {len(sampled_train)} training examples from {len(trainset)} total", Verbosity.HIGH
+                        f"APEX: Sampled {len(sampled_train)} training examples from {len(trainset)} total",
+                        Verbosity.HIGH,
                     )
-                    baseline_for_analysis = current_program.deepcopy()
 
-                    # Wrap the program with tracking if MLflow is active
+                    baseline_for_analysis = state.current_program.deepcopy()
                     if self.tracker.is_active():
                         baseline_for_analysis = track_module(
                             baseline_for_analysis,
                             run_id=self.tracker.get_run_id(),
-                            iteration=iteration
+                            iteration=iteration,
                         )
 
-                    snapshot = self._snapshot_program(baseline_for_analysis)
+                    snapshot = snapshot_program(baseline_for_analysis)
 
-                    failures, successes = self._evaluate_train_examples(baseline_for_analysis, sampled_train)
+                    failures, successes = self.evaluator.evaluate_train_examples(
+                        baseline_for_analysis,
+                        sampled_train,
+                    )
                     self._log(
                         f"APEX: Train evaluation complete - {len(failures)} failures, {len(successes)} successes",
                         Verbosity.HIGH,
@@ -544,10 +499,11 @@ class APEX(Teleprompter):
 
                     if not failures:
                         self._log(
-                            f"APEX: iteration {iteration} - No failures found! All examples succeeded. Skipping to next iteration.",
+                            "APEX: iteration "
+                            f"{iteration} - No failures found! All examples succeeded. Skipping to next iteration.",
                             Verbosity.NORMAL,
                         )
-                        iteration_logs.append(
+                        state.iteration_logs.append(
                             ApexIterationLog(
                                 iteration=iteration,
                                 sampled_train_size=len(sampled_train),
@@ -557,49 +513,83 @@ class APEX(Teleprompter):
                                 candidates=[],
                             )
                         )
-                        no_improvement_count += 1
+                        state.no_improvement_count += 1
                         if self.convergence_patience is not None:
-                            if no_improvement_count >= self.convergence_patience:
-                                stop_reason = "patience"
+                            if state.no_improvement_count >= self.convergence_patience:
+                                state.stop_reason = "patience"
                                 self._log(
-                                    "APEX: Stopping due to convergence patience reached (all successes)", Verbosity.NORMAL
+                                    "APEX: Stopping due to convergence patience reached (all successes)",
+                                    Verbosity.NORMAL,
                                 )
                                 break
-                        self._save_checkpoint(
+                        self.checkpoints.save(
                             iteration=iteration,
-                            current_program=current_program,
-                            best_candidate=best_candidate,
-                            all_candidates=all_candidates,
-                            iteration_logs=iteration_logs,
-                            no_improvement_count=no_improvement_count,
-                            baseline_candidate=baseline_candidate,
+                            current_program=state.current_program,
+                            best_candidate=state.best_candidate,
+                            all_candidates=state.all_candidates,
+                            iteration_logs=state.iteration_logs,
+                            no_improvement_count=state.no_improvement_count,
+                            baseline_candidate=state.baseline_candidate,
+                            rng_state=self._rng.getstate(),
+                            config=self._build_checkpoint_config(),
                         )
                         continue
 
-                    failure_summaries = self._analyze_examples(failures, mode="failure")
-                    success_summaries = self._analyze_successes(successes, failure_count=len(failure_summaries))
+                    failure_summaries = analyze_examples(
+                        failures,
+                        mode="failure",
+                        analysis_lm=self.analysis_lm,
+                        analysis_adapter=self.analysis_adapter,
+                        runtime=self.runtime,
+                        success_threshold=self.success_threshold,
+                        min_metric=self.min_metric,
+                        max_metric=self.max_metric,
+                        format_execution_flow=format_execution_flow_with_details,
+                        log=self._log,
+                    )
+                    success_summaries = analyze_successes(
+                        success_records=successes,
+                        failure_count=len(failure_summaries),
+                        analysis_lm=self.analysis_lm,
+                        analysis_adapter=self.analysis_adapter,
+                        runtime=self.runtime,
+                        success_threshold=self.success_threshold,
+                        min_metric=self.min_metric,
+                        max_metric=self.max_metric,
+                        format_execution_flow=format_execution_flow_with_details,
+                        log=self._log,
+                    )
                     if self._is_enabled(Verbosity.HIGH):
                         self._log(
-                            f"APEX: iteration {iteration} analyzed {len(failure_summaries)} failure(s) and {len(success_summaries)} success(es)",
+                            "APEX: iteration "
+                            f"{iteration} analyzed {len(failure_summaries)} failure(s) and {len(success_summaries)} success(es)",
                             Verbosity.HIGH,
                         )
 
-                    hypotheses = self._generate_hypotheses(
+                    hypotheses = generate_hypotheses(
                         failure_summaries=failure_summaries,
                         success_summaries=success_summaries,
                         snapshot=snapshot,
-                        candidate_history=all_candidates,
-                        current_val_score=current_baseline_candidate.overall_score,
+                        candidate_history=state.all_candidates,
+                        current_val_score=state.current_baseline_candidate.overall_score,
+                        runtime=self.runtime,
+                        hypothesis_lm=self.hypothesis_lm,
+                        hypothesis_adapter=self.hypothesis_adapter,
+                        num_hypotheses=self.num_hypotheses,
+                        include_history=self.include_hypothesis_history,
+                        rng=self._rng,
+                        log=self._log,
                     )
                     self._log(
                         f"APEX: iteration {iteration} produced {len(hypotheses)} hypothesis(es)",
                         Verbosity.NORMAL,
                     )
                     if hypotheses and self._is_enabled(Verbosity.NORMAL):
-                        for idx, h in enumerate(hypotheses, start=1):
-                            predictors_updated = list(h.prompt_changes.keys()) if h.prompt_changes else []
+                        for idx, hypothesis in enumerate(hypotheses, start=1):
+                            predictors_updated = list(hypothesis.prompt_changes.keys()) if hypothesis.prompt_changes else []
                             self._log(
-                                f"APEX: hypothesis #{idx} - strategy: {h.strategy}, impact: {h.impact_score:.2f}, "
+                                "APEX: hypothesis #"
+                                f"{idx} - strategy: {hypothesis.strategy}, impact: {hypothesis.impact_score:.2f}, "
                                 f"updating: {', '.join(predictors_updated) if predictors_updated else 'no predictors'}",
                                 Verbosity.NORMAL,
                             )
@@ -609,25 +599,27 @@ class APEX(Teleprompter):
                             Verbosity.HIGH,
                         )
 
-                    candidates = self._evaluate_candidates(
-                        baseline=current_program,
+                    iteration_candidates = self.evaluator.evaluate_candidates(
+                        baseline=state.current_program,
                         hypotheses=hypotheses,
                         calset=valset,
                         iteration=iteration,
-                        cached_baseline=current_baseline_candidate if iteration > 1 else None,
+                        cached_baseline=state.current_baseline_candidate if iteration > 1 else None,
                     )
 
-                    best_candidate_for_iteration = self._select_best_candidate(candidates)
+                    best_candidate_for_iteration = self.evaluator.select_best_candidate(
+                        iteration_candidates
+                    )
 
-                    all_candidates.extend(candidates)
-                    iteration_logs.append(
+                    state.all_candidates.extend(iteration_candidates)
+                    state.iteration_logs.append(
                         ApexIterationLog(
                             iteration=iteration,
                             sampled_train_size=len(sampled_train),
                             num_failures=len(failure_summaries),
                             num_successes=len(success_summaries),
                             hypotheses=hypotheses,
-                            candidates=candidates,
+                            candidates=iteration_candidates,
                         )
                     )
 
@@ -637,25 +629,32 @@ class APEX(Teleprompter):
                             num_failures=len(failure_summaries),
                             num_successes=len(success_summaries),
                             hypotheses=hypotheses,
-                            candidates=candidates,
+                            candidates=iteration_candidates,
                             best_score=best_candidate_for_iteration.overall_score,
                         )
                         self.tracker.log_iteration(iteration, iteration_data)
 
-                        for idx, candidate in enumerate(candidates):
+                        for idx, candidate in enumerate(iteration_candidates):
                             candidate_data = tracking_utils.format_candidate_data(candidate)
                             self.tracker.log_candidate(candidate_data, iteration, idx)
 
-
-                    if best_candidate_for_iteration.overall_score > best_candidate.overall_score:
-                        best_candidate = best_candidate_for_iteration
+                    if (
+                        best_candidate_for_iteration.overall_score
+                        > state.best_candidate.overall_score
+                    ):
+                        state.best_candidate = best_candidate_for_iteration
                         self._log(
-                            f"APEX: New best candidate found with score {best_candidate.overall_score:.4f}",
+                            f"APEX: New best candidate found with score {state.best_candidate.overall_score:.4f}",
                             Verbosity.NORMAL,
                         )
-                        if best_candidate.hypothesis and best_candidate.hypothesis.prompt_changes:
+                        if (
+                            state.best_candidate.hypothesis
+                            and state.best_candidate.hypothesis.prompt_changes
+                        ):
                             self._log(
-                                f"APEX: Improved {len(best_candidate.hypothesis.prompt_changes)} predictor prompt(s) - strategy: {best_candidate.hypothesis.strategy}",
+                                "APEX: Improved "
+                                f"{len(state.best_candidate.hypothesis.prompt_changes)} predictor prompt(s) - "
+                                f"strategy: {state.best_candidate.hypothesis.strategy}",
                                 Verbosity.NORMAL,
                             )
                             if self._is_enabled(Verbosity.HIGH):
@@ -663,38 +662,48 @@ class APEX(Teleprompter):
                                     "APEX: Detailed improved prompts:",
                                     Verbosity.HIGH,
                                 )
-                                for predictor_name, changes in best_candidate.hypothesis.prompt_changes.items():
-                                    self._log(
+                                for (
+                                    predictor_name,
+                                    changes,
+                                ) in state.best_candidate.hypothesis.prompt_changes.items():
+                                    preview = (
                                         f"  → {predictor_name}: {changes.new_prompt[:300]}..."
                                         if len(changes.new_prompt) > 300
-                                        else f"  → {predictor_name}: {changes.new_prompt}",
-                                        Verbosity.HIGH,
+                                        else f"  → {predictor_name}: {changes.new_prompt}"
                                     )
+                                    self._log(preview, Verbosity.HIGH)
 
-                    baseline_candidate = candidates[0]
+                    state.baseline_candidate = iteration_candidates[0]
                     self._log(
                         f"APEX: iteration {iteration} best score={best_candidate_for_iteration.overall_score:.4f}",
                         Verbosity.NORMAL,
                     )
 
                     if self._is_enabled(Verbosity.HIGH):
-                        score_improvements = [c.overall_score - baseline_candidate.overall_score for c in candidates[1:]]
+                        score_improvements = [
+                            candidate.overall_score - state.baseline_candidate.overall_score
+                            for candidate in iteration_candidates[1:]
+                        ]
                         if score_improvements:
                             self._log(
                                 f"APEX: Score improvements from baseline: {score_improvements}",
                                 Verbosity.HIGH,
                             )
 
-                    if best_candidate_for_iteration is baseline_candidate:
-                        no_improvement_count += 1
+                    if best_candidate_for_iteration is state.baseline_candidate:
+                        state.no_improvement_count += 1
                         if self.convergence_patience is not None:
                             self._log(
-                                f"APEX: No improvement ({no_improvement_count}/{self.convergence_patience} patience)",
+                                "APEX: No improvement ("
+                                f"{state.no_improvement_count}/{self.convergence_patience} patience)",
                                 Verbosity.HIGH,
                             )
-                            if no_improvement_count >= self.convergence_patience:
-                                stop_reason = "patience"
-                                self._log("APEX: Stopping due to convergence patience reached", Verbosity.NORMAL)
+                            if state.no_improvement_count >= self.convergence_patience:
+                                state.stop_reason = "patience"
+                                self._log(
+                                    "APEX: Stopping due to convergence patience reached",
+                                    Verbosity.NORMAL,
+                                )
                                 break
                         else:
                             self._log(
@@ -702,698 +711,128 @@ class APEX(Teleprompter):
                                 Verbosity.HIGH,
                             )
                     else:
-                        no_improvement_count = 0
-                        current_program = best_candidate_for_iteration.program
-                        current_baseline_candidate = best_candidate_for_iteration
+                        state.no_improvement_count = 0
+                        state.current_program = best_candidate_for_iteration.program
                         self._log(
                             "APEX: Updating program with hypothesis improvements",
                             Verbosity.HIGH,
                         )
 
-                    self._save_checkpoint(
+                    state.current_baseline_candidate = best_candidate_for_iteration
+
+                    self.checkpoints.save(
                         iteration=iteration,
-                        current_program=current_program,
-                        best_candidate=best_candidate,
-                        all_candidates=all_candidates,
-                        iteration_logs=iteration_logs,
-                        no_improvement_count=no_improvement_count,
-                        baseline_candidate=baseline_candidate,
+                        current_program=state.current_program,
+                        best_candidate=state.best_candidate,
+                        all_candidates=state.all_candidates,
+                        iteration_logs=state.iteration_logs,
+                        no_improvement_count=state.no_improvement_count,
+                        baseline_candidate=state.baseline_candidate,
+                        rng_state=self._rng.getstate(),
+                        config=self._build_checkpoint_config(),
                     )
-                except KeyboardInterrupt:
-                    stop_reason = "interrupted"
-                    self._log("APEX: Optimization interrupted by user (Ctrl+C)", Verbosity.NORMAL)
 
-                    if "candidates" in locals() and candidates:
-                        iteration_logs.append(
-                            ApexIterationLog(
-                                iteration=iteration,
-                                sampled_train_size=len(sampled_train) if "sampled_train" in locals() else 0,
-                                num_failures=len(failure_summaries) if "failure_summaries" in locals() else 0,
-                                num_successes=len(success_summaries) if "success_summaries" in locals() else 0,
-                                hypotheses=hypotheses if "hypotheses" in locals() else [],
-                                candidates=candidates,
-                            )
-                        )
+            except KeyboardInterrupt:
+                state.stop_reason = "interrupted"
+                self._log(
+                    "APEX: Optimization interrupted by user (Ctrl+C)",
+                    Verbosity.NORMAL,
+                )
 
-                    if self.checkpoint_dir:
-                        self._save_checkpoint(
-                            iteration=iteration,
-                            current_program=current_program,
-                            best_candidate=best_candidate,
-                            all_candidates=all_candidates,
-                            iteration_logs=iteration_logs,
-                            no_improvement_count=no_improvement_count,
-                            baseline_candidate=baseline_candidate if "baseline_candidate" in locals() else best_candidate,
+                if iteration_candidates:
+                    state.iteration_logs.append(
+                        ApexIterationLog(
+                            iteration=state.iteration,
+                            sampled_train_size=len(sampled_train),
+                            num_failures=len(failure_summaries),
+                            num_successes=len(success_summaries),
+                            hypotheses=hypotheses,
+                            candidates=iteration_candidates,
                         )
-                        self._log(
-                            f"APEX: Checkpoint saved at iteration {iteration} - resume with resume=True", Verbosity.NORMAL
-                        )
-                    break
+                    )
+
+                if self.checkpoints.enabled:
+                    baseline_for_checkpoint = state.baseline_candidate or state.best_candidate
+                    self.checkpoints.save(
+                        iteration=state.iteration,
+                        current_program=state.current_program,
+                        best_candidate=state.best_candidate,
+                        all_candidates=state.all_candidates,
+                        iteration_logs=state.iteration_logs,
+                        no_improvement_count=state.no_improvement_count,
+                        baseline_candidate=baseline_for_checkpoint,
+                        rng_state=self._rng.getstate(),
+                        config=self._build_checkpoint_config(),
+                    )
+                    self._log(
+                        f"APEX: Checkpoint saved at iteration {state.iteration} - resume with resume=True",
+                        Verbosity.NORMAL,
+                    )
+
+        if not state.stop_reason:
+            state.stop_reason = "completed"
 
         self._log(
-            f"APEX: Optimization complete - stopped after {len(iteration_logs)} iterations ({stop_reason})",
+            f"APEX: Optimization complete - stopped after {len(state.iteration_logs)} iterations ({state.stop_reason})",
             Verbosity.NORMAL,
         )
         self._log(
-            f"APEX: Final score: {best_candidate.overall_score:.4f} (initial baseline: {baseline_candidate.overall_score:.4f})",
+            "APEX: Final score: "
+            f"{state.best_candidate.overall_score:.4f} (initial baseline: {state.initial_baseline.overall_score:.4f})",
             Verbosity.NORMAL,
         )
 
         if self.tracker.is_active():
             summary = tracking_utils.format_optimization_summary(
-                best_candidate=best_candidate,
-                all_candidates=all_candidates,
-                iterations=iteration_logs,
-                stopped_after=stop_reason,
-                initial_score=baseline_candidate.overall_score,
+                best_candidate=state.best_candidate,
+                all_candidates=state.all_candidates,
+                iterations=state.iteration_logs,
+                stopped_after=state.stop_reason,
+                initial_score=state.initial_baseline.overall_score,
             )
             self.tracker.log_metrics(summary)
 
-            if best_candidate.hypothesis:
+            if state.best_candidate.hypothesis:
                 best_program_data = {
-                    "overall_score": best_candidate.overall_score,
-                    "iteration": best_candidate.iteration,
-                    "hypothesis_strategy": best_candidate.hypothesis.strategy
-                    if hasattr(best_candidate.hypothesis, "strategy")
-                    else "unknown",
+                    "overall_score": state.best_candidate.overall_score,
+                    "iteration": state.best_candidate.iteration,
+                    "hypothesis_strategy": (
+                        state.best_candidate.hypothesis.strategy
+                        if hasattr(state.best_candidate.hypothesis, "strategy")
+                        else "unknown"
+                    ),
                     "prompt_changes": {},
                 }
-                if best_candidate.hypothesis.prompt_changes:
-                    for pred_name, change in best_candidate.hypothesis.prompt_changes.items():
+                if state.best_candidate.hypothesis.prompt_changes:
+                    for pred_name, change in state.best_candidate.hypothesis.prompt_changes.items():
                         best_program_data["prompt_changes"][pred_name] = {
                             "new_prompt": change.new_prompt,
                             "rationale": change.rationale if hasattr(change, "rationale") else "",
                         }
                 self.tracker.log_best_program(best_program_data)
         if self._is_enabled(Verbosity.HIGH):
-            total_candidates = sum(len(log.candidates) for log in iteration_logs)
-            total_hypotheses = sum(len(log.hypotheses) for log in iteration_logs)
+            total_candidates = sum(len(log.candidates) for log in state.iteration_logs)
+            total_hypotheses = sum(len(log.hypotheses) for log in state.iteration_logs)
             self._log(
                 f"APEX: Summary - evaluated {total_candidates} candidates from {total_hypotheses} hypotheses",
                 Verbosity.HIGH,
             )
             score_trajectory = [
-                max(c.overall_score for c in log.candidates) if log.candidates else 0.0 for log in iteration_logs
+                max(c.overall_score for c in log.candidates) if log.candidates else 0.0
+                for log in state.iteration_logs
             ]
             self._log(
                 f"APEX: Best score trajectory across iterations: {score_trajectory}",
                 Verbosity.HIGH,
             )
 
-        optimized_program = best_candidate.program
+        optimized_program = state.best_candidate.program
         optimized_program._compiled = True
         optimized_program.apex_result = ApexOptimizationResult(
-            best_candidate=best_candidate,
-            all_candidates=all_candidates,
-            iterations=iteration_logs,
-            stopped_after=stop_reason,
+            best_candidate=state.best_candidate,
+            all_candidates=state.all_candidates,
+            iterations=state.iteration_logs,
+            stopped_after=state.stop_reason,
         )
         return optimized_program
 
-    def _sample_trainset(self, trainset: Sequence[Example], iteration: int) -> list[Example]:
-        if self.train_sample is None:
-            sampled = list(trainset)
-            self._rng.shuffle(sampled)
-            return sampled
-
-        if isinstance(self.train_sample, int):
-            k = min(self.train_sample, len(trainset))
-            return self._rng.sample(list(trainset), k=k)
-
-        sampled = self.train_sample(list(trainset), iteration)
-        if not isinstance(sampled, list):
-            raise TypeError("Custom train_sample callable must return a list of Examples.")
-        return sampled
-
-    def _evaluate_train_examples(
-        self,
-        program: Module,
-        trainset: Iterable[Example],
-    ) -> tuple[list[TrainExampleRecord], list[TrainExampleRecord]]:
-        failure_records: list[TrainExampleRecord] = []
-        success_records: list[TrainExampleRecord] = []
-
-        examples = list(trainset)
-
-        def process(example: Example) -> TrainExampleRecord:
-            return self._run_single_example(program, example)
-
-        records = self._parallel_execute(
-            examples,
-            process,
-            description="APEX: evaluating trainset",
-            level=Verbosity.NORMAL,
-        )
-
-        for record in records:
-            if record.is_success:
-                success_records.append(record)
-            else:
-                failure_records.append(record)
-        return failure_records, success_records
-
-    def _run_single_example(
-        self,
-        program: Module,
-        example: Example,
-    ) -> TrainExampleRecord:
-        input_kwargs = example.inputs().toDict()
-
-        prediction_obj: Prediction | None = None
-        error_message: str | None = None
-        raw_trace: list[TraceEntry] = []
-
-        with dspy.settings.context(trace=[]):
-            try:
-                prediction_obj = program(**input_kwargs)
-            except Exception as exc:
-                self._log(f"APEX: Program execution failed on example: {str(exc)[:200]}", Verbosity.HIGH, "warning")
-                error_message = f"execution_error: {exc}"
-
-        raw_trace = list(dspy.settings.trace or [])
-        execution_flow = self._extract_execution_flow(raw_trace, program)
-
-        metric_score = self.min_metric
-        metric_feedback: str | None = None
-        try:
-            if prediction_obj is not None:
-                metric_score, metric_feedback = self._evaluate_metric(example, prediction_obj, raw_trace)
-            else:
-                metric_score = self.min_metric
-                if error_message:
-                    self._log(
-                        f"APEX: No prediction to evaluate due to error: {error_message[:100]}", Verbosity.HIGH, "debug"
-                    )
-        except Exception as exc:
-            self._log(f"APEX: Metric evaluation failed: {str(exc)[:200]}", Verbosity.HIGH, "warning")
-            metric_score = self.min_metric
-            metric_feedback = f"metric_error: {exc}"
-
-        metric_score = max(self.min_metric, min(self.max_metric, metric_score))
-        is_success = metric_score >= self.success_threshold
-
-        return TrainExampleRecord(
-            example=example,
-            prediction=prediction_obj,
-            metric_score=metric_score,
-            metric_feedback=metric_feedback,
-            is_success=is_success,
-            error=error_message,
-            execution_flow=execution_flow,
-        )
-
-    def _extract_execution_flow(
-        self,
-        trace: list[TraceEntry],
-        program: Module,
-    ) -> list[ExecutionFlowEntry]:
-        """Extract structured execution flow from raw trace."""
-        execution_flow: list[ExecutionFlowEntry] = []
-        predictor_lookup = dict(program.named_predictors())
-
-        def normalize_value(value: Any) -> Any:
-            if isinstance(value, Prediction | Example):
-                return {k: normalize_value(v) for k, v in value.toDict().items()}
-            if isinstance(value, dict):
-                return {str(k): normalize_value(v) for k, v in value.items()}
-            if isinstance(value, list | tuple):
-                return [normalize_value(v) for v in value]
-            if isinstance(value, set):
-                return sorted(normalize_value(v) for v in value)
-            return value
-
-        def value_key(value: Any) -> str:
-            normalized = normalize_value(value)
-            try:
-                return json.dumps(normalized, sort_keys=True, ensure_ascii=False, default=str)
-            except TypeError:
-                return repr(normalized)
-
-        def stringify(value: Any) -> str:
-            normalized = normalize_value(value)
-            try:
-                return json.dumps(normalized, sort_keys=True, ensure_ascii=False, default=str)
-            except TypeError:
-                return repr(normalized)
-
-        value_sources_by_field: dict[str, list[str]] = {}
-        value_sources_by_value: dict[str, list[str]] = {}
-
-        for predictor_obj, inputs, outputs in trace:
-            predictor_name = "unknown"
-            predictor_type = type(predictor_obj).__name__
-
-            for name, pred in predictor_lookup.items():
-                if pred is predictor_obj:
-                    predictor_name = name
-                    break
-
-            instructions = ""
-            if hasattr(predictor_obj, "signature") and hasattr(predictor_obj.signature, "instructions"):
-                instructions = predictor_obj.signature.instructions
-
-            normalized_inputs = {str(k): normalize_value(v) for k, v in dict(inputs).items()}
-
-            normalized_outputs: dict[str, Any] = {}
-            if isinstance(outputs, Prediction | Example):
-                normalized_outputs = {str(k): normalize_value(v) for k, v in outputs.toDict().items()}
-            elif outputs is not None:
-                normalized_outputs = {"value": normalize_value(outputs)}
-
-            dependencies: set[str] = set()
-            input_sources: dict[str, list[str]] = {}
-
-            for input_name, input_value in normalized_inputs.items():
-                key = value_key(input_value)
-                field_key = f"{input_name}::{key}"
-                source_candidates: list[str] = []
-
-                if value_sources_by_field.get(field_key):
-                    source_candidates = [value_sources_by_field[field_key][-1]]
-                elif value_sources_by_value.get(key):
-                    source_candidates = [value_sources_by_value[key][-1]]
-
-                if source_candidates:
-                    unique_sources = list(dict.fromkeys(source_candidates))
-                    dependencies.update(unique_sources)
-                    input_sources[input_name] = unique_sources
-
-            execution_flow.append(
-                ExecutionFlowEntry(
-                    predictor_name=predictor_name,
-                    predictor_type=predictor_type,
-                    inputs=stringify(normalized_inputs),
-                    outputs=stringify(normalized_outputs) if normalized_outputs else "{}",
-                    instructions=instructions,
-                    dependencies=sorted(dependencies),
-                    input_sources={k: sorted(v) for k, v in sorted(input_sources.items())},
-                )
-            )
-
-            for output_name, output_value in normalized_outputs.items():
-                key = value_key(output_value)
-                field_key = f"{output_name}::{key}"
-                value_sources_by_field.setdefault(field_key, []).append(predictor_name)
-                value_sources_by_value.setdefault(key, []).append(predictor_name)
-
-        return execution_flow
-
-    def _format_execution_flow_as_graph(self, execution_flow: list[ExecutionFlowEntry]) -> str:
-        """Format execution flow as a relationship graph showing predictor dependencies."""
-        if not execution_flow:
-            return "No execution flow available"
-
-        if len(execution_flow) == 1:
-            entry = execution_flow[0]
-            return (
-                "Program DAG:\n"
-                "  Input\n"
-                f"    ↳ {entry.predictor_name}\n"
-                f"  {entry.predictor_name} ({entry.predictor_type})\n"
-                "    depends on: Input\n"
-                "    feeds: Output"
-            )
-
-        flow_lines: list[str] = ["Program DAG:"]
-
-        children_map: dict[str, set[str]] = {entry.predictor_name: set() for entry in execution_flow}
-        root_nodes: list[str] = []
-
-        for entry in execution_flow:
-            if entry.dependencies:
-                for dependency in entry.dependencies:
-                    children_map.setdefault(dependency, set()).add(entry.predictor_name)
-            else:
-                root_nodes.append(entry.predictor_name)
-
-        if root_nodes:
-            flow_lines.append("  Input")
-            flow_lines.append(f"    ↳ {', '.join(sorted(root_nodes))}")
-        else:
-            flow_lines.append("  Input (no predictors depend directly on program input)")
-
-        for entry in execution_flow:
-            flow_lines.append(f"  {entry.predictor_name} ({entry.predictor_type})")
-            if entry.dependencies:
-                flow_lines.append(f"    depends on: {', '.join(entry.dependencies)}")
-            else:
-                flow_lines.append("    depends on: Input")
-
-            children = sorted(children_map.get(entry.predictor_name, set()))
-            if children:
-                flow_lines.append(f"    feeds: {', '.join(children)}")
-            else:
-                flow_lines.append("    feeds: Output")
-
-        return "\n".join(flow_lines)
-
-    def _format_execution_flow_with_details(self, execution_flow: list[ExecutionFlowEntry]) -> str:
-        """Format execution flow with instructions and I/O values for analysis."""
-        if not execution_flow:
-            return "No execution flow available"
-
-        flow_parts: list[str] = []
-
-        flow_parts.append(self._format_execution_flow_as_graph(execution_flow))
-        flow_parts.append("\nPredictor Instructions and Data Flow:")
-
-        for idx, entry in enumerate(execution_flow, start=1):
-            instructions = entry.instructions if entry.instructions else "No instructions"
-            dependencies = ", ".join(entry.dependencies) if entry.dependencies else "Input"
-            flow_parts.append(
-                f"\n{idx}. {entry.predictor_name} ({entry.predictor_type}):\n"
-                f"   Instructions: {instructions}\n"
-                f"   Depends on: {dependencies}"
-            )
-
-            if entry.input_sources:
-                flow_parts.append("   Inputs sourced from:")
-                for input_name, sources in entry.input_sources.items():
-                    flow_parts.append(f"     - {input_name}: {', '.join(sources)}")
-            else:
-                flow_parts.append("   Inputs sourced from: program input or constants")
-
-            flow_parts.append(f"   Actual inputs: {entry.inputs}")
-            flow_parts.append(f"   Actual outputs: {entry.outputs}")
-
-        return "\n".join(flow_parts)
-
-    def _evaluate_metric(
-        self,
-        example: Example,
-        prediction: Prediction,
-        trace_entries: list[TraceEntry],
-    ) -> tuple[float, str | None]:
-        result = self.metric(example, prediction, trace_entries)
-        if isinstance(result, dict):
-            if "score" not in result:
-                raise ValueError("Metric dict must contain a 'score' key.")
-            score = float(result["score"])
-            feedback = result.get("feedback")
-            return score, feedback
-        if isinstance(result, Prediction):
-            score = float(result["score"])
-            feedback = result.get("feedback") if "feedback" in result else None
-            return score, feedback
-        if isinstance(result, bool):
-            return (1.0 if result else 0.0), None
-        if isinstance(result, int | float):
-            return float(result), None
-        raise TypeError(f"Unsupported metric return type: {type(result)}")
-
-    def _analyze_examples(
-        self,
-        records: list[TrainExampleRecord],
-        mode: str,
-    ) -> list[Prediction]:
-        if not records:
-            return []
-
-        signature_class = FailureAnalysisSignature if mode == "failure" else SuccessAnalysisSignature
-        analysis_lm = self.analysis_lm
-        analysis_adapter = self.analysis_adapter
-
-        def process(record: TrainExampleRecord) -> Prediction:
-            with dspy.context(lm=analysis_lm, adapter=analysis_adapter):
-                predictor = dspy.Predict(signature_class)
-
-                inputs = record.example.inputs().toDict()
-                expected = record.example.labels().toDict()
-
-                execution_flow_str = self._format_execution_flow_with_details(record.execution_flow)
-
-                if mode == "failure":
-                    call_inputs = {
-                        "problem": str(inputs),
-                        "prediction": str(record.prediction) if record.prediction else "",
-                        "expected": str(expected),
-                        "error": record.error or "",
-                        "execution_flow": execution_flow_str,
-                        "metric_score": record.metric_score,
-                        "metric_feedback": record.metric_feedback or "N/A",
-                        "success_threshold": self.success_threshold,
-                        "min_metric": self.min_metric,
-                        "max_metric": self.max_metric,
-                    }
-                    result = predictor(**call_inputs)
-                else:
-                    result = predictor(
-                        problem=str(inputs),
-                        prediction=str(record.prediction) if record.prediction else "",
-                        expected=str(expected),
-                        execution_flow=execution_flow_str,
-                        metric_score=record.metric_score,
-                        metric_feedback=record.metric_feedback or "N/A",
-                        success_threshold=self.success_threshold,
-                        min_metric=self.min_metric,
-                        max_metric=self.max_metric,
-                    )
-
-            return result
-
-        analyses = self._parallel_execute(
-            records,
-            process,
-            description=f"APEX: analyzing {mode}s",
-            level=Verbosity.HIGH,
-        )
-
-        if self._is_enabled(Verbosity.HIGH):
-            for index, analysis in enumerate(analyses, start=1):
-                if mode == "failure":
-                    self._log(
-                        f"APEX: failure analysis #{index} ({analysis.category}) → {analysis.root_cause}",
-                        Verbosity.HIGH,
-                    )
-                else:
-                    self._log(
-                        f"APEX: success analysis #{index} ({analysis.category}) → {analysis.success_pattern}",
-                        Verbosity.HIGH,
-                    )
-        return analyses
-
-    def _analyze_successes(
-        self,
-        success_records: list[TrainExampleRecord],
-        failure_count: int,
-    ) -> list[Prediction]:
-        if not success_records or failure_count == 0:
-            return []
-        return self._analyze_examples(success_records, mode="success")
-
-    def _generate_hypotheses(
-        self,
-        *,
-        failure_summaries: list[Prediction],
-        success_summaries: list[Prediction],
-        snapshot: ProgramSnapshot,
-        candidate_history: Sequence[CandidateRecord] | None = None,
-        current_val_score: float | None = None,
-    ) -> list[HypothesisSpec]:
-        if not failure_summaries or self.num_hypotheses == 0:
-            self._log("APEX: No hypotheses to generate (no failures or num_hypotheses=0)", Verbosity.HIGH)
-            return []
-
-        shuffled_failures = list(failure_summaries)
-        self._rng.shuffle(shuffled_failures)
-
-        self._log(
-            f"APEX: Generating up to {self.num_hypotheses} hypotheses from {len(failure_summaries)} failures",
-            Verbosity.HIGH,
-        )
-
-        failure_text = "\n".join([f"- {f.root_cause} (category: {f.category})" for f in failure_summaries])
-        success_text = (
-            "\n".join([f"- {s.success_pattern} (category: {s.category})" for s in success_summaries])
-            if success_summaries
-            else "No success patterns available"
-        )
-
-        program_flow = snapshot.flow_description
-
-        history_text = self._build_hypothesis_history_text(candidate_history)
-        current_val_text = f"{current_val_score:.4f}" if current_val_score is not None else "N/A"
-
-        with dspy.context(lm=self.hypothesis_lm, adapter=self.hypothesis_adapter):
-            predictor = dspy.Predict(HypothesisGenerationSignature)
-            result = predictor(
-                failure_analyses=failure_text,
-                success_analyses=success_text,
-                program_flow=program_flow,
-                current_validation_score=current_val_text,
-                hypothesis_history=history_text,
-                num_hypotheses=self.num_hypotheses,
-            )
-
-        validated_specs = result.hypotheses if result.hypotheses else []
-        validated_specs.sort(key=lambda h: (h.impact_score, h.generalizability_score), reverse=True)
-
-        validated_specs = validated_specs[: self.num_hypotheses]
-
-        if self._is_enabled(Verbosity.HIGH):
-            for idx, spec in enumerate(validated_specs, start=1):
-                self._log(
-                    f"APEX: hypothesis #{idx} ({spec.strategy}) targeting {', '.join(spec.fixable_root_causes) or 'no fixable causes'} "
-                    f"[impact={spec.impact_score:.2f}, generalizability={spec.generalizability_score:.2f}]",
-                    Verbosity.HIGH,
-                )
-                for predictor_name, changes in spec.prompt_changes.items():
-                    self._log(
-                        f"  → {predictor_name}: {changes.new_prompt[:200]}..."
-                        if len(changes.new_prompt) > 200
-                        else f"  → {predictor_name}: {changes.new_prompt}",
-                        Verbosity.HIGH,
-                    )
-                    if changes.rationale:
-                        self._log(
-                            f"     Rationale: {changes.rationale}",
-                            Verbosity.HIGH,
-                        )
-        return validated_specs
-
-    def _evaluate_candidates(
-        self,
-        *,
-        baseline: Module,
-        hypotheses: list[HypothesisSpec],
-        calset: list[Example],
-        iteration: int,
-        cached_baseline: CandidateRecord | None = None,
-    ) -> list[CandidateRecord]:
-        candidates: list[CandidateRecord] = []
-
-        if cached_baseline:
-            baseline_record = CandidateRecord(
-                program=baseline,
-                overall_score=cached_baseline.overall_score,
-                per_example_scores=cached_baseline.per_example_scores,
-                iteration=iteration,
-                hypothesis=None,
-            )
-        else:
-            baseline_record = self._evaluate_candidate(
-                program=baseline.deepcopy(),
-                calset=calset,
-                iteration=iteration,
-                hypothesis=None,
-            )
-
-        candidates.append(baseline_record)
-        self._log(
-            f"APEX: iteration {iteration} baseline score={baseline_record.overall_score:.4f}",
-            Verbosity.NORMAL,
-        )
-
-        for hypothesis in hypotheses:
-            candidate_program = self._apply_hypothesis(baseline, hypothesis)
-            record = self._evaluate_candidate(
-                program=candidate_program,
-                calset=calset,
-                iteration=iteration,
-                hypothesis=hypothesis,
-            )
-            candidates.append(record)
-            self._log(
-                f"APEX: iteration {iteration} hypothesis score={record.overall_score:.4f}",
-                Verbosity.NORMAL,
-            )
-            if self._is_enabled(Verbosity.HIGH):
-                self._log(
-                    f"APEX: hypothesis details → {hypothesis.model_dump()}",
-                    Verbosity.HIGH,
-                )
-        return candidates
-
-    def _evaluate_candidate(
-        self,
-        *,
-        program: Module,
-        calset: list[Example],
-        iteration: int,
-        hypothesis: HypothesisSpec | None,
-    ) -> CandidateRecord:
-        label = "baseline" if hypothesis is None else "hypothesis"
-        cal_examples = list(calset)
-
-        # Wrap program with tracking if MLflow is active
-        if self.tracker.is_active():
-            program = track_module(program, run_id=self.tracker.get_run_id(), iteration=iteration)
-
-        def process(example: Example) -> float:
-            try:
-                per_runs: list[float] = []
-                for run_idx in range(self.num_eval_runs):
-                    with dspy.settings.context(trace=[]):
-                        prediction = program(**example.inputs().toDict())
-                        trace_entries = list(dspy.settings.trace or [])
-                    score, _ = self._evaluate_metric(example, prediction, trace_entries)
-                    score = max(self.min_metric, min(self.max_metric, score))
-                    per_runs.append(score)
-                return median(per_runs)
-            except Exception as e:
-                self._log(f"APEX: Error evaluating example: {str(e)[:200]}", Verbosity.NORMAL, "warning")
-                return self.min_metric
-
-        scores = self._parallel_execute(
-            cal_examples,
-            process,
-            description=f"APEX: evaluating {label}",
-            level=Verbosity.NORMAL,
-        )
-
-        valid_scores = [s for s in scores if s is not None]
-        if not valid_scores:
-            self._log(f"APEX: Warning - no valid scores obtained for {label}", Verbosity.NORMAL, "warning")
-            valid_scores = [self.min_metric]
-
-        overall = sum(valid_scores) / len(valid_scores)
-
-        return CandidateRecord(
-            program=program,
-            overall_score=overall,
-            per_example_scores=valid_scores,
-            iteration=iteration,
-            hypothesis=hypothesis,
-        )
-
-    def _apply_hypothesis(self, baseline: Module, hypothesis: HypothesisSpec) -> Module:
-        candidate = baseline.deepcopy()
-        name_to_predictor = dict(candidate.named_predictors())
-        for predictor_name, changes in hypothesis.prompt_changes.items():
-            if predictor_name not in name_to_predictor:
-                raise ValueError(f"Hypothesis references unknown predictor '{predictor_name}'.")
-            predictor = name_to_predictor[predictor_name]
-            predictor.signature.instructions = changes.new_prompt
-        return candidate
-
-    def _select_best_candidate(self, candidates: list[CandidateRecord]) -> CandidateRecord:
-        best_score = max(c.overall_score for c in candidates)
-        best_candidates = [c for c in candidates if c.overall_score == best_score]
-        return self._rng.choice(best_candidates)
-
-
-    def _snapshot_program(self, program: Module) -> ProgramSnapshot:
-        prompts: dict[str, str] = {}
-        flow = []
-        lookup: dict[int, str] = {}
-
-        for name, predictor in program.named_predictors():
-            flow.append(name)
-            prompts[name] = getattr(predictor.signature, "instructions", "")
-            lookup[id(predictor)] = name
-
-        structure = repr(program)
-
-        if not flow:
-            flow_description = "No predictors"
-        elif len(flow) == 1:
-            flow_description = f"Single predictor: {flow[0]}"
-        else:
-            flow_description = "Input → " + " → ".join(flow) + " → Output"
-
-        return ProgramSnapshot(
-            structure=structure,
-            flow_description=flow_description,
-            prompts=prompts,
-            predictor_name_by_id=lookup,
-        )
