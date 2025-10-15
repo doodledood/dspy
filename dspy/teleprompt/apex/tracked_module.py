@@ -45,7 +45,7 @@ class TrackedPredictor:
         }
 
         # Capture signature instructions if available
-        if hasattr(self._wrapped_predictor, 'signature') and hasattr(self._wrapped_predictor.signature, 'instructions'):
+        if hasattr(self._wrapped_predictor, "signature") and hasattr(self._wrapped_predictor.signature, "instructions"):
             call_info["instructions"] = self._wrapped_predictor.signature.instructions[:500]  # Truncate for logging
 
         # Log inputs
@@ -92,10 +92,10 @@ class TrackedPredictor:
             # Log full trace as artifact
             artifact_name = f"predictor_traces_iter_{self._iteration}.jsonl" if self._iteration else "predictor_traces.jsonl"
 
-            import tempfile
             import os
+            import tempfile
 
-            with tempfile.NamedTemporaryFile(mode='a', suffix=f"_{artifact_name}", delete=False) as f:
+            with tempfile.NamedTemporaryFile(mode="a", suffix=f"_{artifact_name}", delete=False) as f:
                 f.write(json.dumps(call_info) + "\n")
                 temp_path = f.name
 
@@ -141,7 +141,7 @@ class TrackedModule(dspy.Module):
             if not isinstance(predictor, TrackedPredictor):
                 wrapped = TrackedPredictor(predictor, name, self._run_id, self._iteration)
                 # Replace the predictor in the module
-                parts = name.split('.')
+                parts = name.split(".")
                 obj = self._wrapped_module
                 for part in parts[:-1]:
                     obj = getattr(obj, part)
@@ -149,7 +149,7 @@ class TrackedModule(dspy.Module):
 
         # Wrap all sub-modules
         for attr_name in dir(self._wrapped_module):
-            if not attr_name.startswith('_'):
+            if not attr_name.startswith("_"):
                 attr = getattr(self._wrapped_module, attr_name)
                 if isinstance(attr, dspy.Module) and not isinstance(attr, TrackedModule):
                     # Recursively wrap the sub-module
@@ -215,10 +215,10 @@ class TrackedModule(dspy.Module):
             # Log full trace as artifact
             artifact_name = f"module_traces_iter_{self._iteration}.jsonl" if self._iteration else "module_traces.jsonl"
 
-            import tempfile
             import os
+            import tempfile
 
-            with tempfile.NamedTemporaryFile(mode='a', suffix=f"_{artifact_name}", delete=False) as f:
+            with tempfile.NamedTemporaryFile(mode="a", suffix=f"_{artifact_name}", delete=False) as f:
                 f.write(json.dumps(call_info) + "\n")
                 temp_path = f.name
 
