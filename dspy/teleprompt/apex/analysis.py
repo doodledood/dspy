@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+from contextlib import nullcontext
 from typing import Callable, Sequence
 
 import dspy
@@ -8,7 +9,6 @@ from dspy.adapters import Adapter
 from dspy.clients.lm import LM
 from dspy.primitives import Prediction
 
-from .mlflow_utils import create_analysis_trace, create_hypothesis_trace, end_trace
 from .models import (
     CandidateRecord,
     ExecutionFlowEntry,
@@ -22,6 +22,7 @@ from .signatures import (
     HypothesisGenerationSignature,
     SuccessAnalysisSignature,
 )
+from .tracker import ExperimentTracker
 from .types import Verbosity
 
 
@@ -73,13 +74,13 @@ def analyze_examples(
     analysis_lm: LM,
     analysis_adapter: Adapter,
     runtime: RuntimeTools,
+    tracker: ExperimentTracker,
     success_threshold: float,
     min_metric: float,
     max_metric: float,
     format_execution_flow: Callable[[list[ExecutionFlowEntry]], str],
     log: Callable[[str, Verbosity], None] | None = None,
     iteration: int | None = None,
-    tracing_enabled: bool = False,
 ) -> list[Prediction]:
     if not records:
         return []
@@ -91,54 +92,64 @@ def analyze_examples(
 
     def process(item: tuple[int, TrainExampleRecord]) -> Prediction:
         idx, record = item
-        trace = None
-        if tracing_enabled and iteration is not None:
-            trace = create_analysis_trace(
-                analysis_type=mode,
-                iteration=iteration,
-                example_data={"metric_score": record.metric_score, "example_index": idx},
-            )
 
-        try:
-            with dspy.context(lm=analysis_lm, adapter=analysis_adapter):
-                predictor = dspy.Predict(signature_class)
+        span_inputs = {
+            "inputs": record.example.inputs().toDict(),
+            "labels": record.example.labels().toDict(),
+            "metric_score": record.metric_score,
+        }
 
-                inputs = record.example.inputs().toDict()
-                expected = record.example.labels().toDict()
-                execution_flow_str = format_execution_flow(record.execution_flow)
+        attributes = {
+            "analysis_mode": mode,
+            "iteration": iteration if iteration is not None else -1,
+            "example_index": idx,
+        }
 
-                call_inputs = {
-                    "problem": str(inputs),
-                    "prediction": str(record.prediction) if record.prediction else "",
-                    "expected": str(expected),
-                    "execution_flow": execution_flow_str,
-                    "metric_score": record.metric_score,
-                    "metric_feedback": record.metric_feedback or "N/A",
-                    "success_threshold": success_threshold,
-                    "min_metric": min_metric,
-                    "max_metric": max_metric,
-                }
+        with tracker.span(f"apex.analysis.{mode}", inputs=span_inputs, attributes=attributes) as span:
+            try:
+                with dspy.context(lm=analysis_lm, adapter=analysis_adapter):
+                    predictor = dspy.Predict(signature_class)
 
-                if mode == "failure":
-                    call_inputs["error"] = record.error or ""
+                    inputs = record.example.inputs().toDict()
+                    expected = record.example.labels().toDict()
+                    execution_flow_str = format_execution_flow(record.execution_flow)
 
-                result = predictor(**call_inputs)
+                    call_inputs = {
+                        "problem": str(inputs),
+                        "prediction": str(record.prediction) if record.prediction else "",
+                        "expected": str(expected),
+                        "execution_flow": execution_flow_str,
+                        "metric_score": record.metric_score,
+                        "metric_feedback": record.metric_feedback or "N/A",
+                        "success_threshold": success_threshold,
+                        "min_metric": min_metric,
+                        "max_metric": max_metric,
+                    }
 
-            if trace:
-                outputs = {
-                    "category": result.category if hasattr(result, "category") else "unknown",
-                }
-                if mode == "failure":
-                    outputs["root_cause"] = result.root_cause if hasattr(result, "root_cause") else ""
-                else:
-                    outputs["success_pattern"] = result.success_pattern if hasattr(result, "success_pattern") else ""
-                end_trace(trace, outputs)
+                    if mode == "failure":
+                        call_inputs["error"] = record.error or ""
 
-            return result
-        except Exception as e:
-            if trace:
-                end_trace(trace, {"error": str(e)[:200]})
-            raise
+                    result = predictor(**call_inputs)
+
+                if span and hasattr(span, "set_outputs"):
+                    try:
+                        payload = {"category": getattr(result, "category", "unknown")}
+                        if mode == "failure":
+                            payload["root_cause"] = getattr(result, "root_cause", "")
+                        else:
+                            payload["success_pattern"] = getattr(result, "success_pattern", "")
+                        span.set_outputs(payload)
+                    except Exception:  # pragma: no cover - defensive
+                        pass
+
+                return result
+            except Exception as exc:
+                if span and hasattr(span, "set_attribute"):
+                    try:
+                        span.set_attribute("error", str(exc)[:200])
+                    except Exception:  # pragma: no cover - defensive
+                        pass
+                raise
 
     analyses = runtime.parallel_execute(
         indexed_records,
@@ -169,13 +180,13 @@ def analyze_successes(
     analysis_lm: LM,
     analysis_adapter: Adapter,
     runtime: RuntimeTools,
+    tracker: ExperimentTracker,
     success_threshold: float,
     min_metric: float,
     max_metric: float,
     format_execution_flow: Callable[[list[ExecutionFlowEntry]], str],
     log: Callable[[str, Verbosity], None] | None = None,
     iteration: int | None = None,
-    tracing_enabled: bool = False,
 ) -> list[Prediction]:
     if not success_records or failure_count == 0:
         return []
@@ -185,13 +196,13 @@ def analyze_successes(
         analysis_lm=analysis_lm,
         analysis_adapter=analysis_adapter,
         runtime=runtime,
+        tracker=tracker,
         success_threshold=success_threshold,
         min_metric=min_metric,
         max_metric=max_metric,
         format_execution_flow=format_execution_flow,
         log=log,
         iteration=iteration,
-        tracing_enabled=tracing_enabled,
     )
 
 
@@ -210,7 +221,7 @@ def generate_hypotheses(
     rng: random.Random,
     log: Callable[[str, Verbosity], None] | None = None,
     iteration: int | None = None,
-    tracing_enabled: bool = False,
+    tracker: ExperimentTracker | None = None,
 ) -> list[HypothesisSpec]:
     if not failure_summaries or num_hypotheses == 0:
         log_fn = log or (lambda message, level=Verbosity.NORMAL: runtime.log(message, level))
@@ -226,15 +237,19 @@ def generate_hypotheses(
         Verbosity.HIGH,
     )
 
-    trace = None
-    if tracing_enabled and iteration is not None:
-        trace = create_hypothesis_trace(
-            iteration=iteration,
-            num_failures=len(failure_summaries),
-            num_successes=len(success_summaries),
-        )
+    span_attributes = {
+        "iteration": iteration if iteration is not None else -1,
+        "num_failures": len(failure_summaries),
+        "num_successes": len(success_summaries),
+    }
 
-    try:
+    span_cm = tracker.span(
+        "apex.generate_hypotheses",
+        inputs={"current_val_score": current_val_score},
+        attributes=span_attributes,
+    ) if tracker is not None else nullcontext(None)
+
+    with span_cm as span:
         failure_text = "\n".join([f"- {f.root_cause} (category: {f.category})" for f in shuffled_failures])
         success_text = (
             "\n".join([f"- {s.success_pattern} (category: {s.category})" for s in success_summaries])
@@ -264,20 +279,18 @@ def generate_hypotheses(
         validated_specs.sort(key=lambda h: (h.impact_score, h.generalizability_score), reverse=True)
         validated_specs = validated_specs[:num_hypotheses]
 
-        if trace:
-            outputs = {
-                "num_hypotheses_generated": len(validated_specs),
-                "current_val_score": current_val_score or 0.0,
-            }
-            if validated_specs:
-                outputs["best_hypothesis_strategy"] = validated_specs[0].strategy
-                outputs["best_hypothesis_impact"] = validated_specs[0].impact_score
-            end_trace(trace, outputs)
-
-    except Exception as e:
-        if trace:
-            end_trace(trace, {"error": str(e)[:200]})
-        raise
+        if span and hasattr(span, "set_outputs"):
+            try:
+                payload = {
+                    "num_hypotheses_generated": len(validated_specs),
+                    "current_val_score": current_val_score or 0.0,
+                }
+                if validated_specs:
+                    payload["best_hypothesis_strategy"] = validated_specs[0].strategy
+                    payload["best_hypothesis_impact"] = validated_specs[0].impact_score
+                span.set_outputs(payload)
+            except Exception:  # pragma: no cover - defensive
+                pass
 
     if runtime.is_enabled(Verbosity.HIGH):
         for idx, spec in enumerate(validated_specs, start=1):

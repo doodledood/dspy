@@ -5,17 +5,15 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass
 from statistics import median
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 import dspy
 from dspy.primitives import Example, Module, Prediction
 
 from .execution_flow import extract_execution_flow
-from .mlflow_utils import create_evaluation_trace, end_trace
 from .models import CandidateRecord, HypothesisSpec, TrainExampleRecord
 from .runtime import RuntimeTools
 from .tracker import ExperimentTracker
-from .tracking_session import TraceBatch
 from .types import LogLevel, MetricFn, TraceEntry, Verbosity
 
 
@@ -69,21 +67,6 @@ class EvaluationEngine:
             else:
                 failures.append(record)
 
-        if iteration is not None and self.tracker.is_active():
-            if failures:
-                failure_batch = TraceBatch.from_iterable(
-                    iteration=iteration,
-                    stage="train_failures",
-                    traces=[self._format_train_record(record) for record in failures],
-                )
-                self.tracker.log_trace_batch(failure_batch)
-            if successes:
-                success_batch = TraceBatch.from_iterable(
-                    iteration=iteration,
-                    stage="train_successes",
-                    traces=[self._format_train_record(record) for record in successes],
-                )
-                self.tracker.log_trace_batch(success_batch)
         return failures, successes
 
     def evaluate_candidates(
@@ -160,94 +143,65 @@ class EvaluationEngine:
 
         indexed_calset = list(enumerate(calset))
 
-        def process(item: tuple[int, Example]) -> tuple[float | None, Mapping[str, Any] | None]:
+        def process(item: tuple[int, Example]) -> float:
             example_idx, example = item
             inputs_dict = example.inputs().toDict()
             labels_dict = example.labels().toDict()
 
-            hypothesis_info = None
-            if hypothesis:
-                hypothesis_info = {
-                    "strategy": hypothesis.strategy,
-                    "impact_score": hypothesis.impact_score,
-                }
+            span_inputs: dict[str, Any] = {
+                "inputs": inputs_dict,
+                "labels": labels_dict,
+            }
+            if hypothesis is not None:
+                span_inputs["hypothesis_strategy"] = hypothesis.strategy
 
-            trace = None
-            if self.tracker.is_tracing_enabled():
-                stage = "val" if "val" in label else "calibration"
-                trace = create_evaluation_trace(
-                    example_idx=example_idx,
-                    stage=stage,
-                    iteration=iteration,
-                    hypothesis_info=hypothesis_info,
-                )
+            attributes = {
+                "stage": label,
+                "iteration": iteration,
+                "example_index": example_idx,
+            }
 
-            try:
-                per_runs: list[float] = []
-                run_details: list[dict[str, Any]] = []
+            with self.tracker.span(
+                f"apex.{label}_example",
+                inputs=span_inputs,
+                attributes=attributes,
+            ) as span:
+                try:
+                    per_runs: list[float] = []
+                    for _ in range(self.num_eval_runs):
+                        with dspy.settings.context(trace=[]):
+                            prediction = program_to_eval(**inputs_dict)
+                            trace_entries = list(dspy.settings.trace or [])
 
-                for run_index in range(self.num_eval_runs):
-                    with dspy.settings.context(trace=[]):
-                        prediction = program_to_eval(**inputs_dict)
-                        trace_entries = list(dspy.settings.trace or [])
+                        score, feedback = self._evaluate_metric(example, prediction, trace_entries)
+                        clipped_score = max(self.min_metric, min(self.max_metric, score))
+                        per_runs.append(clipped_score)
 
-                    score, feedback = self._evaluate_metric(example, prediction, trace_entries)
-                    clipped_score = max(self.min_metric, min(self.max_metric, score))
-                    per_runs.append(clipped_score)
+                        if span and hasattr(span, "set_attribute"):
+                            try:
+                                span.set_attribute("last_feedback", feedback or "")
+                            except Exception:  # pragma: no cover - defensive
+                                pass
 
-                    execution_flow = extract_execution_flow(trace_entries, program_to_eval)
-                    run_details.append(
-                        {
-                            "run_index": run_index,
-                            "raw_score": score,
-                            "clipped_score": clipped_score,
-                            "feedback": feedback,
-                            "prediction": prediction.toDict() if isinstance(prediction, Prediction) else prediction,
-                            "execution_flow": [entry.model_dump() for entry in execution_flow],
-                        }
+                    median_score = median(per_runs) if per_runs else self.min_metric
+                    if span and hasattr(span, "set_outputs"):
+                        try:
+                            span.set_outputs({"median_score": median_score})
+                        except Exception:  # pragma: no cover - defensive
+                            pass
+                    return median_score
+                except Exception as exc:  # pragma: no cover - defensive
+                    self.log(
+                        f"APEX: Error evaluating example: {str(exc)[:200]}",
+                        Verbosity.NORMAL,
+                        "warning",
                     )
-
-                median_score = median(per_runs) if per_runs else None
-
-                trace_outputs = {
-                    "median_score": median_score,
-                    "num_runs": self.num_eval_runs,
-                }
-                end_trace(trace, trace_outputs)
-
-                payload: dict[str, Any] = {
-                    "inputs": inputs_dict,
-                    "labels": labels_dict,
-                    "runs": run_details,
-                }
-                if median_score is not None:
-                    payload["median_score"] = median_score
-                if hypothesis is not None:
-                    payload["hypothesis"] = {
-                        "strategy": hypothesis.strategy,
-                        "fixable_root_causes": hypothesis.fixable_root_causes,
-                        "impact_score": hypothesis.impact_score,
-                        "generalizability_score": hypothesis.generalizability_score,
-                    }
-                return median_score, payload
-            except Exception as exc:  # pragma: no cover - defensive
-                self.log(
-                    f"APEX: Error evaluating example: {str(exc)[:200]}",
-                    Verbosity.NORMAL,
-                    "warning",
-                )
-                end_trace(trace, {"error": str(exc)[:200]})
-                payload: dict[str, Any] = {
-                    "inputs": inputs_dict,
-                    "labels": labels_dict,
-                    "error": str(exc),
-                }
-                if hypothesis is not None:
-                    payload["hypothesis"] = {
-                        "strategy": hypothesis.strategy,
-                        "fixable_root_causes": hypothesis.fixable_root_causes,
-                    }
-                return self.min_metric, payload
+                    if span and hasattr(span, "set_attribute"):
+                        try:
+                            span.set_attribute("error", str(exc)[:200])
+                        except Exception:
+                            pass
+                    return self.min_metric
 
         results = self.runtime.parallel_execute(
             indexed_calset,
@@ -256,17 +210,7 @@ class EvaluationEngine:
             level=Verbosity.NORMAL,
         )
 
-        valid_scores: list[float] = []
-        trace_payloads: list[Mapping[str, Any]] = []
-        for result in results:
-            if result is None:
-                continue
-            score, payload = result
-            if score is not None:
-                valid_scores.append(score)
-            if payload:
-                trace_payloads.append(payload)
-
+        valid_scores = [score for score in results if score is not None]
         if not valid_scores:
             self.log(
                 f"APEX: Warning - no valid scores obtained for {label}",
@@ -276,11 +220,6 @@ class EvaluationEngine:
             valid_scores = [self.min_metric]
 
         overall = sum(valid_scores) / len(valid_scores)
-
-        if trace_payloads and self.tracker.is_active():
-            stage_name = f"{label}_evaluation"
-            batch = TraceBatch.from_iterable(iteration=iteration, stage=stage_name, traces=trace_payloads)
-            self.tracker.log_trace_batch(batch)
 
         return CandidateRecord(
             program=program,
@@ -319,31 +258,36 @@ class EvaluationEngine:
     ) -> TrainExampleRecord:
         input_kwargs = example.inputs().toDict()
 
-        trace_handle = None
-        if iteration is not None and self.tracker.is_tracing_enabled():
-            trace_handle = create_evaluation_trace(
-                example_idx=example_idx,
-                stage="train",
-                iteration=iteration,
-                hypothesis_info=None,
-            )
-
         prediction_obj: Prediction | None = None
         error_message: str | None = None
         raw_trace: list[TraceEntry] = []
 
-        with dspy.settings.context(trace=[]):
-            try:
-                prediction_obj = program(**input_kwargs)
-            except Exception as exc:  # pragma: no cover - defensive
-                self.log(
-                    f"APEX: Program execution failed on example: {str(exc)[:200]}",
-                    Verbosity.HIGH,
-                    "warning",
-                )
-                error_message = f"execution_error: {exc}"
-            finally:
-                raw_trace = list(dspy.settings.trace or [])
+        try:
+            labels_dict = example.labels().toDict()
+        except Exception:  # pragma: no cover - defensive
+            labels_dict = {}
+
+        with self.tracker.span(
+            "apex.train_example",
+            inputs={"inputs": input_kwargs, "labels": labels_dict},
+            attributes={
+                "stage": "train",
+                "iteration": iteration if iteration is not None else -1,
+                "example_index": example_idx,
+            },
+        ) as span:
+            with dspy.settings.context(trace=[]):
+                try:
+                    prediction_obj = program(**input_kwargs)
+                except Exception as exc:  # pragma: no cover - defensive
+                    self.log(
+                        f"APEX: Program execution failed on example: {str(exc)[:200]}",
+                        Verbosity.HIGH,
+                        "warning",
+                    )
+                    error_message = f"execution_error: {exc}"
+                finally:
+                    raw_trace = list(dspy.settings.trace or [])
 
         execution_flow = extract_execution_flow(raw_trace, program)
 
@@ -369,16 +313,23 @@ class EvaluationEngine:
 
         metric_score = max(self.min_metric, min(self.max_metric, metric_score))
         is_success = metric_score >= self.success_threshold
-
-        if trace_handle:
-            end_trace(
-                trace_handle,
-                {
-                    "metric_score": metric_score,
-                    "is_success": is_success,
-                    "has_error": error_message is not None,
-                },
-            )
+        if span:
+            if hasattr(span, "set_outputs"):
+                try:
+                    span.set_outputs(
+                        {
+                            "metric_score": metric_score,
+                            "is_success": is_success,
+                            "has_error": bool(error_message),
+                        }
+                    )
+                except Exception:  # pragma: no cover - defensive
+                    pass
+            if error_message and hasattr(span, "set_attribute"):
+                try:
+                    span.set_attribute("error", error_message[:200])
+                except Exception:  # pragma: no cover - defensive
+                    pass
 
         return TrainExampleRecord(
             example=example,
@@ -414,21 +365,5 @@ class EvaluationEngine:
             return float(result), None
         msg = f"Unsupported metric return type: {type(result)}"
         raise TypeError(msg)
-
-    def _format_train_record(self, record: TrainExampleRecord) -> Mapping[str, Any]:
-        """Convert a training evaluation record into a trace artifact payload."""
-
-        prediction_dict = record.prediction.toDict() if isinstance(record.prediction, Prediction) else None
-        return {
-            "inputs": record.example.inputs().toDict(),
-            "labels": record.example.labels().toDict(),
-            "metric_score": record.metric_score,
-            "metric_feedback": record.metric_feedback,
-            "is_success": record.is_success,
-            "error": record.error,
-            "prediction": prediction_dict,
-            "execution_flow": [entry.model_dump() for entry in record.execution_flow],
-        }
-
 
 __all__ = ["EvaluationEngine"]
