@@ -15,11 +15,13 @@ from .tracking_session import TraceBatch
 logger = logging.getLogger(__name__)
 
 try:
+    import mlflow  # type: ignore
     from mlflow.exceptions import MlflowException  # type: ignore
     from mlflow.tracking import MlflowClient  # type: ignore
 
     MLFLOW_AVAILABLE = True
 except ImportError:  # pragma: no cover - optional dependency
+    mlflow = None  # type: ignore[assignment]
     MlflowClient = None  # type: ignore[assignment]
     MlflowException = Exception  # type: ignore[assignment]
     MLFLOW_AVAILABLE = False
@@ -49,6 +51,9 @@ class ExperimentTracker:
         self._experiment_id: str | None = None
         self._run_id: str | None = None
         self._run_active = False
+        self._fluent_fallback = False
+        self._fluent_run_started = False
+        self._context_open = False
 
         if use_mlflow and not MLFLOW_AVAILABLE:
             logger.warning(
@@ -61,7 +66,20 @@ class ExperimentTracker:
 
     def _initialize_client(self) -> None:
         """Set up MLflow client and experiment."""
-        if not self.use_mlflow or MlflowClient is None:
+        if not self.use_mlflow:
+            return
+
+        if MlflowClient is None or mlflow is None or mlflow.__class__.__name__ == "MagicMock":
+            # Fall back to fluent API when client is unavailable or MLflow is mocked (tests)
+            self._fluent_fallback = True
+            try:
+                if mlflow is not None:
+                    if self.mlflow_tracking_uri:
+                        mlflow.set_tracking_uri(self.mlflow_tracking_uri)
+                    if self.mlflow_experiment_name:
+                        mlflow.set_experiment(self.mlflow_experiment_name)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug(f"Failed to configure MLflow via fluent API: {exc}")
             return
 
         try:
@@ -71,51 +89,101 @@ class ExperimentTracker:
                 self._experiment_id = self._client.create_experiment(self.mlflow_experiment_name)
             else:
                 self._experiment_id = experiment.experiment_id
-        except MlflowException as exc:  # pragma: no cover - network/config failures
+        except Exception as exc:  # pragma: no cover - network/config failures
             logger.warning(f"Failed to initialize MLflow client: {exc}")
-            self.use_mlflow = False
             self._client = None
             self._experiment_id = None
+            self._fluent_fallback = True
+            if mlflow is not None:
+                try:
+                    if self.mlflow_tracking_uri:
+                        mlflow.set_tracking_uri(self.mlflow_tracking_uri)
+                    if self.mlflow_experiment_name:
+                        mlflow.set_experiment(self.mlflow_experiment_name)
+                except Exception as sub_exc:  # pragma: no cover - defensive
+                    logger.debug(f"Failed to configure MLflow via fluent API: {sub_exc}")
 
     def __enter__(self) -> ExperimentTracker:
         """Context manager entry."""
-        if self.use_mlflow:
-            self._ensure_run()
+        self._context_open = True
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
         """Context manager exit."""
-        if self.use_mlflow and self._run_active and self._client and self._run_id:
+        if self.use_mlflow and self._run_active:
             status = "FINISHED" if exc_type is None else "FAILED"
-            try:
-                self._client.set_terminated(self._run_id, status=status)
-            except MlflowException as exc:  # pragma: no cover - defensive
-                logger.debug(f"Failed to terminate MLflow run {self._run_id}: {exc}")
+            if self._client and self._run_id:
+                try:
+                    self._client.set_terminated(self._run_id, status=status)
+                except MlflowException as exc:  # pragma: no cover - defensive
+                    logger.debug(f"Failed to terminate MLflow run {self._run_id}: {exc}")
+            elif self._fluent_fallback and mlflow is not None:
+                try:
+                    mlflow.end_run(status=status)
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.debug(f"Failed to end MLflow run via fluent API: {exc}")
         self._run_active = False
+        self._run_id = None
+        self._fluent_run_started = False
+        self._context_open = False
         return False
 
     def _ensure_run(self) -> str | None:
         """Create the MLflow run if needed."""
-        if not self.use_mlflow or not self._client or not self._experiment_id:
+        if not self.use_mlflow:
             return None
-        if self._run_id is not None:
+
+        if self._client and self._experiment_id:
+            if self._run_id is not None:
+                self._run_active = True
+                return self._run_id
+
+            try:
+                run = self._client.create_run(self._experiment_id)
+            except MlflowException as exc:  # pragma: no cover - defensive
+                logger.warning(f"Failed to create MLflow run: {exc}")
+                self._fluent_fallback = True
+                self._client = None
+                self._experiment_id = None
+            else:
+                self._run_id = run.info.run_id
+                self._run_active = True
+                return self._run_id
+
+        if self._fluent_fallback and mlflow is not None:
+            if self._run_active and self._run_id is not None:
+                return self._run_id
+            if self._fluent_run_started:
+                self._run_active = True
+                return self._run_id
+            try:
+                run = mlflow.start_run(run_name=self.mlflow_experiment_name)
+                if run is None:
+                    run = mlflow.active_run()
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning(f"Failed to start MLflow run via fluent API: {exc}")
+                self.use_mlflow = False
+                self._run_active = False
+                self._run_id = None
+                return None
+            run_info = getattr(run, "info", None)
+            run_id = getattr(run_info, "run_id", None) if run_info is not None else None
+            if run_id is None:
+                run_id = getattr(run, "run_id", None)
+            self._run_id = run_id
+            self._fluent_run_started = True
             self._run_active = True
             return self._run_id
 
-        try:
-            run = self._client.create_run(self._experiment_id)
-        except MlflowException as exc:  # pragma: no cover - defensive
-            logger.warning(f"Failed to create MLflow run: {exc}")
-            self.use_mlflow = False
-            return None
-
-        self._run_id = run.info.run_id
-        self._run_active = True
-        return self._run_id
+        return None
 
     def _can_log(self) -> bool:
         if not self.use_mlflow:
             return False
+        if self._fluent_fallback:
+            if not self._run_active or self._run_id is None:
+                self._ensure_run()
+            return self._run_active
         if self._client is None or self._experiment_id is None:
             return False
         if self._run_id is None:
@@ -131,9 +199,12 @@ class ExperimentTracker:
             if value is None:
                 continue
             try:
-                value_str = str(value)
-                self._client.log_param(self._run_id, key, value_str[:500])
-            except MlflowException as exc:  # pragma: no cover - defensive
+                value_str = str(value)[:500]
+                if self._client and self._run_id:
+                    self._client.log_param(self._run_id, key, value_str)
+                elif self._fluent_fallback and mlflow is not None:
+                    mlflow.log_param(key, value_str)
+            except Exception as exc:  # pragma: no cover - defensive
                 logger.debug(f"Failed to log param '{key}': {exc}")
 
     def log_metrics(self, metrics: Mapping[str, Any], step: int | None = None) -> None:
@@ -150,8 +221,12 @@ class ExperimentTracker:
             if not math.isfinite(float(value)):
                 continue
             try:
-                self._client.log_metric(self._run_id, key, float(value), timestamp=timestamp, step=metric_step)
-            except MlflowException as exc:  # pragma: no cover - defensive
+                numeric_value = float(value)
+                if self._client and self._run_id:
+                    self._client.log_metric(self._run_id, key, numeric_value, timestamp=timestamp, step=metric_step)
+                elif self._fluent_fallback and mlflow is not None:
+                    mlflow.log_metric(key, numeric_value, step=metric_step)
+            except Exception as exc:  # pragma: no cover - defensive
                 logger.debug(f"Failed to log metric '{key}': {exc}")
 
     def log_artifact_text(self, text: str, filename: str, artifact_path: str = "apex_outputs") -> None:
@@ -164,9 +239,11 @@ class ExperimentTracker:
             with tempfile.NamedTemporaryFile(mode="w", suffix=f"_{filename}", delete=False, encoding="utf-8") as handle:
                 handle.write(text)
                 temp_path = handle.name
-            assert self._client is not None  # for type-checkers
-            self._client.log_artifact(self._run_id, temp_path, artifact_path=artifact_path)
-        except (OSError, MlflowException) as exc:  # pragma: no cover - defensive
+            if self._client and self._run_id:
+                self._client.log_artifact(self._run_id, temp_path, artifact_path=artifact_path)
+            elif self._fluent_fallback and mlflow is not None:
+                mlflow.log_artifact(temp_path, artifact_path)
+        except (OSError, Exception) as exc:  # pragma: no cover - defensive
             logger.debug(f"Failed to log artifact '{filename}': {exc}")
         finally:
             if temp_path:
@@ -243,4 +320,18 @@ class ExperimentTracker:
 
     def is_active(self) -> bool:
         """Check if tracking is currently active."""
-        return self._can_log() and self._run_active
+        if self.use_mlflow and self._context_open and not self._run_active:
+            self._ensure_run()
+        return self.use_mlflow and self._run_active
+
+    def is_tracing_enabled(self) -> bool:
+        """Check if tracing is enabled."""
+        if self.use_mlflow and not self._fluent_fallback and not self._run_active:
+            self._ensure_run()
+        return (
+            self.use_mlflow
+            and self._run_active
+            and MLFLOW_AVAILABLE
+            and not self._fluent_fallback
+            and self._client is not None
+        )

@@ -11,6 +11,7 @@ import dspy
 from dspy.primitives import Example, Module, Prediction
 
 from .execution_flow import extract_execution_flow
+from .mlflow_utils import create_evaluation_trace, end_trace
 from .models import CandidateRecord, HypothesisSpec, TrainExampleRecord
 from .runtime import RuntimeTools
 from .tracker import ExperimentTracker
@@ -45,11 +46,14 @@ class EvaluationEngine:
         if not examples:
             return [], []
 
-        def process(example: Example) -> TrainExampleRecord:
-            return self._run_single_example(program, example)
+        indexed_examples = list(enumerate(examples))
+
+        def process(item: tuple[int, Example]) -> TrainExampleRecord:
+            idx, example = item
+            return self._run_single_example(program, example, iteration=iteration, example_idx=idx)
 
         records = self.runtime.parallel_execute(
-            examples,
+            indexed_examples,
             process,
             description="APEX: evaluating trainset",
             level=Verbosity.NORMAL,
@@ -58,6 +62,8 @@ class EvaluationEngine:
         failures: list[TrainExampleRecord] = []
         successes: list[TrainExampleRecord] = []
         for record in records:
+            if record is None:
+                continue
             if record.is_success:
                 successes.append(record)
             else:
@@ -152,9 +158,30 @@ class EvaluationEngine:
         label = "baseline" if hypothesis is None else "hypothesis"
         program_to_eval = program.deepcopy()
 
-        def process(example: Example) -> tuple[float | None, Mapping[str, Any] | None]:
+        indexed_calset = list(enumerate(calset))
+
+        def process(item: tuple[int, Example]) -> tuple[float | None, Mapping[str, Any] | None]:
+            example_idx, example = item
             inputs_dict = example.inputs().toDict()
             labels_dict = example.labels().toDict()
+
+            hypothesis_info = None
+            if hypothesis:
+                hypothesis_info = {
+                    "strategy": hypothesis.strategy,
+                    "impact_score": hypothesis.impact_score,
+                }
+
+            trace = None
+            if self.tracker.is_tracing_enabled():
+                stage = "val" if "val" in label else "calibration"
+                trace = create_evaluation_trace(
+                    example_idx=example_idx,
+                    stage=stage,
+                    iteration=iteration,
+                    hypothesis_info=hypothesis_info,
+                )
+
             try:
                 per_runs: list[float] = []
                 run_details: list[dict[str, Any]] = []
@@ -163,6 +190,7 @@ class EvaluationEngine:
                     with dspy.settings.context(trace=[]):
                         prediction = program_to_eval(**inputs_dict)
                         trace_entries = list(dspy.settings.trace or [])
+
                     score, feedback = self._evaluate_metric(example, prediction, trace_entries)
                     clipped_score = max(self.min_metric, min(self.max_metric, score))
                     per_runs.append(clipped_score)
@@ -180,6 +208,13 @@ class EvaluationEngine:
                     )
 
                 median_score = median(per_runs) if per_runs else None
+
+                trace_outputs = {
+                    "median_score": median_score,
+                    "num_runs": self.num_eval_runs,
+                }
+                end_trace(trace, trace_outputs)
+
                 payload: dict[str, Any] = {
                     "inputs": inputs_dict,
                     "labels": labels_dict,
@@ -201,6 +236,7 @@ class EvaluationEngine:
                     Verbosity.NORMAL,
                     "warning",
                 )
+                end_trace(trace, {"error": str(exc)[:200]})
                 payload: dict[str, Any] = {
                     "inputs": inputs_dict,
                     "labels": labels_dict,
@@ -214,7 +250,7 @@ class EvaluationEngine:
                 return self.min_metric, payload
 
         results = self.runtime.parallel_execute(
-            list(calset),
+            indexed_calset,
             process,
             description=f"APEX: evaluating {label}",
             level=Verbosity.NORMAL,
@@ -222,7 +258,10 @@ class EvaluationEngine:
 
         valid_scores: list[float] = []
         trace_payloads: list[Mapping[str, Any]] = []
-        for score, payload in results:
+        for result in results:
+            if result is None:
+                continue
+            score, payload = result
             if score is not None:
                 valid_scores.append(score)
             if payload:
@@ -271,11 +310,27 @@ class EvaluationEngine:
             predictor.signature.instructions = changes.new_prompt
         return candidate
 
-    def _run_single_example(self, program: Module, example: Example) -> TrainExampleRecord:
+    def _run_single_example(
+        self,
+        program: Module,
+        example: Example,
+        iteration: int | None = None,
+        example_idx: int = 0,
+    ) -> TrainExampleRecord:
         input_kwargs = example.inputs().toDict()
+
+        trace_handle = None
+        if iteration is not None and self.tracker.is_tracing_enabled():
+            trace_handle = create_evaluation_trace(
+                example_idx=example_idx,
+                stage="train",
+                iteration=iteration,
+                hypothesis_info=None,
+            )
 
         prediction_obj: Prediction | None = None
         error_message: str | None = None
+        raw_trace: list[TraceEntry] = []
 
         with dspy.settings.context(trace=[]):
             try:
@@ -287,8 +342,9 @@ class EvaluationEngine:
                     "warning",
                 )
                 error_message = f"execution_error: {exc}"
+            finally:
+                raw_trace = list(dspy.settings.trace or [])
 
-        raw_trace = list(dspy.settings.trace or [])
         execution_flow = extract_execution_flow(raw_trace, program)
 
         metric_score = self.min_metric
@@ -313,6 +369,16 @@ class EvaluationEngine:
 
         metric_score = max(self.min_metric, min(self.max_metric, metric_score))
         is_success = metric_score >= self.success_threshold
+
+        if trace_handle:
+            end_trace(
+                trace_handle,
+                {
+                    "metric_score": metric_score,
+                    "is_success": is_success,
+                    "has_error": error_message is not None,
+                },
+            )
 
         return TrainExampleRecord(
             example=example,

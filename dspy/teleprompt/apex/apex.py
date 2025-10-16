@@ -524,6 +524,8 @@ class APEX(Teleprompter):
                         )
                         continue
 
+                    tracing_enabled = self.tracker.is_tracing_enabled()
+
                     failure_summaries = analyze_examples(
                         failures,
                         mode="failure",
@@ -535,6 +537,8 @@ class APEX(Teleprompter):
                         max_metric=self.max_metric,
                         format_execution_flow=format_execution_flow_with_details,
                         log=self._log,
+                        iteration=iteration,
+                        tracing_enabled=tracing_enabled,
                     )
                     success_summaries = analyze_successes(
                         success_records=successes,
@@ -547,6 +551,8 @@ class APEX(Teleprompter):
                         max_metric=self.max_metric,
                         format_execution_flow=format_execution_flow_with_details,
                         log=self._log,
+                        iteration=iteration,
+                        tracing_enabled=tracing_enabled,
                     )
                     if self._is_enabled(Verbosity.HIGH):
                         self._log(
@@ -568,6 +574,8 @@ class APEX(Teleprompter):
                         include_history=self.include_hypothesis_history,
                         rng=self._rng,
                         log=self._log,
+                        iteration=iteration,
+                        tracing_enabled=tracing_enabled,
                     )
                     self._log(
                         f"APEX: iteration {iteration} produced {len(hypotheses)} hypothesis(es)",
