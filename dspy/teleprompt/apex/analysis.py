@@ -65,6 +65,7 @@ def build_hypothesis_history_text(*, include_history: bool, candidate_history: S
     if baseline_candidate is None:
         baseline_candidate = min(candidate_history, key=lambda candidate: candidate.iteration)
 
+    baseline_score: float | None = None
     if baseline_candidate is not None:
         baseline_score = baseline_candidate.overall_score
         baseline_score_text = f"{baseline_score:.4f}" if baseline_score is not None else "N/A"
@@ -82,7 +83,11 @@ def build_hypothesis_history_text(*, include_history: bool, candidate_history: S
     for candidate in sorted_candidates:
         score = candidate.overall_score
         score_text = f"{score:.4f}" if score is not None else "N/A"
-        lines.append(f"- Iteration {candidate.iteration} (score={score_text}):")
+        delta_text = ""
+        if baseline_score is not None and score is not None:
+            delta = score - baseline_score
+            delta_text = f", delta={'+' if delta >= 0 else ''}{delta:.4f} vs baseline"
+        lines.append(f"- Iteration {candidate.iteration} (score={score_text}{delta_text}):")
 
         changes = candidate.hypothesis.prompt_changes
         if not changes:

@@ -606,10 +606,11 @@ class HypothesisGenerationSignature(Signature):
     - **current_validation_score**: Latest validation score for the current baseline program. If unavailable, will be "N/A".
     - **current_iteration**: Current optimizer iteration number (0-indexed) to ground hypotheses in trajectory stage
     - **hypothesis_history**: Chronological record of prior hypotheses with validation scores, iteration numbers, and prompt
-      change rationales (no raw prompts). Use this trajectory to track which prompt adjustments boosted or hurt validation,
-      protect improvements by preserving successful rationales, and steer clear of ideas that previously regressed the score.
-      When unavailable, this field will be "N/A"; in that case rely on the current failure and success analyses to propose
-      minimal, high-leverage changes.
+      change rationales (no raw prompts). The history always begins with an iteration 0 baseline line, followed by each tested
+      hypothesis annotated with the score delta versus that baseline. Use this trajectory to track which prompt adjustments
+      boosted or hurt validation, protect improvements by preserving successful rationales, and steer clear of ideas that
+      previously regressed the score. When unavailable, this field will be "N/A"; in that case rely on the current failure and
+      success analyses to propose minimal, high-leverage changes.
 
     Key insight: A predictor might succeed on some inputs and fail on others. Look for consistent patterns, not one-off issues. Use categories to group related failures for more effective targeting.
 
