@@ -1,3 +1,4 @@
+import random
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -9,10 +10,12 @@ from dspy.teleprompt.apex import (
     APEX,
     CandidateRecord,
     ChangeMagnitude,
+    ExperimentTracker,
     HypothesisSpec,
     PromptChange,
     Verbosity,
 )
+from dspy.teleprompt.apex.evaluation import EvaluationEngine
 from dspy.utils.dummies import DummyLM
 
 
@@ -76,6 +79,67 @@ def metric(example: Example, prediction: dspy.Prediction, trace) -> float:
     expected = example.output
     predicted = prediction.output
     return 1.0 if expected == predicted else 0.0
+
+
+class InMemoryTracker(ExperimentTracker):
+    """Tracker stub that captures logged trace batches in-memory."""
+
+    def __init__(self):
+        super().__init__(use_mlflow=False)
+        self.logged_batches: list = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        return False
+
+    def is_active(self):
+        return True
+
+    def log_trace_batch(self, batch):
+        self.logged_batches.append(batch)
+
+
+def test_evaluate_candidate_logs_traces_without_mutating_predictors():
+    tracker = InMemoryTracker()
+    runtime = runtime_module.RuntimeTools(verbosity=Verbosity.HIGH, num_threads=1)
+    engine = EvaluationEngine(
+        metric=metric,
+        runtime=runtime,
+        tracker=tracker,
+        min_metric=0.0,
+        max_metric=1.0,
+        success_threshold=1.0,
+        num_eval_runs=1,
+        rng=random.Random(0),
+        log=lambda message, level, _: None,
+        is_enabled=lambda _: False,
+    )
+
+    class TraceableModule(dspy.Module):
+        def __init__(self):
+            super().__init__()
+            self.predictor = dspy.Predict("input -> output")
+            self.predictor.lm = DummyLM([{"output": "good"}])
+
+        def forward(self, input: str) -> dspy.Prediction:
+            return self.predictor(input=input)
+
+    program = TraceableModule()
+    example = make_train_example("x")
+
+    record = engine.evaluate_candidate(program=program, calset=[example], iteration=1, hypothesis=None)
+
+    predictor_names = [name for name, _ in record.program.named_predictors()]
+    assert predictor_names == ["predictor"]
+
+    assert tracker.logged_batches, "Expected execution traces to be logged"
+    artifact = tracker.logged_batches[0].to_artifact()
+    assert artifact["stage"] == "baseline_evaluation"
+    execution_flows = artifact["traces"][0]["runs"][0]["execution_flow"]
+    predictor_names_in_trace = {entry["predictor_name"] for entry in execution_flows}
+    assert predictor_names_in_trace == {"predictor"}
 
 
 @pytest.mark.parametrize(

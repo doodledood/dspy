@@ -5,7 +5,7 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass
 from statistics import median
-from typing import Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import dspy
 from dspy.primitives import Example, Module, Prediction
@@ -13,8 +13,8 @@ from dspy.primitives import Example, Module, Prediction
 from .execution_flow import extract_execution_flow
 from .models import CandidateRecord, HypothesisSpec, TrainExampleRecord
 from .runtime import RuntimeTools
-from .tracked_module import track_module
 from .tracker import ExperimentTracker
+from .tracking_session import TraceBatch
 from .types import LogLevel, MetricFn, TraceEntry, Verbosity
 
 
@@ -37,6 +37,7 @@ class EvaluationEngine:
         self,
         program: Module,
         trainset: Iterable[Example],
+        iteration: int | None = None,
     ) -> tuple[list[TrainExampleRecord], list[TrainExampleRecord]]:
         """Run the training set through the program and bucket by success."""
 
@@ -61,6 +62,22 @@ class EvaluationEngine:
                 successes.append(record)
             else:
                 failures.append(record)
+
+        if iteration is not None and self.tracker.is_active():
+            if failures:
+                failure_batch = TraceBatch.from_iterable(
+                    iteration=iteration,
+                    stage="train_failures",
+                    traces=[self._format_train_record(record) for record in failures],
+                )
+                self.tracker.log_trace_batch(failure_batch)
+            if successes:
+                success_batch = TraceBatch.from_iterable(
+                    iteration=iteration,
+                    stage="train_successes",
+                    traces=[self._format_train_record(record) for record in successes],
+                )
+                self.tracker.log_trace_batch(success_batch)
         return failures, successes
 
     def evaluate_candidates(
@@ -133,42 +150,84 @@ class EvaluationEngine:
         """Evaluate a single candidate program."""
 
         label = "baseline" if hypothesis is None else "hypothesis"
+        program_to_eval = program.deepcopy()
 
-        tracked_program = program
-        if self.tracker.is_active():
-            tracked_program = track_module(
-                program,
-                run_id=self.tracker.get_run_id(),
-                iteration=iteration,
-            )
-
-        def process(example: Example) -> float:
+        def process(example: Example) -> tuple[float | None, Mapping[str, Any] | None]:
+            inputs_dict = example.inputs().toDict()
+            labels_dict = example.labels().toDict()
             try:
                 per_runs: list[float] = []
-                for _ in range(self.num_eval_runs):
+                run_details: list[dict[str, Any]] = []
+
+                for run_index in range(self.num_eval_runs):
                     with dspy.settings.context(trace=[]):
-                        prediction = tracked_program(**example.inputs().toDict())
+                        prediction = program_to_eval(**inputs_dict)
                         trace_entries = list(dspy.settings.trace or [])
-                    score, _ = self._evaluate_metric(example, prediction, trace_entries)
-                    score = max(self.min_metric, min(self.max_metric, score))
-                    per_runs.append(score)
-                return median(per_runs)
+                    score, feedback = self._evaluate_metric(example, prediction, trace_entries)
+                    clipped_score = max(self.min_metric, min(self.max_metric, score))
+                    per_runs.append(clipped_score)
+
+                    execution_flow = extract_execution_flow(trace_entries, program_to_eval)
+                    run_details.append(
+                        {
+                            "run_index": run_index,
+                            "raw_score": score,
+                            "clipped_score": clipped_score,
+                            "feedback": feedback,
+                            "prediction": prediction.toDict() if isinstance(prediction, Prediction) else prediction,
+                            "execution_flow": [entry.model_dump() for entry in execution_flow],
+                        }
+                    )
+
+                median_score = median(per_runs) if per_runs else None
+                payload: dict[str, Any] = {
+                    "inputs": inputs_dict,
+                    "labels": labels_dict,
+                    "runs": run_details,
+                }
+                if median_score is not None:
+                    payload["median_score"] = median_score
+                if hypothesis is not None:
+                    payload["hypothesis"] = {
+                        "strategy": hypothesis.strategy,
+                        "fixable_root_causes": hypothesis.fixable_root_causes,
+                        "impact_score": hypothesis.impact_score,
+                        "generalizability_score": hypothesis.generalizability_score,
+                    }
+                return median_score, payload
             except Exception as exc:  # pragma: no cover - defensive
                 self.log(
                     f"APEX: Error evaluating example: {str(exc)[:200]}",
                     Verbosity.NORMAL,
                     "warning",
                 )
-                return self.min_metric
+                payload: dict[str, Any] = {
+                    "inputs": inputs_dict,
+                    "labels": labels_dict,
+                    "error": str(exc),
+                }
+                if hypothesis is not None:
+                    payload["hypothesis"] = {
+                        "strategy": hypothesis.strategy,
+                        "fixable_root_causes": hypothesis.fixable_root_causes,
+                    }
+                return self.min_metric, payload
 
-        scores = self.runtime.parallel_execute(
+        results = self.runtime.parallel_execute(
             list(calset),
             process,
             description=f"APEX: evaluating {label}",
             level=Verbosity.NORMAL,
         )
 
-        valid_scores = [s for s in scores if s is not None]
+        valid_scores: list[float] = []
+        trace_payloads: list[Mapping[str, Any]] = []
+        for score, payload in results:
+            if score is not None:
+                valid_scores.append(score)
+            if payload:
+                trace_payloads.append(payload)
+
         if not valid_scores:
             self.log(
                 f"APEX: Warning - no valid scores obtained for {label}",
@@ -179,8 +238,13 @@ class EvaluationEngine:
 
         overall = sum(valid_scores) / len(valid_scores)
 
+        if trace_payloads and self.tracker.is_active():
+            stage_name = f"{label}_evaluation"
+            batch = TraceBatch.from_iterable(iteration=iteration, stage=stage_name, traces=trace_payloads)
+            self.tracker.log_trace_batch(batch)
+
         return CandidateRecord(
-            program=tracked_program,
+            program=program,
             overall_score=overall,
             per_example_scores=valid_scores,
             iteration=iteration,
@@ -284,6 +348,21 @@ class EvaluationEngine:
             return float(result), None
         msg = f"Unsupported metric return type: {type(result)}"
         raise TypeError(msg)
+
+    def _format_train_record(self, record: TrainExampleRecord) -> Mapping[str, Any]:
+        """Convert a training evaluation record into a trace artifact payload."""
+
+        prediction_dict = record.prediction.toDict() if isinstance(record.prediction, Prediction) else None
+        return {
+            "inputs": record.example.inputs().toDict(),
+            "labels": record.example.labels().toDict(),
+            "metric_score": record.metric_score,
+            "metric_feedback": record.metric_feedback,
+            "is_success": record.is_success,
+            "error": record.error,
+            "prediction": prediction_dict,
+            "execution_flow": [entry.model_dump() for entry in record.execution_flow],
+        }
 
 
 __all__ = ["EvaluationEngine"]

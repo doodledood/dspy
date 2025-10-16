@@ -39,7 +39,6 @@ from .runtime import RuntimeTools
 from .sampling import sample_trainset
 from .snapshot import snapshot_program
 from .state import OptimizationState
-from .tracked_module import track_module
 from .tracker import ExperimentTracker
 from .types import LogLevel, MetricFn, SamplerFn, TraceEntry, Verbosity
 
@@ -474,18 +473,13 @@ class APEX(Teleprompter):
                     )
 
                     baseline_for_analysis = state.current_program.deepcopy()
-                    if self.tracker.is_active():
-                        baseline_for_analysis = track_module(
-                            baseline_for_analysis,
-                            run_id=self.tracker.get_run_id(),
-                            iteration=iteration,
-                        )
 
                     snapshot = snapshot_program(baseline_for_analysis)
 
                     failures, successes = self.evaluator.evaluate_train_examples(
                         baseline_for_analysis,
                         sampled_train,
+                        iteration=iteration,
                     )
                     self._log(
                         f"APEX: Train evaluation complete - {len(failures)} failures, {len(successes)} successes",

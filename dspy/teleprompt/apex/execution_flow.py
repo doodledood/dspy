@@ -47,12 +47,14 @@ def extract_execution_flow(trace: list[TraceEntry], program: Module) -> list[Exe
     value_sources_by_value: dict[str, list[str]] = {}
 
     for predictor_obj, inputs, outputs in trace:
-        predictor_name = "unknown"
+        predictor_name = None
         predictor_type = type(predictor_obj).__name__
 
+        # First check if the predictor has a stored name (TrackedPredictor)
         if hasattr(predictor_obj, "_predictor_name"):
             predictor_name = predictor_obj._predictor_name
         else:
+            # Try identity-based lookup
             trace_predictor = predictor_obj
             if hasattr(predictor_obj, "_wrapped_predictor"):
                 trace_predictor = predictor_obj._wrapped_predictor
@@ -65,6 +67,22 @@ def extract_execution_flow(trace: list[TraceEntry], program: Module) -> list[Exe
                 if pred is predictor_obj or lookup_predictor is trace_predictor:
                     predictor_name = name
                     break
+
+            # If identity lookup fails and there's only one predictor, use its name
+            # This handles the deepcopy case where identity is lost
+            if predictor_name is None and len(predictor_lookup) == 1:
+                predictor_name = next(iter(predictor_lookup))
+
+        # This should NEVER happen - if it does, it's a bug
+        if predictor_name is None:
+            raise ValueError(
+                f"Failed to resolve predictor name for {predictor_type} in execution flow. "
+                f"This is a bug in APEX - predictor identity was lost (likely due to deepcopy). "
+                f"Trace contains {predictor_type} at {id(predictor_obj)}, "
+                f"but program.named_predictors() has: {list(predictor_lookup.keys())} "
+                f"at ids: {[id(p) for p in predictor_lookup.values()]}. "
+                f"This causes APEX to fail with confusing 'unknown predictor' errors."
+            )
 
         instructions = ""
         if hasattr(predictor_obj, "signature") and hasattr(predictor_obj.signature, "instructions"):
