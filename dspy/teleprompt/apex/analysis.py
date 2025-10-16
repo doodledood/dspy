@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import random
 from contextlib import nullcontext
-from typing import Any, Callable, Sequence
+from typing import Callable, Sequence
 
 import dspy
 from dspy.adapters import Adapter
@@ -19,6 +19,7 @@ from .models import (
     TrainExampleRecord,
 )
 from .runtime import RuntimeTools
+from .serialization import to_serializable
 from .signatures import (
     FailureAnalysisSignature,
     HypothesisGenerationSignature,
@@ -26,21 +27,6 @@ from .signatures import (
 )
 from .tracker import ExperimentTracker
 from .types import Verbosity
-
-
-def _to_serializable(value: Any) -> Any:
-    if isinstance(value, Prediction):
-        return value.toDict()
-    if hasattr(value, "model_dump"):
-        try:
-            return value.model_dump()  # type: ignore[no-untyped-call]
-        except Exception:  # pragma: no cover - defensive
-            pass
-    if isinstance(value, dict):
-        return {str(k): _to_serializable(v) for k, v in value.items()}
-    if isinstance(value, list | tuple | set):
-        return [_to_serializable(v) for v in value]
-    return value
 
 
 def _normalize_whitespace(text: str) -> str:
@@ -162,7 +148,7 @@ def analyze_examples(
             "metric_score": record.metric_score,
             "metric_feedback": record.metric_feedback,
             "prompt": prompt_text,
-            "analysis_payload": _to_serializable(call_inputs),
+            "analysis_payload": to_serializable(call_inputs),
         }
 
         attributes = {
@@ -180,7 +166,7 @@ def analyze_examples(
                     try:
                         payload = {
                             "prompt": prompt_text,
-                            "analysis": _to_serializable(result),
+                            "analysis": to_serializable(result),
                         }
                         if mode == "failure":
                             payload["root_cause"] = getattr(result, "root_cause", "")
@@ -336,7 +322,7 @@ def generate_hypotheses(
     span_inputs = {
         "best_val_score": best_val_score,
         "prompt": prompt_text,
-        "generation_payload": _to_serializable(generation_payload),
+        "generation_payload": to_serializable(generation_payload),
     }
 
     span_cm = (
@@ -359,10 +345,10 @@ def generate_hypotheses(
                     "num_hypotheses_generated": len(validated_specs),
                     "best_val_score": best_val_score or 0.0,
                     "current_iteration": iteration if iteration is not None else -1,
-                    "failure_analyses": [_to_serializable(record) for record in failure_records],
-                    "success_analyses": [_to_serializable(record) for record in success_records],
+                    "failure_analyses": [to_serializable(record) for record in failure_records],
+                    "success_analyses": [to_serializable(record) for record in success_records],
                     "prompt": prompt_text,
-                    "hypotheses": [_to_serializable(spec) for spec in validated_specs],
+                    "hypotheses": [to_serializable(spec) for spec in validated_specs],
                 }
                 span.set_outputs(payload)
             except Exception:  # pragma: no cover - defensive

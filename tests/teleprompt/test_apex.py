@@ -1,9 +1,11 @@
 import random
+import warnings
 from contextlib import contextmanager
 from typing import Any
 from unittest.mock import MagicMock, call, patch
 
 import pytest
+from litellm.types.utils import Choices, Delta, Message, ModelResponseStream, StreamingChoices
 
 import dspy
 import dspy.teleprompt.apex.runtime as runtime_module
@@ -20,6 +22,7 @@ from dspy.teleprompt.apex import (
 from dspy.teleprompt.apex.analysis import generate_hypotheses
 from dspy.teleprompt.apex.evaluation import EvaluationEngine
 from dspy.teleprompt.apex.models import ProgramSnapshot
+from dspy.teleprompt.apex.serialization import to_serializable
 from dspy.utils.dummies import DummyLM
 
 
@@ -62,6 +65,26 @@ def make_hypothesis_response(prompt_value: str = "good") -> dict:
             }
         ]
     }
+
+
+def test_apex_serialization_suppresses_pydantic_warnings():
+    stream_chunk = ModelResponseStream(
+        model="gpt-4o-mini",
+        choices=[StreamingChoices(delta=Delta(content="chunk-token"), finish_reason=None, index=0)],
+    )
+    choice = Choices(message=Message(role="assistant", content="choice-response"), finish_reason="stop", index=0)
+
+    payload = {"chunk": stream_chunk, "choice": choice}
+
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always")
+        serialized = to_serializable(payload)
+
+    assert all(
+        "PydanticSerializationUnexpectedValue" not in str(warning.message) for warning in recorded
+    ), "Serialization emitted a LiteLLM Pydantic warning"
+    assert serialized["chunk"]["choices"][0]["delta"]["content"] == "chunk-token"
+    assert serialized["choice"]["message"]["content"] == "choice-response"
 
 
 class PromptDrivenModule(dspy.Module):
@@ -215,7 +238,7 @@ def test_generate_hypotheses_traces_include_full_context():
         success_summaries=[success_summary],
         snapshot=snapshot,
         candidate_history=None,
-        current_val_score=0.5,
+        best_val_score=0.5,
         runtime=runtime,
         hypothesis_lm=hypothesis_lm,
         hypothesis_adapter=hypothesis_adapter,
@@ -248,9 +271,11 @@ def test_generate_hypotheses_traces_include_full_context():
     assert success_entry["category"] == "clear_format_compliance"
     assert success_entry["key_details"] == "Keep current instructions"
 
+    assert payload["best_validation_score"] == "0.5000"
     assert payload["current_iteration"] == 2
 
     outputs = span["outputs"]
+    assert outputs["best_val_score"] == 0.5
     assert outputs["failure_analyses"][0]["root_cause"] == "Extractor dropped required field"
     assert outputs["success_analyses"][0]["success_pattern"] == "Validator preserved schema"
 @pytest.mark.parametrize(
@@ -327,6 +352,14 @@ def test_apex_builds_history_text_when_enabled():
         },
     )
 
+    baseline = CandidateRecord(
+        program=PromptDrivenModule(initial_prompt="baseline"),
+        overall_score=0.6,
+        per_example_scores=[0.6],
+        iteration=0,
+        hypothesis=None,
+    )
+
     candidate = CandidateRecord(
         program=PromptDrivenModule(initial_prompt="bad"),
         overall_score=0.8,
@@ -335,9 +368,11 @@ def test_apex_builds_history_text_when_enabled():
         hypothesis=hypothesis,
     )
 
-    history_text = optimizer._build_hypothesis_history_text([candidate])
+    history_text = optimizer._build_hypothesis_history_text([baseline, candidate])
 
+    assert "Iteration 0 baseline score=0.6000 (best so far)" in history_text
     assert "Iteration 3" in history_text
+    assert "delta=+0.2000 vs prior best" in history_text
     assert "predictor" in history_text
     assert "Clean whitespace" in history_text
 

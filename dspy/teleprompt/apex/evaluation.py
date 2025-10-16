@@ -13,19 +13,9 @@ from dspy.primitives import Example, Module, Prediction
 from .execution_flow import extract_execution_flow
 from .models import CandidateRecord, HypothesisSpec, TrainExampleRecord
 from .runtime import RuntimeTools
+from .serialization import to_serializable
 from .tracker import ExperimentTracker
 from .types import LogLevel, MetricFn, TraceEntry, Verbosity
-
-
-def _serialize_value(value: Any) -> Any:
-    if isinstance(value, Prediction | Example):
-        return value.toDict()
-    if isinstance(value, dict):
-        return {str(k): _serialize_value(v) for k, v in value.items()}
-    if isinstance(value, list | tuple | set):
-        return [_serialize_value(v) for v in value]
-    return value
-
 
 _LM_HISTORY_KEYS = (
     "prompt",
@@ -50,8 +40,8 @@ def _serialize_trace_entries(trace_entries: list[TraceEntry]) -> list[dict[str, 
 
         entry: dict[str, Any] = {
             "predictor_type": type(predictor_obj).__name__,
-            "inputs": _serialize_value(inputs),
-            "outputs": _serialize_value(outputs.toDict() if isinstance(outputs, Prediction) else outputs),
+            "inputs": to_serializable(inputs),
+            "outputs": to_serializable(outputs),
         }
         predictor_name = getattr(predictor_obj, "_predictor_name", None)
         if predictor_name:
@@ -65,7 +55,7 @@ def _serialize_trace_entries(trace_entries: list[TraceEntry]) -> list[dict[str, 
             if offset <= len(history_list):
                 history_entry = history_list[-offset]
                 history_payload = {
-                    k: _serialize_value(history_entry.get(k)) for k in _LM_HISTORY_KEYS if k in history_entry
+                    k: to_serializable(history_entry.get(k)) for k in _LM_HISTORY_KEYS if k in history_entry
                 }
                 if history_payload:
                     entry["lm_history"] = history_payload
@@ -217,7 +207,7 @@ class EvaluationEngine:
                 "prompts": prompts_map,
             }
             if hypothesis is not None:
-                span_inputs["hypothesis"] = _serialize_value(hypothesis.model_dump())
+                span_inputs["hypothesis"] = to_serializable(hypothesis)
 
             attributes = {
                 "stage": label,
@@ -250,9 +240,7 @@ class EvaluationEngine:
                                 "raw_score": score,
                                 "clipped_score": clipped_score,
                                 "feedback": feedback,
-                                "prediction": _serialize_value(
-                                    prediction.toDict() if isinstance(prediction, Prediction) else prediction
-                                ),
+                                "prediction": to_serializable(prediction),
                                 "trace": trace_payload,
                             }
                         )
@@ -406,11 +394,9 @@ class EvaluationEngine:
                             "metric_score": metric_score,
                             "is_success": is_success,
                             "has_error": bool(error_message),
-                            "prediction": _serialize_value(
-                                prediction_obj.toDict() if isinstance(prediction_obj, Prediction) else prediction_obj
-                            ),
+                            "prediction": to_serializable(prediction_obj),
                             "trace": trace_serialized,
-                            "execution_flow": _serialize_value([entry.model_dump() for entry in execution_flow]),
+                            "execution_flow": to_serializable(execution_flow),
                         }
                     )
                 except Exception:  # pragma: no cover - defensive
