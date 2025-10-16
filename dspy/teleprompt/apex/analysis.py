@@ -254,7 +254,7 @@ def generate_hypotheses(
     success_summaries: list[Prediction],
     snapshot: ProgramSnapshot,
     candidate_history: Sequence[CandidateRecord] | None,
-    current_val_score: float | None,
+    best_val_score: float | None,
     runtime: RuntimeTools,
     hypothesis_lm: LM,
     hypothesis_adapter: Adapter,
@@ -315,20 +315,20 @@ def generate_hypotheses(
         include_history=include_history,
         candidate_history=candidate_history,
     )
-    current_val_text = f"{current_val_score:.4f}" if current_val_score is not None else "N/A"
+    best_val_text = f"{best_val_score:.4f}" if best_val_score is not None else "N/A"
 
     generation_payload = {
         "failure_analyses": failure_records,
         "success_analyses": success_records,
         "program_flow": program_flow,
-        "current_validation_score": current_val_text,
+        "best_validation_score": best_val_text,
         "current_iteration": iteration if iteration is not None else -1,
         "hypothesis_history": history_text,
         "num_hypotheses": num_hypotheses,
     }
 
     span_inputs = {
-        "current_val_score": current_val_score,
+        "best_val_score": best_val_score,
         "prompt": prompt_text,
         "generation_payload": _to_serializable(generation_payload),
     }
@@ -351,7 +351,7 @@ def generate_hypotheses(
             try:
                 payload = {
                     "num_hypotheses_generated": len(validated_specs),
-                    "current_val_score": current_val_score or 0.0,
+                    "best_val_score": best_val_score or 0.0,
                     "current_iteration": iteration if iteration is not None else -1,
                     "failure_analyses": [_to_serializable(record) for record in failure_records],
                     "success_analyses": [_to_serializable(record) for record in success_records],

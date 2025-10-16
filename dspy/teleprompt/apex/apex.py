@@ -564,7 +564,7 @@ class APEX(Teleprompter):
                         success_summaries=success_summaries,
                         snapshot=snapshot,
                         candidate_history=state.all_candidates,
-                        current_val_score=state.current_baseline_candidate.overall_score,
+                        best_val_score=state.best_candidate.overall_score,
                         runtime=self.runtime,
                         hypothesis_lm=self.hypothesis_lm,
                         hypothesis_adapter=self.hypothesis_adapter,

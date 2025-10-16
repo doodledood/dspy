@@ -603,7 +603,7 @@ class HypothesisGenerationSignature(Signature):
       propose very small, low-risk tweaks; a low ratio indicates broader fixes may be
       justified.
     - **program_flow**: Predictor dependencies forming a directed acyclic graph (DAG) of relationships
-    - **current_validation_score**: Latest validation score for the current baseline program. If unavailable, will be "N/A".
+    - **best_validation_score**: Best validation score achieved so far (initial baseline at minimum). If unavailable, will be "N/A".
     - **current_iteration**: Current optimizer iteration number (0-indexed) to ground hypotheses in trajectory stage
     - **hypothesis_history**: Chronological record of prior hypotheses with validation scores, iteration numbers, and prompt
       change rationales (no raw prompts). The history always begins with an iteration 0 baseline line, followed by each tested
@@ -813,8 +813,8 @@ class HypothesisGenerationSignature(Signature):
         desc="Structured success analyses (SuccessSummaryRecord) for this iteration"
     )
     program_flow: str = InputField(desc="Program structure showing predictor relationships as a directed acyclic graph")
-    current_validation_score: str = InputField(
-        desc="Latest validation score for the current baseline program; 'N/A' if unavailable",
+    best_validation_score: str = InputField(
+        desc="Best validation score achieved so far; 'N/A' if unavailable",
         default="N/A",
     )
     current_iteration: int = InputField(
