@@ -158,6 +158,7 @@ def test_evaluate_candidate_logs_traces_without_mutating_predictors():
     span = tracker.spans[0]
     assert span["name"] == "apex.baseline_example"
     assert span["outputs"]["median_score"] == 1.0
+    assert "predictor" in span["inputs"]["prompts"]
 
 
 @pytest.mark.parametrize(

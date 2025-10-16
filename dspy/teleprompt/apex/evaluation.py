@@ -17,6 +17,33 @@ from .tracker import ExperimentTracker
 from .types import LogLevel, MetricFn, TraceEntry, Verbosity
 
 
+def _serialize_value(value: Any) -> Any:
+    if isinstance(value, Prediction | Example):
+        return value.toDict()
+    if isinstance(value, dict):
+        return {str(k): _serialize_value(v) for k, v in value.items()}
+    if isinstance(value, list | tuple | set):
+        return [_serialize_value(v) for v in value]
+    return value
+
+
+def _serialize_trace_entries(trace_entries: list[TraceEntry]) -> list[dict[str, Any]]:
+    serialized: list[dict[str, Any]] = []
+    for predictor_obj, inputs, outputs in trace_entries:
+        entry: dict[str, Any] = {
+            "predictor_type": type(predictor_obj).__name__,
+            "inputs": _serialize_value(inputs),
+            "outputs": _serialize_value(
+                outputs.toDict() if isinstance(outputs, Prediction) else outputs
+            ),
+        }
+        predictor_name = getattr(predictor_obj, "_predictor_name", None)
+        if predictor_name:
+            entry["predictor_name"] = predictor_name
+        serialized.append(entry)
+    return serialized
+
+
 @dataclass
 class EvaluationEngine:
     """Coordinates program and candidate evaluation for APEX."""
@@ -148,9 +175,15 @@ class EvaluationEngine:
             inputs_dict = example.inputs().toDict()
             labels_dict = example.labels().toDict()
 
+            prompts_map = {
+                name: getattr(predictor.signature, "instructions", "")
+                for name, predictor in program_to_eval.named_predictors()
+            }
+
             span_inputs: dict[str, Any] = {
                 "inputs": inputs_dict,
                 "labels": labels_dict,
+                "prompts": prompts_map,
             }
             if hypothesis is not None:
                 span_inputs["hypothesis_strategy"] = hypothesis.strategy
@@ -168,7 +201,8 @@ class EvaluationEngine:
             ) as span:
                 try:
                     per_runs: list[float] = []
-                    for _ in range(self.num_eval_runs):
+                    run_details: list[dict[str, Any]] = []
+                    for run_index in range(self.num_eval_runs):
                         with dspy.settings.context(trace=[]):
                             prediction = program_to_eval(**inputs_dict)
                             trace_entries = list(dspy.settings.trace or [])
@@ -177,16 +211,31 @@ class EvaluationEngine:
                         clipped_score = max(self.min_metric, min(self.max_metric, score))
                         per_runs.append(clipped_score)
 
+                        trace_payload = _serialize_trace_entries(trace_entries)
+
+                        run_details.append(
+                            {
+                                "run_index": run_index,
+                                "raw_score": score,
+                                "clipped_score": clipped_score,
+                                "feedback": feedback,
+                                "prediction": _serialize_value(
+                                    prediction.toDict() if isinstance(prediction, Prediction) else prediction
+                                ),
+                                "trace": trace_payload,
+                            }
+                        )
+
                         if span and hasattr(span, "set_attribute"):
                             try:
-                                span.set_attribute("last_feedback", feedback or "")
+                                span.set_attribute(f"run_{run_index}_score", clipped_score)
                             except Exception:  # pragma: no cover - defensive
                                 pass
 
                     median_score = median(per_runs) if per_runs else self.min_metric
                     if span and hasattr(span, "set_outputs"):
                         try:
-                            span.set_outputs({"median_score": median_score})
+                            span.set_outputs({"median_score": median_score, "runs": run_details})
                         except Exception:  # pragma: no cover - defensive
                             pass
                     return median_score
@@ -267,9 +316,14 @@ class EvaluationEngine:
         except Exception:  # pragma: no cover - defensive
             labels_dict = {}
 
+        prompts_map = {
+            name: getattr(predictor.signature, "instructions", "")
+            for name, predictor in program.named_predictors()
+        }
+
         with self.tracker.span(
             "apex.train_example",
-            inputs={"inputs": input_kwargs, "labels": labels_dict},
+            inputs={"inputs": input_kwargs, "labels": labels_dict, "prompts": prompts_map},
             attributes={
                 "stage": "train",
                 "iteration": iteration if iteration is not None else -1,
@@ -290,6 +344,7 @@ class EvaluationEngine:
                     raw_trace = list(dspy.settings.trace or [])
 
         execution_flow = extract_execution_flow(raw_trace, program)
+        trace_serialized = _serialize_trace_entries(raw_trace)
 
         metric_score = self.min_metric
         metric_feedback: str | None = None
@@ -321,6 +376,10 @@ class EvaluationEngine:
                             "metric_score": metric_score,
                             "is_success": is_success,
                             "has_error": bool(error_message),
+                            "prediction": _serialize_value(
+                                prediction_obj.toDict() if isinstance(prediction_obj, Prediction) else prediction_obj
+                            ),
+                            "trace": trace_serialized,
                         }
                     )
                 except Exception:  # pragma: no cover - defensive

@@ -93,10 +93,14 @@ def analyze_examples(
     def process(item: tuple[int, TrainExampleRecord]) -> Prediction:
         idx, record = item
 
+        predictor = dspy.Predict(signature_class)
+        prompt_text = getattr(predictor.signature, "instructions", "")
+
         span_inputs = {
             "inputs": record.example.inputs().toDict(),
             "labels": record.example.labels().toDict(),
             "metric_score": record.metric_score,
+            "prompt": prompt_text,
         }
 
         attributes = {
@@ -108,8 +112,6 @@ def analyze_examples(
         with tracker.span(f"apex.analysis.{mode}", inputs=span_inputs, attributes=attributes) as span:
             try:
                 with dspy.context(lm=analysis_lm, adapter=analysis_adapter):
-                    predictor = dspy.Predict(signature_class)
-
                     inputs = record.example.inputs().toDict()
                     expected = record.example.labels().toDict()
                     execution_flow_str = format_execution_flow(record.execution_flow)
@@ -133,7 +135,10 @@ def analyze_examples(
 
                 if span and hasattr(span, "set_outputs"):
                     try:
-                        payload = {"category": getattr(result, "category", "unknown")}
+                        payload = {
+                            "category": getattr(result, "category", "unknown"),
+                            "prompt": prompt_text,
+                        }
                         if mode == "failure":
                             payload["root_cause"] = getattr(result, "root_cause", "")
                         else:
@@ -243,11 +248,19 @@ def generate_hypotheses(
         "num_successes": len(success_summaries),
     }
 
-    span_cm = tracker.span(
-        "apex.generate_hypotheses",
-        inputs={"current_val_score": current_val_score},
-        attributes=span_attributes,
-    ) if tracker is not None else nullcontext(None)
+    predictor = dspy.Predict(HypothesisGenerationSignature)
+    prompt_text = getattr(predictor.signature, "instructions", "")
+
+    span_inputs = {
+        "current_val_score": current_val_score,
+        "prompt": prompt_text,
+    }
+
+    span_cm = (
+        tracker.span("apex.generate_hypotheses", inputs=span_inputs, attributes=span_attributes)
+        if tracker is not None
+        else nullcontext(None)
+    )
 
     with span_cm as span:
         failure_text = "\n".join([f"- {f.root_cause} (category: {f.category})" for f in shuffled_failures])
@@ -265,7 +278,6 @@ def generate_hypotheses(
         current_val_text = f"{current_val_score:.4f}" if current_val_score is not None else "N/A"
 
         with dspy.context(lm=hypothesis_lm, adapter=hypothesis_adapter):
-            predictor = dspy.Predict(HypothesisGenerationSignature)
             result = predictor(
                 failure_analyses=failure_text,
                 success_analyses=success_text,
@@ -284,6 +296,7 @@ def generate_hypotheses(
                 payload = {
                     "num_hypotheses_generated": len(validated_specs),
                     "current_val_score": current_val_score or 0.0,
+                    "prompt": prompt_text,
                 }
                 if validated_specs:
                     payload["best_hypothesis_strategy"] = validated_specs[0].strategy
