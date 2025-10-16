@@ -27,21 +27,52 @@ def _serialize_value(value: Any) -> Any:
     return value
 
 
+_LM_HISTORY_KEYS = (
+    "prompt",
+    "messages",
+    "outputs",
+    "usage",
+    "kwargs",
+    "cost",
+    "model",
+    "response_model",
+    "timestamp",
+    "uuid",
+)
+
+
 def _serialize_trace_entries(trace_entries: list[TraceEntry]) -> list[dict[str, Any]]:
-    serialized: list[dict[str, Any]] = []
-    for predictor_obj, inputs, outputs in trace_entries:
+    serialized: list[dict[str, Any]] = [None] * len(trace_entries)  # type: ignore[list-item]
+    history_offsets: dict[int, int] = {}
+
+    for idx in range(len(trace_entries) - 1, -1, -1):
+        predictor_obj, inputs, outputs = trace_entries[idx]
+
         entry: dict[str, Any] = {
             "predictor_type": type(predictor_obj).__name__,
             "inputs": _serialize_value(inputs),
-            "outputs": _serialize_value(
-                outputs.toDict() if isinstance(outputs, Prediction) else outputs
-            ),
+            "outputs": _serialize_value(outputs.toDict() if isinstance(outputs, Prediction) else outputs),
         }
         predictor_name = getattr(predictor_obj, "_predictor_name", None)
         if predictor_name:
             entry["predictor_name"] = predictor_name
-        serialized.append(entry)
-    return serialized
+
+        history_list = getattr(predictor_obj, "history", None)
+        if history_list:
+            key = id(predictor_obj)
+            history_offsets[key] = history_offsets.get(key, 0) + 1
+            offset = history_offsets[key]
+            if offset <= len(history_list):
+                history_entry = history_list[-offset]
+                history_payload = {
+                    k: _serialize_value(history_entry.get(k)) for k in _LM_HISTORY_KEYS if k in history_entry
+                }
+                if history_payload:
+                    entry["lm_history"] = history_payload
+
+        serialized[idx] = entry
+
+    return serialized  # type: ignore[return-value]
 
 
 @dataclass
@@ -186,7 +217,7 @@ class EvaluationEngine:
                 "prompts": prompts_map,
             }
             if hypothesis is not None:
-                span_inputs["hypothesis_strategy"] = hypothesis.strategy
+                span_inputs["hypothesis"] = _serialize_value(hypothesis.model_dump())
 
             attributes = {
                 "stage": label,
@@ -317,8 +348,7 @@ class EvaluationEngine:
             labels_dict = {}
 
         prompts_map = {
-            name: getattr(predictor.signature, "instructions", "")
-            for name, predictor in program.named_predictors()
+            name: getattr(predictor.signature, "instructions", "") for name, predictor in program.named_predictors()
         }
 
         with self.tracker.span(
@@ -380,6 +410,7 @@ class EvaluationEngine:
                                 prediction_obj.toDict() if isinstance(prediction_obj, Prediction) else prediction_obj
                             ),
                             "trace": trace_serialized,
+                            "execution_flow": _serialize_value([entry.model_dump() for entry in execution_flow]),
                         }
                     )
                 except Exception:  # pragma: no cover - defensive
@@ -424,5 +455,6 @@ class EvaluationEngine:
             return float(result), None
         msg = f"Unsupported metric return type: {type(result)}"
         raise TypeError(msg)
+
 
 __all__ = ["EvaluationEngine"]

@@ -9,6 +9,7 @@ import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Mapping
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -34,34 +35,37 @@ class ExperimentTracker:
         self.mlflow_tracking_uri = mlflow_tracking_uri
         self.mlflow_experiment_name = mlflow_experiment_name or "APEX"
         self._run_active = False
+        self._autolog_kwargs: dict[str, Any] = {}
+        self._autolog_active = False
+        self._supports_tracing = False
 
         if self.use_mlflow and mlflow is not None:
-            try:
-                if self.mlflow_tracking_uri:
-                    mlflow.set_tracking_uri(self.mlflow_tracking_uri)
-                if self.mlflow_experiment_name:
-                    mlflow.set_experiment(self.mlflow_experiment_name)
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.warning("Disabling MLflow tracking: %s", exc)
-                self.use_mlflow = False
+            if not hasattr(mlflow, "dspy") or not hasattr(mlflow.dspy, "autolog"):
+                raise RuntimeError("mlflow.dspy.autolog is required for MLflow tracking.")
+            self._configure_remote_tracking()
+            self._supports_tracing = hasattr(mlflow, "start_span")
 
     def __enter__(self) -> ExperimentTracker:
         if self.use_mlflow and not self._run_active and mlflow is not None:
             try:
                 mlflow.start_run()
                 self._run_active = True
+                self._enable_autolog()
             except Exception as exc:  # pragma: no cover - defensive
-                logger.warning("Failed to start MLflow run: %s", exc)
-                self.use_mlflow = False
+                self._disable_autolog(silent=True)
+                raise RuntimeError(f"Failed to start MLflow run: {exc}") from exc
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
-        if self._run_active and mlflow is not None:
-            status = "FINISHED" if exc_type is None else "FAILED"
-            try:
-                mlflow.end_run(status=status)
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.warning("Failed to end MLflow run: %s", exc)
+        try:
+            self._disable_autolog(silent=True)
+        finally:
+            if self._run_active and mlflow is not None:
+                status = "FINISHED" if exc_type is None else "FAILED"
+                try:
+                    mlflow.end_run(status=status)
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.warning("Failed to end MLflow run: %s", exc)
         self._run_active = False
         return False
 
@@ -76,6 +80,59 @@ class ExperimentTracker:
             func(*args, **kwargs)
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("MLflow logging failed: %s", exc)
+
+    def _configure_remote_tracking(self) -> None:
+        if not self.mlflow_tracking_uri:
+            raise ValueError("An MLflow tracking URI is required when use_mlflow=True.")
+        parsed = urlparse(self.mlflow_tracking_uri)
+        if parsed.scheme not in {"http", "https"}:
+            msg = f"MLflow tracking URI must use http or https. Received '{self.mlflow_tracking_uri}'."
+            raise ValueError(msg)
+
+        try:
+            mlflow.set_tracking_uri(self.mlflow_tracking_uri)
+            resolved_uri = mlflow.get_tracking_uri()
+        except Exception as exc:  # pragma: no cover - defensive
+            raise RuntimeError(f"Failed to configure MLflow tracking URI '{self.mlflow_tracking_uri}': {exc}") from exc
+
+        if resolved_uri and resolved_uri.startswith("file:"):
+            raise RuntimeError(
+                "MLflow resolved the tracking URI to a local file store. Configure an MLflow server and supply its HTTP(S) URI."
+            )
+
+        if self.mlflow_experiment_name:
+            try:
+                mlflow.set_experiment(self.mlflow_experiment_name)
+            except Exception as exc:  # pragma: no cover - defensive
+                raise RuntimeError(f"Failed to set MLflow experiment '{self.mlflow_experiment_name}': {exc}") from exc
+
+        self._autolog_kwargs: dict[str, Any] = {
+            "log_traces": True,
+            "log_traces_from_compile": True,
+            "log_traces_from_eval": True,
+            "log_compiles": False,
+            "log_evals": False,
+        }
+
+    def _enable_autolog(self) -> None:
+        if self._autolog_active or mlflow is None:
+            return
+        try:
+            mlflow.dspy.autolog(**self._autolog_kwargs, silent=True)
+            self._autolog_active = True
+        except Exception as exc:  # pragma: no cover - defensive
+            raise RuntimeError(f"Failed to enable MLflow DSPy autolog: {exc}") from exc
+
+    def _disable_autolog(self, *, silent: bool = False) -> None:
+        if not self._autolog_active or mlflow is None:
+            return
+        try:
+            mlflow.dspy.autolog(disable=True, silent=True)
+        except Exception as exc:  # pragma: no cover - defensive
+            if not silent:
+                logger.warning("Failed to disable MLflow DSPy autolog: %s", exc)
+        finally:
+            self._autolog_active = False
 
     # ------------------------------------------------------------------ metrics & params
     def log_params(self, params: Mapping[str, Any]) -> None:
@@ -108,7 +165,7 @@ class ExperimentTracker:
 
     # ------------------------------------------------------------------ tracing
     def is_tracing_enabled(self) -> bool:
-        return self._active() and hasattr(mlflow, "start_span")
+        return self._active() and self._supports_tracing
 
     @contextmanager
     def span(

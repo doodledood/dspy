@@ -1,7 +1,7 @@
 import random
 from contextlib import contextmanager
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -119,6 +119,36 @@ class RecordingTracker(ExperimentTracker):
         span = _Span(record)
         self.spans.append(record)
         yield span
+
+
+def configure_mock_mlflow(mock_mlflow: MagicMock, *, run_id: str = "test-run-id") -> MagicMock:
+    """Configure a patched mlflow module with the attributes APEX expects."""
+
+    mock_mlflow.set_tracking_uri.return_value = None
+    mock_mlflow.get_tracking_uri.return_value = "http://localhost:5000"
+    mock_mlflow.set_experiment.return_value = None
+
+    mock_mlflow.dspy = MagicMock()
+    mock_mlflow.dspy.autolog = MagicMock()
+
+    mock_run = MagicMock()
+    mock_run.info.run_id = run_id
+    mock_mlflow.start_run.return_value = mock_run
+    mock_mlflow.active_run.return_value = mock_run
+
+    def _span_factory(*args, **kwargs):  # pragma: no cover - simple helper
+        @contextmanager
+        def _cm():
+            span_mock = MagicMock()
+            span_mock.set_inputs = MagicMock()
+            span_mock.set_outputs = MagicMock()
+            span_mock.set_attribute = MagicMock()
+            yield span_mock
+
+        return _cm()
+
+    mock_mlflow.start_span.side_effect = _span_factory
+    return mock_run
 
 
 def test_evaluate_candidate_logs_traces_without_mutating_predictors():
@@ -969,9 +999,7 @@ def test_apex_mlflow_disabled_by_default():
 @patch("dspy.teleprompt.apex.tracker.mlflow")
 def test_apex_mlflow_enabled(mock_mlflow):
     """Test that MLflow tracking can be enabled and logs appropriate data."""
-    mock_run = MagicMock()
-    mock_run.info.run_id = "test-run-id"
-    mock_mlflow.start_run.return_value = mock_run
+    configure_mock_mlflow(mock_mlflow)
 
     trainset = [make_train_example("x"), make_train_example("y")]
     calset = trainset
@@ -1008,10 +1036,22 @@ def test_apex_mlflow_enabled(mock_mlflow):
 
     mock_mlflow.set_tracking_uri.assert_called_with("http://localhost:5000")
     mock_mlflow.set_experiment.assert_called_with("test-experiment")
+    mock_mlflow.get_tracking_uri.assert_called()
     mock_mlflow.start_run.assert_called_once()
     mock_mlflow.end_run.assert_called_once()
 
-    assert mock_mlflow.log_param.call_count > 0
+    autolog_calls = mock_mlflow.dspy.autolog.call_args_list
+    assert autolog_calls[0] == call(
+        log_traces=True,
+        log_traces_from_compile=True,
+        log_traces_from_eval=True,
+        log_compiles=False,
+        log_evals=False,
+        silent=True,
+    )
+    assert autolog_calls[-1] == call(disable=True, silent=True)
+
+    assert mock_mlflow.log_param.call_count > 0 or mock_mlflow.log_metrics.call_count > 0
     assert optimized.predictor.signature.instructions == "good"
 
 
@@ -1053,9 +1093,7 @@ def test_apex_mlflow_graceful_fallback():
 @patch("dspy.teleprompt.apex.tracker.mlflow")
 def test_apex_mlflow_iteration_tracking(mock_mlflow):
     """Test that APEX tracks iteration-level metrics with MLflow."""
-    mock_run = MagicMock()
-    mock_run.info.run_id = "test-run-id"
-    mock_mlflow.start_run.return_value = mock_run
+    configure_mock_mlflow(mock_mlflow)
 
     trainset = [make_train_example("x"), make_train_example("y")]
     calset = trainset
@@ -1093,9 +1131,7 @@ def test_apex_mlflow_iteration_tracking(mock_mlflow):
 @patch("dspy.teleprompt.apex.tracker.mlflow")
 def test_apex_mlflow_artifact_logging(mock_mlflow):
     """Test that APEX logs artifacts like hypotheses to MLflow."""
-    mock_run = MagicMock()
-    mock_run.info.run_id = "test-run-id"
-    mock_mlflow.start_run.return_value = mock_run
+    configure_mock_mlflow(mock_mlflow)
 
     trainset = [make_train_example("x")]
     calset = trainset
@@ -1134,9 +1170,7 @@ def test_apex_mlflow_context_manager():
 
     with patch("dspy.teleprompt.apex.tracker.MLFLOW_AVAILABLE", True):
         with patch("dspy.teleprompt.apex.tracker.mlflow") as mock_mlflow:
-            mock_run = MagicMock()
-            mock_run.info.run_id = "test-run-id"
-            mock_mlflow.start_run.return_value = mock_run
+            configure_mock_mlflow(mock_mlflow)
 
             tracker = ExperimentTracker(use_mlflow=True)
 
@@ -1146,6 +1180,32 @@ def test_apex_mlflow_context_manager():
                 tracker.log_metrics({"test_metric": 0.5})
 
             mock_mlflow.end_run.assert_called_once()
+            autolog_calls = mock_mlflow.dspy.autolog.call_args_list
+            assert autolog_calls[0].kwargs["log_traces"] is True
+            assert autolog_calls[-1] == call(disable=True, silent=True)
+
+
+@patch("dspy.teleprompt.apex.tracker.MLFLOW_AVAILABLE", True)
+@patch("dspy.teleprompt.apex.tracker.mlflow")
+def test_experiment_tracker_rejects_local_tracking_uri(mock_mlflow):
+    from dspy.teleprompt.apex.tracker import ExperimentTracker
+
+    configure_mock_mlflow(mock_mlflow)
+
+    with pytest.raises(ValueError, match="http or https"):
+        ExperimentTracker(use_mlflow=True, mlflow_tracking_uri="file:///tmp/mlruns")
+
+
+@patch("dspy.teleprompt.apex.tracker.MLFLOW_AVAILABLE", True)
+@patch("dspy.teleprompt.apex.tracker.mlflow")
+def test_experiment_tracker_detects_file_store_fallback(mock_mlflow):
+    from dspy.teleprompt.apex.tracker import ExperimentTracker
+
+    configure_mock_mlflow(mock_mlflow)
+    mock_mlflow.get_tracking_uri.return_value = "file:///tmp/mlruns"
+
+    with pytest.raises(RuntimeError, match="local file store"):
+        ExperimentTracker(use_mlflow=True, mlflow_tracking_uri="http://localhost:5000")
 
 
 def test_apex_tracking_utils_format_functions():

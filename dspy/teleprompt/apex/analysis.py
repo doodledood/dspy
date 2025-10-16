@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import random
 from contextlib import nullcontext
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 import dspy
 from dspy.adapters import Adapter
@@ -24,6 +24,21 @@ from .signatures import (
 )
 from .tracker import ExperimentTracker
 from .types import Verbosity
+
+
+def _to_serializable(value: Any) -> Any:
+    if isinstance(value, Prediction):
+        return value.toDict()
+    if hasattr(value, "model_dump"):
+        try:
+            return value.model_dump()  # type: ignore[no-untyped-call]
+        except Exception:  # pragma: no cover - defensive
+            pass
+    if isinstance(value, dict):
+        return {str(k): _to_serializable(v) for k, v in value.items()}
+    if isinstance(value, list | tuple | set):
+        return [_to_serializable(v) for v in value]
+    return value
 
 
 def _normalize_whitespace(text: str) -> str:
@@ -96,11 +111,32 @@ def analyze_examples(
         predictor = dspy.Predict(signature_class)
         prompt_text = getattr(predictor.signature, "instructions", "")
 
-        span_inputs = {
-            "inputs": record.example.inputs().toDict(),
-            "labels": record.example.labels().toDict(),
+        example_inputs = record.example.inputs().toDict()
+        example_labels = record.example.labels().toDict()
+        execution_flow_str = format_execution_flow(record.execution_flow)
+
+        call_inputs = {
+            "problem": str(example_inputs),
+            "prediction": str(record.prediction) if record.prediction else "",
+            "expected": str(example_labels),
+            "execution_flow": execution_flow_str,
             "metric_score": record.metric_score,
+            "metric_feedback": record.metric_feedback or "N/A",
+            "success_threshold": success_threshold,
+            "min_metric": min_metric,
+            "max_metric": max_metric,
+        }
+
+        if mode == "failure":
+            call_inputs["error"] = record.error or ""
+
+        span_inputs = {
+            "inputs": example_inputs,
+            "labels": example_labels,
+            "metric_score": record.metric_score,
+            "metric_feedback": record.metric_feedback,
             "prompt": prompt_text,
+            "analysis_payload": _to_serializable(call_inputs),
         }
 
         attributes = {
@@ -112,32 +148,13 @@ def analyze_examples(
         with tracker.span(f"apex.analysis.{mode}", inputs=span_inputs, attributes=attributes) as span:
             try:
                 with dspy.context(lm=analysis_lm, adapter=analysis_adapter):
-                    inputs = record.example.inputs().toDict()
-                    expected = record.example.labels().toDict()
-                    execution_flow_str = format_execution_flow(record.execution_flow)
-
-                    call_inputs = {
-                        "problem": str(inputs),
-                        "prediction": str(record.prediction) if record.prediction else "",
-                        "expected": str(expected),
-                        "execution_flow": execution_flow_str,
-                        "metric_score": record.metric_score,
-                        "metric_feedback": record.metric_feedback or "N/A",
-                        "success_threshold": success_threshold,
-                        "min_metric": min_metric,
-                        "max_metric": max_metric,
-                    }
-
-                    if mode == "failure":
-                        call_inputs["error"] = record.error or ""
-
                     result = predictor(**call_inputs)
 
                 if span and hasattr(span, "set_outputs"):
                     try:
                         payload = {
-                            "category": getattr(result, "category", "unknown"),
                             "prompt": prompt_text,
+                            "analysis": _to_serializable(result),
                         }
                         if mode == "failure":
                             payload["root_cause"] = getattr(result, "root_cause", "")
@@ -251,9 +268,33 @@ def generate_hypotheses(
     predictor = dspy.Predict(HypothesisGenerationSignature)
     prompt_text = getattr(predictor.signature, "instructions", "")
 
+    failure_text = "\n".join([f"- {f.root_cause} (category: {f.category})" for f in shuffled_failures])
+    success_text = (
+        "\n".join([f"- {s.success_pattern} (category: {s.category})" for s in success_summaries])
+        if success_summaries
+        else "No success patterns available"
+    )
+
+    program_flow = snapshot.flow_description
+    history_text = build_hypothesis_history_text(
+        include_history=include_history,
+        candidate_history=candidate_history,
+    )
+    current_val_text = f"{current_val_score:.4f}" if current_val_score is not None else "N/A"
+
+    generation_payload = {
+        "failure_analyses": failure_text,
+        "success_analyses": success_text,
+        "program_flow": program_flow,
+        "current_validation_score": current_val_text,
+        "hypothesis_history": history_text,
+        "num_hypotheses": num_hypotheses,
+    }
+
     span_inputs = {
         "current_val_score": current_val_score,
         "prompt": prompt_text,
+        "generation_payload": _to_serializable(generation_payload),
     }
 
     span_cm = (
@@ -263,29 +304,8 @@ def generate_hypotheses(
     )
 
     with span_cm as span:
-        failure_text = "\n".join([f"- {f.root_cause} (category: {f.category})" for f in shuffled_failures])
-        success_text = (
-            "\n".join([f"- {s.success_pattern} (category: {s.category})" for s in success_summaries])
-            if success_summaries
-            else "No success patterns available"
-        )
-
-        program_flow = snapshot.flow_description
-        history_text = build_hypothesis_history_text(
-            include_history=include_history,
-            candidate_history=candidate_history,
-        )
-        current_val_text = f"{current_val_score:.4f}" if current_val_score is not None else "N/A"
-
         with dspy.context(lm=hypothesis_lm, adapter=hypothesis_adapter):
-            result = predictor(
-                failure_analyses=failure_text,
-                success_analyses=success_text,
-                program_flow=program_flow,
-                current_validation_score=current_val_text,
-                hypothesis_history=history_text,
-                num_hypotheses=num_hypotheses,
-            )
+            result = predictor(**generation_payload)
 
         validated_specs = result.hypotheses if result.hypotheses else []
         validated_specs.sort(key=lambda h: (h.impact_score, h.generalizability_score), reverse=True)
@@ -297,10 +317,8 @@ def generate_hypotheses(
                     "num_hypotheses_generated": len(validated_specs),
                     "current_val_score": current_val_score or 0.0,
                     "prompt": prompt_text,
+                    "hypotheses": [_to_serializable(spec) for spec in validated_specs],
                 }
-                if validated_specs:
-                    payload["best_hypothesis_strategy"] = validated_specs[0].strategy
-                    payload["best_hypothesis_impact"] = validated_specs[0].impact_score
                 span.set_outputs(payload)
             except Exception:  # pragma: no cover - defensive
                 pass
