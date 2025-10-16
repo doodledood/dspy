@@ -515,6 +515,7 @@ def test_apex_rejects_invalid_analysis_json():
     student = PromptDrivenModule(initial_prompt="bad")
     trainset = [make_train_example("x")]
     from dspy.utils.exceptions import AdapterParseError
+
     with pytest.raises(AdapterParseError):
         optimizer.compile(student, trainset=trainset, valset=trainset)
 
@@ -697,6 +698,8 @@ def test_apex_end_to_end_fake_data():
     assert result.all_candidates[1].hypothesis is None  # First iteration baseline
     assert result.all_candidates[2].hypothesis is not None  # First iteration hypothesis
     assert result.all_candidates[3].hypothesis is None  # Second iteration baseline
+
+
 def test_apex_normal_verbosity_logs_candidates_only():
     trainset = [make_train_example("x")]
     calset = trainset
@@ -1066,9 +1069,7 @@ def test_apex_tracking_utils_format_functions():
     """Test the tracking utility formatting functions."""
     from dspy.teleprompt.apex import tracking_utils
 
-    baseline_metrics = tracking_utils.format_baseline_metrics(
-        baseline_score=0.5, num_train=10, num_val=5
-    )
+    baseline_metrics = tracking_utils.format_baseline_metrics(baseline_score=0.5, num_train=10, num_val=5)
     assert baseline_metrics["baseline_score"] == 0.5
     assert baseline_metrics["num_train_examples"] == 10
     assert baseline_metrics["num_val_examples"] == 5
@@ -1116,11 +1117,7 @@ def test_apex_tracking_utils_format_functions():
 
     best_candidate = MagicMock(overall_score=0.9)
     all_candidates = [MagicMock(overall_score=0.7), MagicMock(overall_score=0.9)]
-    iterations = [
-        MagicMock(
-            num_failures=2, num_successes=3, hypotheses=hypotheses
-        )
-    ]
+    iterations = [MagicMock(num_failures=2, num_successes=3, hypotheses=hypotheses)]
     summary = tracking_utils.format_optimization_summary(
         best_candidate=best_candidate,
         all_candidates=all_candidates,
@@ -1134,3 +1131,85 @@ def test_apex_tracking_utils_format_functions():
     assert summary["stopped_after"] == "patience"
     assert summary["total_iterations"] == 1
     assert summary["total_candidates"] == 2
+
+
+def test_apex_predictor_names_in_execution_flow_after_deepcopy():
+    """Predictor names must be correctly resolved in execution flow after deepcopy.
+
+    This tests the specific bug where predictor names show as 'unknown' in
+    execution flow, causing hypothesis LM to generate invalid predictor references.
+    """
+    from dspy.teleprompt.apex.execution_flow import extract_execution_flow
+
+    class QuestionAnswer(dspy.Signature):
+        question = dspy.InputField()
+        answer = dspy.OutputField()
+
+    program = dspy.ChainOfThought(QuestionAnswer)
+
+    # Simulate APEX's flow: deepcopy the program
+    program_copy = program.deepcopy()
+
+    # Run with tracing (simulating evaluate_train_examples)
+    example = dspy.Example(question="Test?", answer="42").with_inputs("question")
+
+    fake_lm = DummyLM([{"reasoning": "thinking", "answer": "42"}])
+    with dspy.settings.context(lm=fake_lm, trace=[], max_trace_size=50):
+        _ = program_copy(question=example.question)
+        trace = list(dspy.settings.trace or [])
+
+    assert len(trace) > 0, "Trace should contain predictor calls"
+
+    # Extract execution flow from the SAME program instance
+    execution_flow = extract_execution_flow(trace, program_copy)
+
+    # Critical assertion: predictor names must NOT be "unknown"
+    for entry in execution_flow:
+        assert entry.predictor_name != "unknown", (
+            f"BUG: Predictor name is 'unknown' (type: {entry.predictor_type}). "
+            f"This causes hypothesis LM to see 'unknown (Predict)' and generate "
+            f"invalid predictor references like 'Predict' instead of 'predict'."
+        )
+        # For ChainOfThought, the single predictor is named "predict"
+        assert entry.predictor_name == "predict", f"Expected 'predict', got '{entry.predictor_name}'"
+
+
+def test_apex_end_to_end_with_deepcopy():
+    """Verify APEX works end-to-end with deepcopied programs."""
+    trainset = [make_train_example("x"), make_train_example("y")]
+    calset = trainset
+
+    analysis_lm = DummyLM(
+        [make_analysis_response("needs fix") for _ in range(len(trainset))],
+        adapter=dspy.JSONAdapter(),
+    )
+    hypothesis_lm = DummyLM(
+        [make_hypothesis_response("good")],
+        adapter=dspy.JSONAdapter(),
+    )
+
+    optimizer = APEX(
+        metric=metric,
+        analysis_lm=analysis_lm,
+        hypothesis_lm=hypothesis_lm,
+        max_iterations=1,
+        num_hypotheses=1,
+        convergence_patience=1,
+        num_eval_runs=1,
+        train_sample=None,
+        seed=99,
+        verbosity="none",
+    )
+
+    student = PromptDrivenModule(initial_prompt="bad")
+    optimized = optimizer.compile(student, trainset=trainset, valset=calset)
+
+    # Verify optimization succeeded (predictor names were resolved correctly)
+    assert optimized.predictor.signature.instructions == "good"
+    assert optimized.apex_result.best_candidate.overall_score == 1.0
+
+    # Verify predictor names appeared correctly in failure analysis
+    # (this would have failed with the "unknown" bug)
+    iteration = optimized.apex_result.iterations[0]
+    assert len(iteration.hypotheses) == 1
+    assert "predictor" in iteration.hypotheses[0].prompt_changes
