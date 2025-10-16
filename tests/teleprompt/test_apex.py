@@ -1,4 +1,6 @@
 import random
+from contextlib import contextmanager
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -81,28 +83,46 @@ def metric(example: Example, prediction: dspy.Prediction, trace) -> float:
     return 1.0 if expected == predicted else 0.0
 
 
-class InMemoryTracker(ExperimentTracker):
-    """Tracker stub that captures logged trace batches in-memory."""
+class RecordingTracker(ExperimentTracker):
+    """Tracker stub that records span calls for assertions."""
 
     def __init__(self):
         super().__init__(use_mlflow=False)
-        self.logged_batches: list = []
+        self.spans: list[dict[str, Any]] = []
 
-    def __enter__(self):
+    def __enter__(self):  # pragma: no cover - simple stub
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, exc_type, exc_val, exc_tb):  # pragma: no cover - simple stub
         return False
 
-    def is_active(self):
-        return True
+    @contextmanager
+    def span(self, name: str, *, inputs=None, attributes=None):
+        record = {
+            "name": name,
+            "inputs": inputs,
+            "attributes": attributes,
+            "outputs": None,
+        }
 
-    def log_trace_batch(self, batch):
-        self.logged_batches.append(batch)
+        class _Span:
+            def __init__(self, store):
+                self._store = store
+
+            def set_outputs(self, value):
+                self._store["outputs"] = value
+
+            def set_attribute(self, key, value):
+                attrs = self._store.setdefault("attributes", {})
+                attrs[key] = value
+
+        span = _Span(record)
+        self.spans.append(record)
+        yield span
 
 
 def test_evaluate_candidate_logs_traces_without_mutating_predictors():
-    tracker = InMemoryTracker()
+    tracker = RecordingTracker()
     runtime = runtime_module.RuntimeTools(verbosity=Verbosity.HIGH, num_threads=1)
     engine = EvaluationEngine(
         metric=metric,
@@ -134,12 +154,10 @@ def test_evaluate_candidate_logs_traces_without_mutating_predictors():
     predictor_names = [name for name, _ in record.program.named_predictors()]
     assert predictor_names == ["predictor"]
 
-    assert tracker.logged_batches, "Expected execution traces to be logged"
-    artifact = tracker.logged_batches[0].to_artifact()
-    assert artifact["stage"] == "baseline_evaluation"
-    execution_flows = artifact["traces"][0]["runs"][0]["execution_flow"]
-    predictor_names_in_trace = {entry["predictor_name"] for entry in execution_flows}
-    assert predictor_names_in_trace == {"predictor"}
+    assert tracker.spans, "Expected spans to be recorded"
+    span = tracker.spans[0]
+    assert span["name"] == "apex.baseline_example"
+    assert span["outputs"]["median_score"] == 1.0
 
 
 @pytest.mark.parametrize(
