@@ -57,6 +57,19 @@ def build_hypothesis_history_text(*, include_history: bool, candidate_history: S
         lines.append("- No hypotheses have been tried yet.")
         return "\n".join(lines)
 
+    baseline_candidate = min(
+        (candidate for candidate in candidate_history if candidate.iteration == 0),
+        default=None,
+        key=lambda candidate: candidate.iteration,
+    )
+    if baseline_candidate is None:
+        baseline_candidate = min(candidate_history, key=lambda candidate: candidate.iteration)
+
+    if baseline_candidate is not None:
+        baseline_score = baseline_candidate.overall_score
+        baseline_score_text = f"{baseline_score:.4f}" if baseline_score is not None else "N/A"
+        lines.append(f"- Iteration {baseline_candidate.iteration} baseline score={baseline_score_text}")
+
     sorted_candidates = sorted(
         (candidate for candidate in candidate_history if candidate.hypothesis),
         key=lambda candidate: candidate.iteration,
