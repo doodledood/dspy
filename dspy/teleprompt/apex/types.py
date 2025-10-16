@@ -1,4 +1,5 @@
 """Shared type definitions for the APEX optimizer."""
+
 from __future__ import annotations
 
 from enum import Enum

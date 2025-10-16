@@ -1,4 +1,5 @@
 """Data models used by the APEX optimizer."""
+
 from __future__ import annotations
 
 from enum import Enum

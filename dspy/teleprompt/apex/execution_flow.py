@@ -50,10 +50,21 @@ def extract_execution_flow(trace: list[TraceEntry], program: Module) -> list[Exe
         predictor_name = "unknown"
         predictor_type = type(predictor_obj).__name__
 
-        for name, pred in predictor_lookup.items():
-            if pred is predictor_obj:
-                predictor_name = name
-                break
+        if hasattr(predictor_obj, "_predictor_name"):
+            predictor_name = predictor_obj._predictor_name
+        else:
+            trace_predictor = predictor_obj
+            if hasattr(predictor_obj, "_wrapped_predictor"):
+                trace_predictor = predictor_obj._wrapped_predictor
+
+            for name, pred in predictor_lookup.items():
+                lookup_predictor = pred
+                if hasattr(pred, "_wrapped_predictor"):
+                    lookup_predictor = pred._wrapped_predictor
+
+                if pred is predictor_obj or lookup_predictor is trace_predictor:
+                    predictor_name = name
+                    break
 
         instructions = ""
         if hasattr(predictor_obj, "signature") and hasattr(predictor_obj.signature, "instructions"):

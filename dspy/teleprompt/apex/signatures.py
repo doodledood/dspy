@@ -1,5 +1,6 @@
 # ruff: noqa: RUF002
 """Prompt signatures used by the APEX optimizer."""
+
 from __future__ import annotations
 
 from dspy.signatures import InputField, OutputField, Signature

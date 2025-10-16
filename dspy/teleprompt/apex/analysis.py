@@ -28,9 +28,7 @@ def _normalize_whitespace(text: str) -> str:
     return " ".join(text.split())
 
 
-def build_hypothesis_history_text(
-    *, include_history: bool, candidate_history: Sequence[CandidateRecord] | None
-) -> str:
+def build_hypothesis_history_text(*, include_history: bool, candidate_history: Sequence[CandidateRecord] | None) -> str:
     if not include_history:
         return "N/A"
 
@@ -60,9 +58,7 @@ def build_hypothesis_history_text(
             continue
 
         for predictor_name, change in changes.items():
-            rationale_text = (
-                _normalize_whitespace(change.rationale) if change.rationale else "No rationale provided"
-            )
+            rationale_text = _normalize_whitespace(change.rationale) if change.rationale else "No rationale provided"
             magnitude = change.change_magnitude.value
             lines.append(f"    * {predictor_name} [{magnitude}]: {rationale_text}")
 
@@ -215,9 +211,7 @@ def generate_hypotheses(
 
     program_flow = snapshot.flow_description
 
-    history_text = build_hypothesis_history_text(
-        include_history=include_history, candidate_history=candidate_history
-    )
+    history_text = build_hypothesis_history_text(include_history=include_history, candidate_history=candidate_history)
     current_val_text = f"{current_val_score:.4f}" if current_val_score is not None else "N/A"
 
     with dspy.context(lm=hypothesis_lm, adapter=hypothesis_adapter):

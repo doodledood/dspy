@@ -97,9 +97,7 @@ class CheckpointManager:
             checkpoint = cloudpickle.load(f)
 
         if not isinstance(checkpoint, ApexCheckpoint):
-            raise TypeError(
-                f"Invalid checkpoint type: expected ApexCheckpoint, got {type(checkpoint)}"
-            )
+            raise TypeError(f"Invalid checkpoint type: expected ApexCheckpoint, got {type(checkpoint)}")
 
         self.runtime.log(
             f"APEX: Loaded checkpoint from iteration {checkpoint.iteration}",

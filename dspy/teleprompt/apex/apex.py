@@ -380,16 +380,8 @@ class APEX(Teleprompter):
                     f"APEX: running with num_threads={self.num_threads}",
                     Verbosity.NORMAL,
                 )
-                max_iter_str = (
-                    f"{self.max_iterations}"
-                    if self.max_iterations is not None
-                    else "until convergence"
-                )
-                patience_str = (
-                    f"{self.convergence_patience}"
-                    if self.convergence_patience is not None
-                    else "disabled"
-                )
+                max_iter_str = f"{self.max_iterations}" if self.max_iterations is not None else "until convergence"
+                patience_str = f"{self.convergence_patience}" if self.convergence_patience is not None else "disabled"
                 self._log(
                     "APEX: Configuration - "
                     f"max_iterations={max_iter_str}, "
@@ -589,7 +581,9 @@ class APEX(Teleprompter):
                     )
                     if hypotheses and self._is_enabled(Verbosity.NORMAL):
                         for idx, hypothesis in enumerate(hypotheses, start=1):
-                            predictors_updated = list(hypothesis.prompt_changes.keys()) if hypothesis.prompt_changes else []
+                            predictors_updated = (
+                                list(hypothesis.prompt_changes.keys()) if hypothesis.prompt_changes else []
+                            )
                             self._log(
                                 "APEX: hypothesis #"
                                 f"{idx} - strategy: {hypothesis.strategy}, impact: {hypothesis.impact_score:.2f}, "
@@ -610,9 +604,7 @@ class APEX(Teleprompter):
                         cached_baseline=state.current_baseline_candidate if iteration > 1 else None,
                     )
 
-                    best_candidate_for_iteration = self.evaluator.select_best_candidate(
-                        iteration_candidates
-                    )
+                    best_candidate_for_iteration = self.evaluator.select_best_candidate(iteration_candidates)
 
                     state.all_candidates.extend(iteration_candidates)
                     state.iteration_logs.append(
@@ -641,19 +633,13 @@ class APEX(Teleprompter):
                             candidate_data = tracking_utils.format_candidate_data(candidate)
                             self.tracker.log_candidate(candidate_data, iteration, idx)
 
-                    if (
-                        best_candidate_for_iteration.overall_score
-                        > state.best_candidate.overall_score
-                    ):
+                    if best_candidate_for_iteration.overall_score > state.best_candidate.overall_score:
                         state.best_candidate = best_candidate_for_iteration
                         self._log(
                             f"APEX: New best candidate found with score {state.best_candidate.overall_score:.4f}",
                             Verbosity.NORMAL,
                         )
-                        if (
-                            state.best_candidate.hypothesis
-                            and state.best_candidate.hypothesis.prompt_changes
-                        ):
+                        if state.best_candidate.hypothesis and state.best_candidate.hypothesis.prompt_changes:
                             self._log(
                                 "APEX: Improved "
                                 f"{len(state.best_candidate.hypothesis.prompt_changes)} predictor prompt(s) - "
@@ -821,8 +807,7 @@ class APEX(Teleprompter):
                 Verbosity.HIGH,
             )
             score_trajectory = [
-                max(c.overall_score for c in log.candidates) if log.candidates else 0.0
-                for log in state.iteration_logs
+                max(c.overall_score for c in log.candidates) if log.candidates else 0.0 for log in state.iteration_logs
             ]
             self._log(
                 f"APEX: Best score trajectory across iterations: {score_trajectory}",
@@ -838,4 +823,3 @@ class APEX(Teleprompter):
             stopped_after=state.stop_reason,
         )
         return optimized_program
-

@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 
 try:
     import mlflow
+
     MLFLOW_AVAILABLE = True
 except ImportError:
     MLFLOW_AVAILABLE = False
@@ -90,7 +91,9 @@ class TrackedPredictor:
                 mlflow.log_metric(metric_name, call_info["execution_time"], step=step)
 
             # Log full trace as artifact
-            artifact_name = f"predictor_traces_iter_{self._iteration}.jsonl" if self._iteration else "predictor_traces.jsonl"
+            artifact_name = (
+                f"predictor_traces_iter_{self._iteration}.jsonl" if self._iteration else "predictor_traces.jsonl"
+            )
 
             import os
             import tempfile
@@ -161,7 +164,7 @@ class TrackedModule(dspy.Module):
         self._call_count += 1
 
         if not self._tracking_enabled:
-            return self._wrapped_module.forward(*args, **kwargs)
+            return self._wrapped_module(*args, **kwargs)
 
         start_time = time.time()
         call_info = {
@@ -181,7 +184,7 @@ class TrackedModule(dspy.Module):
 
         try:
             # Execute the actual forward call
-            result = self._wrapped_module.forward(*args, **kwargs)
+            result = self._wrapped_module(*args, **kwargs)
 
             call_info["execution_time"] = time.time() - start_time
             call_info["status"] = "success"

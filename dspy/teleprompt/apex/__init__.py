@@ -1,4 +1,5 @@
 """APEX optimizer package."""
+
 from dspy.teleprompt.apex.apex import APEX
 from dspy.teleprompt.apex.models import (
     ApexCheckpoint,

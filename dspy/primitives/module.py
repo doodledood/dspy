@@ -172,10 +172,10 @@ class Module(BaseModule, metaclass=ProgramMeta):
 
         # Execute the forward method of Parallel
         if return_failed_examples:
-            results, failed_examples, exceptions = parallel_executor.forward(exec_pairs)
+            results, failed_examples, exceptions = parallel_executor(exec_pairs)
             return results, failed_examples, exceptions
         else:
-            results = parallel_executor.forward(exec_pairs)
+            results = parallel_executor(exec_pairs)
             return results
 
     def _set_lm_usage(self, tokens: dict[str, Any], output: Any):
@@ -191,8 +191,9 @@ class Module(BaseModule, metaclass=ProgramMeta):
         if prediction_in_output:
             prediction_in_output.set_lm_usage(tokens)
         else:
-            logger.warning("Failed to set LM usage. Please return `dspy.Prediction` object from dspy.Module to enable usage tracking.")
-
+            logger.warning(
+                "Failed to set LM usage. Please return `dspy.Prediction` object from dspy.Module to enable usage tracking."
+            )
 
     def __getattribute__(self, name):
         attr = super().__getattribute__(name)
