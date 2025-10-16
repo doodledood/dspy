@@ -68,6 +68,34 @@ class ExecutionFlowEntry(BaseModel):
     input_sources: dict[str, list[str]] = Field(default_factory=dict)
 
 
+class FailureSummaryRecord(BaseModel):
+    """Structured failure summary passed to hypothesis generation."""
+
+    root_cause: str = Field(description="Fundamental issue identified by FailureDetective")
+    involved_predictors: list[str] = Field(
+        default_factory=list,
+        description="Predictors in causal order (primary failure first, then affected downstream)",
+    )
+    context: str = Field(description="Input characteristics that trigger this failure")
+    category: str = Field(description="Canonical category label for grouping similar failures")
+    key_details: str = Field(description="Structured fix info: SEVERITY / PRIMARY_FAILURE / FIXABLE / NOT_FIXABLE / SUGGESTED_FIX")
+
+
+class SuccessSummaryRecord(BaseModel):
+    """Structured success summary passed to hypothesis generation."""
+
+    success_pattern: str = Field(description="Mechanism that produced the success")
+    contributing_predictors: list[str] = Field(
+        default_factory=list,
+        description="Predictors responsible for the success pattern",
+    )
+    context: str = Field(description="Input characteristics where the success pattern applies")
+    category: str = Field(description="Categorization of the success pattern")
+    key_details: str = Field(
+        description="Preservation guidance: MUST PRESERVE / CAN MODIFY / FRAGILE / RELIABILITY"
+    )
+
+
 class TrainExampleRecord(BaseModel):
     """Record of a single training example evaluation."""
 
@@ -154,6 +182,8 @@ __all__ = [
     "PromptChange",
     "HypothesisSpec",
     "ExecutionFlowEntry",
+    "FailureSummaryRecord",
+    "SuccessSummaryRecord",
     "TrainExampleRecord",
     "CandidateRecord",
     "ProgramSnapshot",

@@ -12,8 +12,10 @@ from dspy.primitives import Prediction
 from .models import (
     CandidateRecord,
     ExecutionFlowEntry,
+    FailureSummaryRecord,
     HypothesisSpec,
     ProgramSnapshot,
+    SuccessSummaryRecord,
     TrainExampleRecord,
 )
 from .runtime import RuntimeTools
@@ -268,12 +270,27 @@ def generate_hypotheses(
     predictor = dspy.Predict(HypothesisGenerationSignature)
     prompt_text = getattr(predictor.signature, "instructions", "")
 
-    failure_text = "\n".join([f"- {f.root_cause} (category: {f.category})" for f in shuffled_failures])
-    success_text = (
-        "\n".join([f"- {s.success_pattern} (category: {s.category})" for s in success_summaries])
-        if success_summaries
-        else "No success patterns available"
-    )
+    failure_records = [
+        FailureSummaryRecord(
+            root_cause=getattr(f, "root_cause", ""),
+            involved_predictors=list(getattr(f, "involved_predictors", []) or []),
+            context=getattr(f, "context", "") or "",
+            category=getattr(f, "category", "") or "",
+            key_details=getattr(f, "key_details", "") or "",
+        )
+        for f in shuffled_failures
+    ]
+
+    success_records = [
+        SuccessSummaryRecord(
+            success_pattern=getattr(s, "success_pattern", ""),
+            contributing_predictors=list(getattr(s, "contributing_predictors", []) or []),
+            context=getattr(s, "context", "") or "",
+            category=getattr(s, "category", "") or "",
+            key_details=getattr(s, "key_details", "") or "",
+        )
+        for s in success_summaries
+    ]
 
     program_flow = snapshot.flow_description
     history_text = build_hypothesis_history_text(
@@ -283,10 +300,11 @@ def generate_hypotheses(
     current_val_text = f"{current_val_score:.4f}" if current_val_score is not None else "N/A"
 
     generation_payload = {
-        "failure_analyses": failure_text,
-        "success_analyses": success_text,
+        "failure_analyses": failure_records,
+        "success_analyses": success_records,
         "program_flow": program_flow,
         "current_validation_score": current_val_text,
+        "current_iteration": iteration if iteration is not None else -1,
         "hypothesis_history": history_text,
         "num_hypotheses": num_hypotheses,
     }
@@ -316,6 +334,9 @@ def generate_hypotheses(
                 payload = {
                     "num_hypotheses_generated": len(validated_specs),
                     "current_val_score": current_val_score or 0.0,
+                    "current_iteration": iteration if iteration is not None else -1,
+                    "failure_analyses": [_to_serializable(record) for record in failure_records],
+                    "success_analyses": [_to_serializable(record) for record in success_records],
                     "prompt": prompt_text,
                     "hypotheses": [_to_serializable(spec) for spec in validated_specs],
                 }

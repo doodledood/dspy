@@ -17,7 +17,9 @@ from dspy.teleprompt.apex import (
     PromptChange,
     Verbosity,
 )
+from dspy.teleprompt.apex.analysis import generate_hypotheses
 from dspy.teleprompt.apex.evaluation import EvaluationEngine
+from dspy.teleprompt.apex.models import ProgramSnapshot
 from dspy.utils.dummies import DummyLM
 
 
@@ -191,6 +193,66 @@ def test_evaluate_candidate_logs_traces_without_mutating_predictors():
     assert "predictor" in span["inputs"]["prompts"]
 
 
+def test_generate_hypotheses_traces_include_full_context():
+    tracker = RecordingTracker()
+    runtime = runtime_module.RuntimeTools(verbosity=Verbosity.HIGH, num_threads=1)
+
+    failure_summary = dspy.Prediction(**make_analysis_response("Extractor dropped required field"))
+    success_summary = dspy.Prediction(**make_success_response("Validator preserved schema"))
+
+    hypothesis_adapter = dspy.JSONAdapter()
+    hypothesis_lm = DummyLM([make_hypothesis_response()], adapter=hypothesis_adapter)
+
+    snapshot = ProgramSnapshot(
+        structure="Test structure",
+        flow_description="predictor -> validator",
+        prompts={"predictor": "Prompt"},
+        predictor_name_by_id={},
+    )
+
+    hypotheses = generate_hypotheses(
+        failure_summaries=[failure_summary],
+        success_summaries=[success_summary],
+        snapshot=snapshot,
+        candidate_history=None,
+        current_val_score=0.5,
+        runtime=runtime,
+        hypothesis_lm=hypothesis_lm,
+        hypothesis_adapter=hypothesis_adapter,
+        num_hypotheses=1,
+        include_history=False,
+        rng=random.Random(0),
+        iteration=2,
+        tracker=tracker,
+    )
+
+    assert hypotheses, "Expected at least one hypothesis"
+
+    span = tracker.spans[-1]
+    assert span["name"] == "apex.generate_hypotheses"
+    payload = span["inputs"]["generation_payload"]
+
+    failure_records = payload["failure_analyses"]
+    assert isinstance(failure_records, list) and failure_records, "Expected serialized failure analyses"
+    failure_entry = failure_records[0]
+    assert failure_entry["root_cause"] == "Extractor dropped required field"
+    assert failure_entry["involved_predictors"] == ["predictor"]
+    assert failure_entry["category"] == "format_ambiguity"
+    assert failure_entry["key_details"] == "Needs to say good"
+
+    success_records = payload["success_analyses"]
+    assert isinstance(success_records, list) and success_records, "Expected serialized success analyses"
+    success_entry = success_records[0]
+    assert success_entry["success_pattern"] == "Validator preserved schema"
+    assert success_entry["contributing_predictors"] == ["predictor"]
+    assert success_entry["category"] == "clear_format_compliance"
+    assert success_entry["key_details"] == "Keep current instructions"
+
+    assert payload["current_iteration"] == 2
+
+    outputs = span["outputs"]
+    assert outputs["failure_analyses"][0]["root_cause"] == "Extractor dropped required field"
+    assert outputs["success_analyses"][0]["success_pattern"] == "Validator preserved schema"
 @pytest.mark.parametrize(
     "kwargs, error_match",
     [

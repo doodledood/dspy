@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from dspy.signatures import InputField, OutputField, Signature
-from dspy.teleprompt.apex.models import HypothesisSpec
+from dspy.teleprompt.apex.models import FailureSummaryRecord, HypothesisSpec, SuccessSummaryRecord
 
 
 class FailureAnalysisSignature(Signature):
@@ -594,16 +594,17 @@ class HypothesisGenerationSignature(Signature):
 
     ## Input Understanding
 
-    You receive string summaries (not raw data) from a SAMPLE of training examples:
+    You receive structured summaries (not raw data) from a SAMPLE of training examples:
 
-    - **failure_analyses**: Root causes and categories from failed examples in this iteration’s sample
-    - **success_analyses**: Patterns that worked well and must be preserved
+    - **failure_analyses**: List[FailureSummaryRecord]. Each record bundles root_cause, involved_predictors (causal order), context, category, and key_details for one failed example.
+    - **success_analyses**: List[SuccessSummaryRecord]. Each record bundles success_pattern, contributing_predictors, context, category, and key_details for one successful example.
       *Count them carefully.* The mix of success and failure analyses mirrors the
       outcomes in this batch. A high success-to-failure ratio signals you should
       propose very small, low-risk tweaks; a low ratio indicates broader fixes may be
       justified.
     - **program_flow**: Predictor dependencies forming a directed acyclic graph (DAG) of relationships
     - **current_validation_score**: Latest validation score for the current baseline program. If unavailable, will be "N/A".
+    - **current_iteration**: Current optimizer iteration number (0-indexed) to ground hypotheses in trajectory stage
     - **hypothesis_history**: Chronological record of prior hypotheses with validation scores, iteration numbers, and prompt
       change rationales (no raw prompts). Use this trajectory to track which prompt adjustments boosted or hurt validation,
       protect improvements by preserving successful rationales, and steer clear of ideas that previously regressed the score.
@@ -804,16 +805,20 @@ class HypothesisGenerationSignature(Signature):
 
     Remember: You’re working with pattern summaries. Focus on fixing clear problems while preserving successful approaches. Conservative improvements beat risky rewrites."""
 
-    failure_analyses: str = InputField(
-        desc="Root cause summaries from failure analyses, showing patterns and issues to fix"
+    failure_analyses: list[FailureSummaryRecord] = InputField(
+        desc="Structured failure analyses (FailureSummaryRecord) for this iteration"
     )
-    success_analyses: str = InputField(
-        desc="Success pattern summaries for contrast, showing what works well and should be preserved"
+    success_analyses: list[SuccessSummaryRecord] = InputField(
+        desc="Structured success analyses (SuccessSummaryRecord) for this iteration"
     )
     program_flow: str = InputField(desc="Program structure showing predictor relationships as a directed acyclic graph")
     current_validation_score: str = InputField(
         desc="Latest validation score for the current baseline program; 'N/A' if unavailable",
         default="N/A",
+    )
+    current_iteration: int = InputField(
+        desc="Current optimizer iteration number (0-indexed) to ground hypotheses",
+        default=-1,
     )
     hypothesis_history: str = InputField(
         desc="History of previously tested hypotheses with validation scores and change notes; 'N/A' if unavailable",
