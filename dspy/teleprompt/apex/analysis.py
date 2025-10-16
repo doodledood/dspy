@@ -66,10 +66,12 @@ def build_hypothesis_history_text(*, include_history: bool, candidate_history: S
         baseline_candidate = min(candidate_history, key=lambda candidate: candidate.iteration)
 
     baseline_score: float | None = None
+    best_so_far = None
     if baseline_candidate is not None:
         baseline_score = baseline_candidate.overall_score
         baseline_score_text = f"{baseline_score:.4f}" if baseline_score is not None else "N/A"
-        lines.append(f"- Iteration {baseline_candidate.iteration} baseline score={baseline_score_text}")
+        lines.append(f"- Iteration {baseline_candidate.iteration} baseline score={baseline_score_text} (best so far)")
+        best_so_far = baseline_score
 
     sorted_candidates = sorted(
         (candidate for candidate in candidate_history if candidate.hypothesis),
@@ -84,10 +86,14 @@ def build_hypothesis_history_text(*, include_history: bool, candidate_history: S
         score = candidate.overall_score
         score_text = f"{score:.4f}" if score is not None else "N/A"
         delta_text = ""
-        if baseline_score is not None and score is not None:
-            delta = score - baseline_score
-            delta_text = f", delta={'+' if delta >= 0 else ''}{delta:.4f} vs baseline"
+        previous_best = best_so_far
+        if previous_best is not None and score is not None:
+            delta = score - previous_best
+            delta_text = f", delta={'+' if delta >= 0 else ''}{delta:.4f} vs prior best"
         lines.append(f"- Iteration {candidate.iteration} (score={score_text}{delta_text}):")
+
+        if score is not None:
+            best_so_far = score if previous_best is None else max(previous_best, score)
 
         changes = candidate.hypothesis.prompt_changes
         if not changes:

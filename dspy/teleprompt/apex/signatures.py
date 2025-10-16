@@ -602,15 +602,16 @@ class HypothesisGenerationSignature(Signature):
       outcomes in this batch. A high success-to-failure ratio signals you should
       propose very small, low-risk tweaks; a low ratio indicates broader fixes may be
       justified.
-    - **program_flow**: Predictor dependencies forming a directed acyclic graph (DAG) of relationships
+    - **program_flow**: Predictor dependencies forming a directed acyclic graph (DAG) of relationships. This snapshot (including
+      prompt text) always reflects the current best-so-far baseline you are improving.
     - **best_validation_score**: Best validation score achieved so far (initial baseline at minimum). If unavailable, will be "N/A".
     - **current_iteration**: Current optimizer iteration number (0-indexed) to ground hypotheses in trajectory stage
     - **hypothesis_history**: Chronological record of prior hypotheses with validation scores, iteration numbers, and prompt
       change rationales (no raw prompts). The history always begins with an iteration 0 baseline line, followed by each tested
-      hypothesis annotated with the score delta versus that baseline. Use this trajectory to track which prompt adjustments
-      boosted or hurt validation, protect improvements by preserving successful rationales, and steer clear of ideas that
-      previously regressed the score. When unavailable, this field will be "N/A"; in that case rely on the current failure and
-      success analyses to propose minimal, high-leverage changes.
+      hypothesis annotated with the score delta relative to the prior best-so-far score. Use this trajectory to track which
+      prompt adjustments boosted or hurt validation, protect improvements by preserving successful rationales, and steer clear
+      of ideas that previously regressed the score. When unavailable, this field will be "N/A"; in that case rely on the
+      current failure and success analyses to propose minimal, high-leverage changes.
 
     Key insight: A predictor might succeed on some inputs and fail on others. Look for consistent patterns, not one-off issues. Use categories to group related failures for more effective targeting.
 
