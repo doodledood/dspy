@@ -83,27 +83,39 @@ class FailureAnalysisSignature(Signature):
     ### 3. Root Cause Categorization
     Based on I/O analysis, classify the ROOT cause (not symptoms):
 
-    **Prompt-Related** (Fixable):
-    - `missing-format-spec`: Output format not specified (e.g., JSON structure)
-    - `ambiguous-instruction`: Unclear what predictor should do
-    - `missing-constraint`: Lacks validation rules or boundaries
-    - `inconsistent-terminology`: Conflicting terms between predictors
-    - `insufficient-examples`: Needs concrete examples in prompt
+    **Prompt-Related** (Fixable via Instructions):
+    - `missing-format-spec`: Output format not specified (e.g., "must be integer", "return as JSON")
+    - `missing-constraint`: Lacks validation rules or boundaries (e.g., "sum must equal 1000")
+    - `unclear-methodology`: Instructions don't specify HOW to solve (e.g., needs "step-by-step")
+    - `incomplete-instruction`: Missing critical requirements (e.g., "verify all conditions")
+    - `ambiguous-target`: Unclear what to output (e.g., "find the value" without specifying which)
+    - `insufficient-structure`: Needs more organized approach (e.g., "break into cases")
+    - `missing-examples`: Needs concrete examples to guide format/approach
+    - `missing-reasoning`: Needs explicit CoT/reasoning requirement (e.g., "show your work")
+    - `over-constrained`: Instructions too rigid, preventing correct approach
+    - `inconsistent-requirements`: Conflicting instructions within prompt
 
-    **Data-Flow** (Partially Fixable):
+    **Data-Related** (Not Fixable via Prompts):
+    - `missing-context`: Required information not provided in inputs
+    - `insufficient-input`: Input lacks necessary data to solve problem
+    - `corrupted-input`: Input data malformed or contains errors
+    - `wrong-input-type`: Input is wrong type for the task
+
+    **Architecture** (Structural Issues):
     - `type-mismatch`: Upstream output type doesn't match downstream input
-    - `schema-mismatch`: Field names/structure incompatible
-    - `data-loss`: Information lost during transformation
-    - `encoding-error`: Character encoding or escaping issues
-
-    **Architecture** (Not Fixable via Prompts):
-    - `missing-retrieval`: Needs external data not available
-    - `model-limitation`: Beyond LM capabilities
+    - `schema-mismatch`: Field names/structure incompatible between predictors
+    - `data-loss`: Information lost during predictor transformation
+    - `missing-retrieval`: Needs external data source not available
+    - `computational-complexity`: Problem inherently too hard for LM
     - `wrong-predictor-type`: Needs different predictor class
 
     **Custom Categories**:
-    - If none fit, create a specific descriptive category
-    - Format: `domain-specific-issue` (e.g., `math-precision-error`, `date-parsing-failure`)
+    - When NONE of the above fit, create a specific descriptive category
+    - Format: `domain-specific-issue` (e.g., `temporal-reasoning-error`, `spatial-logic-failure`)
+    - Use custom categories liberally when the issue is unique
+
+    **IMPORTANT**: Identify the TRUE root cause, whether prompt-related or not. Don't force everything
+    to be a prompt issue. If the problem is missing data or wrong inputs, say so.
     - Be specific enough to group similar failures
 
     ### 4. Category Selection & Fix Strategy
@@ -114,26 +126,36 @@ class FailureAnalysisSignature(Signature):
     3. ELSE → Analyze quality issues in output
 
     **Category Selection Tree**:
+    • Missing required data?
+      - Input lacks needed info → `missing-context` or `insufficient-input`
+      - Needs external source → `missing-retrieval`
+      - Input corrupted → `corrupted-input`
+
     • Crashed/exception?
       - Type mismatch in I/O → `type-mismatch`
       - Schema/field mismatch → `schema-mismatch`
-      - Otherwise → `ambiguous-instruction`
+      - Wrong input type → `wrong-input-type`
+      - Missing instruction → `incomplete-instruction`
 
     • Wrong format/structure?
       - Missing format spec → `missing-format-spec`
       - Has spec but wrong fields → `schema-mismatch`
 
-    • Missing information?
-      - Lacks examples → `insufficient-examples`
-      - Unclear instructions → `ambiguous-instruction`
-      - Data unavailable → `missing-retrieval`
+    • Missing/wrong approach?
+      - No methodology specified → `unclear-methodology`
+      - Needs structure → `insufficient-structure`
+      - Missing verification → `incomplete-instruction`
+      - Needs examples → `missing-examples`
+      - Needs reasoning shown → `missing-reasoning`
 
     • Wrong values/content?
       - Missing constraints → `missing-constraint`
-      - Ambiguous instructions → `ambiguous-instruction`
-      - Beyond capabilities → `model-limitation`
+      - Unclear target → `ambiguous-target`
+      - Too rigid instructions → `over-constrained`
+      - Conflicting requirements → `inconsistent-requirements`
+      - Computationally hard → `computational-complexity`
 
-    • None fit? → Create: `[domain]-[specific]-[issue]`
+    • None fit? → Create custom: `[domain]-[specific]-[issue]`
 
     **Fix Strategy by Severity**:
     - NEAR_MISS: Small clarification, single predictor adjustment
@@ -144,11 +166,14 @@ class FailureAnalysisSignature(Signature):
 
     Provide focused analysis with these EXACT fields:
 
-    **root_cause**: The fundamental issue (not symptoms)
-    - Start with failure location: "In [Predictor], ..."
-    - State what went wrong with I/O evidence
-    - Length: 2-3 sentences max
-    - Include data evidence from I/O analysis
+    **root_cause**: The fundamental issue (prompt-related OR data-related OR architectural)
+    - Start with: "In [Predictor], ..."
+    - Describe the TRUE root cause, not forced to be prompt-related
+    - Length: 1-2 sentences max
+    - Examples:
+      - Prompt issue: "In predict, lacks instruction to output integer format. Produced '370/3' instead."
+      - Data issue: "In predict, input missing required context about base year for calculation."
+      - Architecture issue: "In ExtractorPredictor, output schema incompatible with downstream Validator."
 
     **involved_predictors**: Predictors contributing to failure
     - List in order of causality (primary failure first)
@@ -180,34 +205,34 @@ class FailureAnalysisSignature(Signature):
     ## Examples
     *All use: score_norm = (score - min) / (max - min), margin = threshold_norm - score_norm*
 
-    ### Example 1: NEAR_MISS
+    ### Example 1: NEAR_MISS (Math Problem)
     Given: score=0.92, threshold=1.0, range=[0,1] → margin=0.08
     ```
-    root_cause: "In ExtractorPredictor, failed to convert '5M' to numeric form. Metric stated: 'Expected numeric value for revenue field, got string '5M''. I/O confirmed: input 'revenue was 5M' → output {'amount': '5M'} instead of 5000000."
-    involved_predictors: ["ExtractorPredictor", "CalculatorPredictor"]
-    context: "Text with abbreviated numbers (K, M, B suffixes)"
-    category: "missing-constraint"
-    key_details: "SEVERITY: NEAR_MISS. PRIMARY_FAILURE: ExtractorPredictor. FIXABLE: Add numeric conversion instruction. NOT_FIXABLE: None. SUGGESTED_FIX: Add 'Convert abbreviated numbers to full numeric values (K=1000, M=1000000, B=1000000000)'."
+    root_cause: "In predict, lacks instruction to output integer format. Produced '370/3' instead of required integer."
+    involved_predictors: ["predict"]
+    context: "AIME-style problems requiring integer answers"
+    category: "missing-format-spec"
+    key_details: "SEVERITY: NEAR_MISS. PRIMARY_FAILURE: predict. FIXABLE: Add 'Output must be a single integer value'. NOT_FIXABLE: None. SUGGESTED_FIX: Add explicit integer output requirement to instructions."
     ```
 
-    ### Example 2: MODERATE
+    ### Example 2: MODERATE (Methodology Issue)
     Given: score=18, threshold=50, range=[0,100] → margin=0.32
     ```
-    root_cause: "In ValidatorPredictor, crashed with KeyError on 'user_id' because ExtractorPredictor output {'userId': ...} but Validator expects {'user_id': ...}."
-    involved_predictors: ["ExtractorPredictor", "ValidatorPredictor"]
-    context: "All user data extraction tasks"
-    category: "schema-mismatch"
-    key_details: "SEVERITY: MODERATE. PRIMARY_FAILURE: ExtractorPredictor. FIXABLE: Standardize field naming. NOT_FIXABLE: None. SUGGESTED_FIX: Change ExtractorPredictor to output 'user_id'."
+    root_cause: "In predict, instructions don't specify to verify all conditions. Model skipped checking one arithmetic progression case."
+    involved_predictors: ["predict"]
+    context: "Problems requiring exhaustive case checking"
+    category: "incomplete-instruction"
+    key_details: "SEVERITY: MODERATE. PRIMARY_FAILURE: predict. FIXABLE: Add 'Verify all possible cases before concluding'. NOT_FIXABLE: None. SUGGESTED_FIX: Add explicit exhaustive verification requirement."
     ```
 
-    ### Example 3: SEVERE
+    ### Example 3: SEVERE (Missing Structure)
     Given: score=0.15, threshold=0.7, range=[0,1] → margin=0.55
     ```
-    root_cause: "In SummarizerPredictor, produced empty output because ParserPredictor provided malformed JSON. Parser ignored JSON format specification."
-    involved_predictors: ["ParserPredictor", "SummarizerPredictor", "FormatterPredictor"]
-    context: "Complex nested data structures"
-    category: "ambiguous-instruction"
-    key_details: "SEVERITY: SEVERE. PRIMARY_FAILURE: ParserPredictor. FIXABLE: Complete rewrite with JSON schema. NOT_FIXABLE: None. SUGGESTED_FIX: Replace vague 'extract data' with explicit JSON schema and examples."
+    root_cause: "In predict, lacks systematic approach instruction. Model attempted direct solution without proper setup."
+    involved_predictors: ["predict"]
+    context: "Multi-step optimization problems"
+    category: "unclear-methodology"
+    key_details: "SEVERITY: SEVERE. PRIMARY_FAILURE: predict. FIXABLE: Add step-by-step methodology. NOT_FIXABLE: None. SUGGESTED_FIX: Add 'Break down into steps: 1) Set up constraints, 2) Identify critical points, 3) Verify optimality'."
     ```
 
     *Key lesson: Always trace cascades to their origin - fixing downstream symptoms wastes iterations*
@@ -221,24 +246,42 @@ class FailureAnalysisSignature(Signature):
     key_details: "SEVERITY: MODERATE. PRIMARY_FAILURE: DateExtractor. FIXABLE: Add temporal context. NOT_FIXABLE: None. SUGGESTED_FIX: Add 'Given today is [DATE], resolve relative dates to absolute dates'."
     ```
 
-    ### Example 5: Metric vs I/O Contradiction
-    Given: score=0.65, threshold=0.8, range=[0,1] → margin=0.15
+    ### Example 5: Missing Data Issue
+    Given: score=0.3, threshold=0.8, range=[0,1] → margin=0.5
     ```
-    root_cause: "In FormatterPredictor, JSON correct but metric states: 'Values in wrong units - expected metric, got imperial'. Hidden requirement not in prompts."
-    involved_predictors: ["FormatterPredictor"]
-    context: "Measurement data requiring specific unit conventions"
-    category: "missing-constraint"
-    key_details: "SEVERITY: MODERATE. PRIMARY_FAILURE: FormatterPredictor. FIXABLE: Add unit specification. NOT_FIXABLE: Metric expectation discovery. SUGGESTED_FIX: Add 'All measurements must be in metric units'."
+    root_cause: "In predict, input lacks required historical data. Cannot compute trend without prior values."
+    involved_predictors: ["predict"]
+    context: "Time-series problems requiring historical context"
+    category: "missing-context"
+    key_details: "SEVERITY: SEVERE. PRIMARY_FAILURE: predict. FIXABLE: None via prompts. NOT_FIXABLE: Missing required input data. SUGGESTED_FIX: Input needs to include historical data points."
     ```
+
+    ### Example 6: Custom Category
+    ```
+    root_cause: "In DateExtractor, failed to resolve relative dates. Input 'next Tuesday' ambiguous without reference date."
+    involved_predictors: ["DateExtractor", "SchedulerPredictor"]
+    context: "Natural language with relative time references"
+    category: "temporal-resolution-failure"
+    key_details: "SEVERITY: MODERATE. PRIMARY_FAILURE: DateExtractor. FIXABLE: Add context handling. NOT_FIXABLE: None. SUGGESTED_FIX: Add 'Use provided reference_date field for relative dates'."
+    ```
+
+    ## CRITICAL: Identify the TRUE Root Cause
+
+    - Root cause: 1-2 sentences describing the ACTUAL problem
+    - Don't force everything to be a prompt issue
+    - If input lacks data → say "missing-context"
+    - If architecture wrong → say "schema-mismatch"
+    - If prompt unclear → say what's missing
+    - Use custom categories when predefined don't fit
 
     ## Quality Checklist
 
     Before returning analysis, verify:
     ☐ Metric feedback checked FIRST?
-    ☐ PRIMARY failure point identified (not cascades)?
-    ☐ Root cause fundamental (not symptom)?
-    ☐ I/O evidence provided?
-    ☐ Fix actionable and severity-appropriate?"""
+    ☐ Root cause identifies TRUE issue (not forced to be prompt)?
+    ☐ Category matches actual problem type?
+    ☐ Custom category created if needed?
+    ☐ Analysis is CONCISE and ACTIONABLE?"""
 
     problem: str = InputField(desc="The problem statement or input to the program")
     prediction: str = InputField(desc="The model's actual prediction/output")
@@ -372,7 +415,23 @@ class SuccessAnalysisSignature(Signature):
 
     ### 4. Preservation Decision Tree
 
-    **Quick Tests for Classification**:
+    **Category Selection Guide**:
+    • Success from organized approach → `structured-methodology`
+    • Success from rules/boundaries → `explicit-constraints`
+    • Success from output format → `format-specification`
+    • Success from exhaustive checking → `comprehensive-coverage`
+    • Success from problem breakdown → `decomposition-strategy`
+    • Success from self-checking → `verification-step`
+    • Success from examples → `example-guided`
+    • Success from iteration → `iterative-refinement`
+    • Success from error handling → `error-recovery`
+    • Success from using context → `context-leveraging`
+    • Success from precision specs → `precision-specification`
+    • Success from domain language → `domain-notation`
+    • Just lucky input → `input-pattern-match`
+    • None fit → Create custom category
+
+    **Quick Tests for Preservation**:
     MUST PRESERVE tests:
     • Would removing break success? AND no alternative exists?
     • Does metric specifically praise this mechanism?
@@ -450,17 +509,28 @@ class SuccessAnalysisSignature(Signature):
     - This defines the pattern's DOMAIN
 
     **category**: Classification for pattern grouping
-    Pick from:
-    - "explicit-format-following" - Success from clear format specs
-    - "robust-error-handling" - Handled edge cases well
-    - "effective-coordination" - Multi-predictor alignment
-    - "clear-instruction-execution" - Unambiguous prompt following
-    - "input-pattern-match" - Specific input type handling
+    Pick the MOST SPECIFIC that applies:
+    - "structured-methodology" - Success from step-by-step or systematic approach
+    - "explicit-constraints" - Success from clear boundaries/validation rules
+    - "format-specification" - Success from well-defined output format
+    - "comprehensive-coverage" - Success from checking all cases/conditions
+    - "decomposition-strategy" - Success from breaking problem into subproblems
+    - "verification-step" - Success from explicit verification/checking instruction
+    - "example-guided" - Success from following provided examples
+    - "iterative-refinement" - Success from instruction to refine/improve answer
+    - "error-recovery" - Success from fallback/recovery strategies in prompt
+    - "context-leveraging" - Success from effective use of provided context/data
+    - "precision-specification" - Success from clear accuracy/precision requirements
+    - "domain-notation" - Success from using domain-specific language/terminology
+    - "input-pattern-match" - Lucky match with specific input type
 
     **Custom Categories**:
-    - If none fit, create a specific descriptive category
-    - Format: `domain-specific-success` (e.g., `temporal-accuracy`, `math-precision-success`)
-    - Be specific enough to group similar successes for pattern recognition
+    - When NONE of the above fit, create a specific descriptive category
+    - Format: `domain-specific-success` (e.g., `geometric-visualization`, `symbolic-manipulation`)
+    - Use custom categories when the success pattern is unique
+
+    **IMPORTANT**: Choose the category that best explains WHY the prompt worked, not just that it worked.
+    If predefined categories don't capture the essence, create a custom one.
 
     **key_details**: Preservation requirements (most critical field)
     Structure your response as:
@@ -487,24 +557,24 @@ class SuccessAnalysisSignature(Signature):
     ## Examples
     *All use: score_norm = (score - min) / (max - min), margin = score_norm - threshold_norm*
 
-    ### Example 1: EXCELLENT
+    ### Example 1: EXCELLENT (Structured Approach)
     Given: score=0.95, threshold=0.5, range=[0,1] → margin=0.45
     ```
-    success_pattern: "ExtractorPredictor parsed JSON via schema specification, Validator verified all fields. Metric: 'Perfect extraction - all nested objects preserved'."
-    contributing_predictors: ["ExtractorPredictor", "Validator"]
-    context: "Structured data with nested objects and arrays"
-    category: "explicit-format-following"
-    key_details: "MUST PRESERVE: JSON schema and validation logic. CAN MODIFY: Error messages, descriptive text. FRAGILE: Field names 'user_id', 'timestamp' in data contract. RELIABILITY: High - consistent across varied inputs"
+    success_pattern: "Predict succeeded by following step-by-step breakdown instruction, systematically checking each condition."
+    contributing_predictors: ["predict"]
+    context: "Complex multi-constraint problems"
+    category: "structured-methodology"
+    key_details: "MUST PRESERVE: Step-by-step approach. CAN MODIFY: Wording of steps. FRAGILE: None. RELIABILITY: High - methodical approach generalizes well."
     ```
 
-    ### Example 2: SOLID
+    ### Example 2: SOLID (Format Control)
     Given: score=72, threshold=50, range=[0,100] → margin=0.22
     ```
-    success_pattern: "Cleaner recovered from Extractor's malformed JSON by fixing quote escaping. I/O: {'text': 'She said \"hello\"'} → escaped correctly."
-    contributing_predictors: ["Cleaner"]
-    context: "Text with embedded quotes and special characters"
-    category: "robust-error-handling"
-    key_details: "MUST PRESERVE: Quote escaping detection. CAN MODIFY: Extractor prompt to prevent malformation. FRAGILE: Regex pattern for quotes. RELIABILITY: Medium - may miss edge cases"
+    success_pattern: "Predict correctly output integer due to explicit 'final answer must be an integer' instruction."
+    contributing_predictors: ["predict"]
+    context: "Mathematical problems requiring specific output format"
+    category: "format-specification"
+    key_details: "MUST PRESERVE: Integer output requirement. CAN MODIFY: How the requirement is phrased. FRAGILE: None. RELIABILITY: High - format instruction consistently followed."
     ```
 
     ### Example 3: MARGINAL
@@ -517,13 +587,13 @@ class SuccessAnalysisSignature(Signature):
     key_details: "MUST PRESERVE: Nothing. CAN MODIFY: All prompts need improvement. FRAGILE: N/A. RELIABILITY: Low - only works when pre-formatted"
     ```
 
-    ### Example 4: Custom Category
+    ### Example 4: Verification Success
     ```
-    success_pattern: "MathSolver computed derivatives using step-by-step symbolic manipulation, Verifier confirmed accuracy."
-    contributing_predictors: ["MathSolver", "Verifier"]
-    context: "Calculus problems requiring symbolic differentiation"
-    category: "mathematical-precision-success"
-    key_details: "MUST PRESERVE: Step-by-step computation approach. CAN MODIFY: Output formatting. FRAGILE: Mathematical notation parsing. RELIABILITY: High for standard calculus"
+    success_pattern: "Predict succeeded by following instruction to 'verify your answer satisfies all conditions' catching an initial error."
+    contributing_predictors: ["predict"]
+    context: "Problems with multiple constraints to satisfy"
+    category: "verification-step"
+    key_details: "MUST PRESERVE: Explicit verification requirement. CAN MODIFY: Phrasing of verification. FRAGILE: None. RELIABILITY: High - self-checking improves accuracy."
     ```
 
     ### Example 5: Suboptimal Success
@@ -538,15 +608,20 @@ class SuccessAnalysisSignature(Signature):
 
     *Key lesson: Success ≠ worth preserving. Expensive workarounds should be replaced, not protected*
 
+    ## CRITICAL: Identify WHY the Prompt Worked
+
+    - Success pattern: Focus on the INSTRUCTION FEATURE that enabled success
+    - Categories should differentiate success types (not all "clear-instruction-execution")
+    - Be specific: "step-by-step requirement" not "good instructions"
+    - Keep patterns concise (1 sentence) and actionable
+
     ## Quality Checklist
 
     Before returning analysis, verify:
-    ☐ Metric feedback checked FIRST?
-    ☐ Margin calculated for preservation stringency?
-    ☐ Success pattern CAUSAL (not correlation)?
-    ☐ Preservation SURGICAL (mechanism not implementation)?
-    ☐ Avoided preserving workarounds over outcomes?
-    ☐ Preservation strength matches quality margin?"""
+    ☐ Success pattern identifies specific PROMPT FEATURE?
+    ☐ Category is SPECIFIC (not generic "clear-instruction-execution")?
+    ☐ Pattern is CONCISE (1 sentence)?
+    ☐ Preservation focuses on mechanism, not implementation details?"""
 
     problem: str = InputField(desc="The problem statement or input to the program")
     prediction: str = InputField(desc="The model's actual prediction/output")
@@ -596,8 +671,15 @@ class HypothesisGenerationSignature(Signature):
 
     You receive structured summaries (not raw data) from a SAMPLE of training examples:
 
-    - **failure_analyses**: List[FailureSummaryRecord]. Each record captures the root_cause, the involved_predictors (normalized against program_flow), and the category for one failed example.
-    - **success_analyses**: List[SuccessSummaryRecord]. Each record captures the root_cause (success pattern), contributing_predictors (normalized), and category for one successful example.
+    - **failure_analyses**: List[FailureSummaryRecord]. Each record captures:
+      - root_cause: CONCISE description of missing/unclear instruction (not computational details)
+      - category: Actionable category focusing on fixable prompt issues
+      - involved_predictors: Which predictors need fixing
+
+    - **success_analyses**: List[SuccessSummaryRecord]. Each record captures:
+      - root_cause: The specific PROMPT FEATURE that enabled success
+      - category: Differentiated category (e.g., "structured-methodology", "format-specification")
+      - contributing_predictors: Which predictors benefited
       *Count them carefully.* The mix of success and failure analyses mirrors the
       outcomes in this batch. A high success-to-failure ratio signals you should
       propose very small, low-risk tweaks; a low ratio indicates broader fixes may be
