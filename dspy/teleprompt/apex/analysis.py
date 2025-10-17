@@ -192,10 +192,10 @@ def analyze_examples(
         indexed_records,
         process,
         description=f"APEX: analyzing {mode}s",
-        level=Verbosity.HIGH,
+        level=Verbosity.DETAILED,
     )
 
-    if runtime.is_enabled(Verbosity.HIGH):
+    if runtime.is_enabled(Verbosity.DETAILED):
         for index, analysis in enumerate(analyses, start=1):
             if mode == "failure":
                 categories = getattr(analysis, "categories", [])
@@ -211,7 +211,7 @@ def analyze_examples(
 
                 log_fn(
                     f"APEX: failure analysis #{index} ({category_str}) → {cause_str}",
-                    level=Verbosity.HIGH,
+                    level=Verbosity.DETAILED,
                 )
             else:
                 categories = getattr(analysis, "categories", [])
@@ -227,7 +227,7 @@ def analyze_examples(
 
                 log_fn(
                     f"APEX: success analysis #{index} ({category_str}) → {pattern_str}",
-                    level=Verbosity.HIGH,
+                    level=Verbosity.DETAILED,
                 )
     return analyses
 
@@ -284,7 +284,7 @@ def generate_hypotheses(
 ) -> list[HypothesisSpec]:
     if not failure_summaries or num_hypotheses == 0:
         log_fn = log or (lambda message, level=Verbosity.NORMAL: runtime.log(message, level))
-        log_fn("APEX: No hypotheses to generate (no failures or num_hypotheses=0)", Verbosity.HIGH)
+        log_fn("APEX: No hypotheses to generate (no failures or num_hypotheses=0)", Verbosity.DETAILED)
         return []
 
     log_fn = log or (lambda message, level=Verbosity.NORMAL: runtime.log(message, level))
@@ -293,7 +293,7 @@ def generate_hypotheses(
 
     log_fn(
         f"APEX: Generating up to {num_hypotheses} hypotheses from {len(failure_summaries)} failures",
-        Verbosity.HIGH,
+        Verbosity.DETAILED,
     )
 
     span_attributes = {
@@ -514,7 +514,7 @@ def generate_hypotheses(
             except Exception:  # pragma: no cover - defensive
                 pass
 
-    if runtime.is_enabled(Verbosity.HIGH):
+    if runtime.is_enabled(Verbosity.DETAILED):
         for idx, spec in enumerate(validated_specs, start=1):
             log_fn(
                 "APEX: hypothesis #{} ({}) targeting {} [impact={:.2f}, generalizability={:.2f}]".format(
@@ -524,7 +524,7 @@ def generate_hypotheses(
                     spec.impact_score,
                     spec.generalizability_score,
                 ),
-                Verbosity.HIGH,
+                Verbosity.DETAILED,
             )
             for predictor_name, changes in spec.prompt_changes.items():
                 if len(changes.new_prompt) > 200:
@@ -533,12 +533,12 @@ def generate_hypotheses(
                     prompt_preview = changes.new_prompt
                 log_fn(
                     f"  → {predictor_name}: {prompt_preview}",
-                    Verbosity.HIGH,
+                    Verbosity.DETAILED,
                 )
                 if changes.change_summary:
                     log_fn(
                         f"     Summary: {changes.change_summary}",
-                        Verbosity.HIGH,
+                        Verbosity.DETAILED,
                     )
 
     return validated_specs

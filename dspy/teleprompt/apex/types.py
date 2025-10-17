@@ -18,9 +18,9 @@ SamplerFn = Callable[[list[Example], int], list[Example]]
 class Verbosity(str, Enum):
     """Verbosity levels supported by the APEX optimizer."""
 
-    NONE = "none"
+    SILENT = "silent"
     NORMAL = "normal"
-    HIGH = "high"
+    DETAILED = "detailed"
 
     @classmethod
     def parse(cls, value: str | Verbosity | None) -> Verbosity:
@@ -30,10 +30,11 @@ class Verbosity(str, Enum):
         if isinstance(value, cls):
             return value
         normalized = value.lower()
+
         for member in cls:
             if member.value == normalized:
                 return member
-        msg = "Unsupported verbosity level '{value}'. Use one of: none, normal, high."
+        msg = "Unsupported verbosity level '{value}'. Use one of: silent, normal, detailed."
         raise ValueError(msg.format(value=value))
 
 
@@ -41,9 +42,9 @@ def verbosity_rank(level: Verbosity) -> int:
     """Return a numeric ranking for a verbosity level."""
 
     return {
-        Verbosity.NONE: 0,
+        Verbosity.SILENT: 0,
         Verbosity.NORMAL: 1,
-        Verbosity.HIGH: 2,
+        Verbosity.DETAILED: 2,
     }[level]
 
 

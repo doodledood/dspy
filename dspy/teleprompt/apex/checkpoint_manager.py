@@ -70,7 +70,7 @@ class CheckpointManager:
 
         self.runtime.log(
             f"APEX: Saved checkpoint at iteration {iteration}",
-            level=Verbosity.HIGH,
+            level=Verbosity.DETAILED,
         )
 
     def load(self) -> ApexCheckpoint | None:

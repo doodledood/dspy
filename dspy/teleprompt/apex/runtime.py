@@ -75,6 +75,6 @@ class RuntimeTools:
             num_threads=self.num_threads,
             disable_progress_bar=not self.is_enabled(level),
             max_errors=max(len(items_list), 1),
-            provide_traceback=self.is_enabled(Verbosity.HIGH),
+            provide_traceback=self.is_enabled(Verbosity.DETAILED),
         )
         return executor.execute(func, items_list)

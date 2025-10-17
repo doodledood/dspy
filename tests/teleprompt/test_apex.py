@@ -28,21 +28,21 @@ from dspy.utils.dummies import DummyLM
 
 def make_analysis_response(root_cause: str = "Prompt missing correct token") -> dict:
     return {
-        "root_cause": root_cause,
+        "potential_root_causes": [root_cause],
         "involved_predictors": ["predictor"],
         "context": "Baseline emits 'bad'",
-        "category": "format_ambiguity",
-        "key_details": "Needs to say good",
+        "categories": ["format_ambiguity"],
+        "key_details": "SEVERITY: MODERATE. PRIMARY_FAILURE: predictor. FIXABLE: Add correct token. NOT_FIXABLE: None. SUGGESTED_FIX: Needs to say good",
     }
 
 
 def make_success_response(pattern: str = "Prompt handled well") -> dict:
     return {
-        "success_pattern": pattern,
+        "potential_success_patterns": [pattern],
         "contributing_predictors": ["predictor"],
         "context": "Handled correctly",
-        "category": "clear_format_compliance",
-        "key_details": "Keep current instructions",
+        "categories": ["clear_format_compliance"],
+        "key_details": "MUST PRESERVE: Keep current instructions. CAN MODIFY: Minor wording. FRAGILE: None. RELIABILITY: High.",
     }
 
 
@@ -58,7 +58,7 @@ def make_hypothesis_response(prompt_value: str = "good") -> dict:
                 "prompt_changes": {
                     "predictor": PromptChange(
                         new_prompt=prompt_value,
-                        rationale="Align output with expectation",
+                        change_summary="Align output with expectation",
                         change_magnitude=ChangeMagnitude.MINIMAL,
                     )
                 },
@@ -178,7 +178,7 @@ def configure_mock_mlflow(mock_mlflow: MagicMock, *, run_id: str = "test-run-id"
 
 def test_evaluate_candidate_logs_traces_without_mutating_predictors():
     tracker = RecordingTracker()
-    runtime = runtime_module.RuntimeTools(verbosity=Verbosity.HIGH, num_threads=1)
+    runtime = runtime_module.RuntimeTools(verbosity=Verbosity.DETAILED, num_threads=1)
     engine = EvaluationEngine(
         metric=metric,
         runtime=runtime,
@@ -218,7 +218,7 @@ def test_evaluate_candidate_logs_traces_without_mutating_predictors():
 
 def test_generate_hypotheses_traces_include_full_context():
     tracker = RecordingTracker()
-    runtime = runtime_module.RuntimeTools(verbosity=Verbosity.HIGH, num_threads=1)
+    runtime = runtime_module.RuntimeTools(verbosity=Verbosity.DETAILED, num_threads=1)
 
     failure_summary = dspy.Prediction(**make_analysis_response("Extractor dropped required field"))
     success_summary = dspy.Prediction(**make_success_response("Validator preserved schema"))
@@ -258,31 +258,29 @@ def test_generate_hypotheses_traces_include_full_context():
     failure_records = payload["failure_analyses"]
     assert isinstance(failure_records, list) and failure_records, "Expected serialized failure analyses"
     failure_entry = failure_records[0]
-    assert failure_entry["root_cause"] == "Extractor dropped required field"
+    assert failure_entry["potential_root_causes"] == ["Extractor dropped required field"]
     assert failure_entry["involved_predictors"] == ["predictor"]
-    assert failure_entry["category"] == "format_ambiguity"
-    assert "key_details" not in failure_entry
+    assert failure_entry["categories"] == ["format_ambiguity"]
 
     success_records = payload["success_analyses"]
     assert isinstance(success_records, list) and success_records, "Expected serialized success analyses"
     success_entry = success_records[0]
-    assert success_entry["root_cause"] == "Validator preserved schema"
+    assert success_entry["potential_root_causes"] == ["Validator preserved schema"]
     assert success_entry["contributing_predictors"] == ["predictor"]
-    assert success_entry["category"] == "clear_format_compliance"
-    assert "key_details" not in success_entry
+    assert success_entry["categories"] == ["clear_format_compliance"]
 
     assert payload["failure_category_counts"] == {"format_ambiguity": 1}
     assert payload["success_category_counts"] == {"clear_format_compliance": 1}
     assert payload["success_rate_percentage"] == pytest.approx(50.0)
-    assert "Predictor prompts:" in payload["program_flow"]
+    assert "Predictor prompts and configurations:" in payload["program_flow"]
 
     assert payload["best_validation_score"] == "0.5000"
     assert payload["current_iteration"] == 2
 
     outputs = span["outputs"]
     assert outputs["best_val_score"] == 0.5
-    assert outputs["failure_analyses"][0]["root_cause"] == "Extractor dropped required field"
-    assert outputs["success_analyses"][0]["root_cause"] == "Validator preserved schema"
+    assert outputs["failure_analyses"][0]["potential_root_causes"] == ["Extractor dropped required field"]
+    assert outputs["success_analyses"][0]["potential_root_causes"] == ["Validator preserved schema"]
     assert outputs["failure_category_counts"] == {"format_ambiguity": 1}
     assert outputs["success_category_counts"] == {"clear_format_compliance": 1}
     assert outputs["success_rate_percentage"] == pytest.approx(50.0)
@@ -320,7 +318,7 @@ def test_apex_requires_non_empty_train_and_valset():
         hypothesis_lm=analysis_lm,
         max_iterations=1,
         convergence_patience=1,
-        verbosity="none",
+        verbosity="silent",
     )
 
     student = PromptDrivenModule(initial_prompt="bad")
@@ -340,7 +338,7 @@ def test_apex_builds_history_text_when_enabled():
         hypothesis_lm=analysis_lm,
         max_iterations=1,
         convergence_patience=1,
-        verbosity="none",
+        verbosity="silent",
     )
 
     hypothesis = HypothesisSpec(
@@ -354,7 +352,7 @@ def test_apex_builds_history_text_when_enabled():
         prompt_changes={
             "predictor": PromptChange(
                 new_prompt="better",
-                rationale="Clean whitespace",
+                change_summary="Clean whitespace",
                 change_magnitude=ChangeMagnitude.MINIMAL,
             )
         },
@@ -393,7 +391,7 @@ def test_apex_history_disabled_returns_na():
         hypothesis_lm=analysis_lm,
         max_iterations=1,
         convergence_patience=1,
-        verbosity="none",
+        verbosity="silent",
         include_hypothesis_history=False,
     )
 
@@ -420,7 +418,7 @@ def test_apex_sample_callable_must_return_list():
         num_hypotheses=1,
         convergence_patience=1,
         seed=1,
-        verbosity="none",
+        verbosity="silent",
         train_sample=lambda data, iteration: tuple(data),
     )
 
@@ -442,7 +440,7 @@ def test_apex_apply_hypothesis_rejects_unknown_predictor():
         hypothesis_lm=analysis_lm,
         max_iterations=1,
         convergence_patience=1,
-        verbosity="none",
+        verbosity="silent",
     )
 
     hypothesis = HypothesisSpec(
@@ -456,7 +454,7 @@ def test_apex_apply_hypothesis_rejects_unknown_predictor():
         prompt_changes={
             "unknown": PromptChange(
                 new_prompt="new",
-                rationale="",
+                change_summary="",
                 change_magnitude=ChangeMagnitude.MINIMAL,
             )
         },
@@ -489,7 +487,7 @@ def test_apex_improves_and_tracks_history():
         num_eval_runs=1,
         train_sample=None,
         seed=42,
-        verbosity="none",
+        verbosity="silent",
     )
 
     student = PromptDrivenModule(initial_prompt="bad")
@@ -525,7 +523,7 @@ def test_apex_train_sampling_controls_analysis_calls():
                         "prompt_changes": {
                             "predictor": PromptChange(
                                 new_prompt="good",
-                                rationale="",
+                                change_summary="",
                                 change_magnitude=ChangeMagnitude.MINIMAL,
                             )
                         },
@@ -546,7 +544,7 @@ def test_apex_train_sampling_controls_analysis_calls():
         num_eval_runs=1,
         convergence_patience=1,
         seed=0,
-        verbosity="none",
+        verbosity="silent",
     )
 
     student = PromptDrivenModule(initial_prompt="bad")
@@ -592,7 +590,7 @@ def test_apex_sampling_callable_receives_iteration():
         num_eval_runs=1,
         convergence_patience=1,
         seed=13,
-        verbosity="none",
+        verbosity="silent",
     )
 
     trainset = [make_train_example("x"), make_train_example("y"), make_train_example("z")]
@@ -628,7 +626,7 @@ def test_apex_execution_flow_captures_branching_dependencies():
         num_eval_runs=1,
         convergence_patience=1,
         seed=0,
-        verbosity="none",
+        verbosity="silent",
     )
 
     branching_program = BranchingModule()
@@ -699,7 +697,7 @@ def test_apex_uses_configured_num_threads(monkeypatch):
         num_eval_runs=1,
         convergence_patience=1,
         seed=11,
-        verbosity="none",
+        verbosity="silent",
         num_threads=2,
     )
 
@@ -727,7 +725,7 @@ def test_apex_rejects_invalid_analysis_json():
         num_hypotheses=1,
         convergence_patience=1,
         seed=0,
-        verbosity="none",
+        verbosity="silent",
     )
 
     student = PromptDrivenModule(initial_prompt="bad")
@@ -756,7 +754,7 @@ def test_apex_trims_hypotheses_to_limit():
                         "prompt_changes": {
                             "predictor": PromptChange(
                                 new_prompt="good",
-                                rationale="Align",
+                                change_summary="Align",
                                 change_magnitude=ChangeMagnitude.MINIMAL,
                             )
                         },
@@ -770,7 +768,7 @@ def test_apex_trims_hypotheses_to_limit():
                         "prompt_changes": {
                             "predictor": PromptChange(
                                 new_prompt="great",
-                                rationale="Align alt",
+                                change_summary="Align alt",
                                 change_magnitude=ChangeMagnitude.MODERATE,
                             )
                         },
@@ -789,7 +787,7 @@ def test_apex_trims_hypotheses_to_limit():
         num_hypotheses=1,
         convergence_patience=1,
         seed=0,
-        verbosity="none",
+        verbosity="silent",
     )
 
     student = PromptDrivenModule(initial_prompt="bad")
@@ -830,7 +828,7 @@ def test_apex_handles_fewer_successes_than_failures():
         num_hypotheses=1,
         convergence_patience=1,
         seed=123,
-        verbosity="none",
+        verbosity="silent",
     )
 
     student = PromptDrivenModule(initial_prompt="bad")
@@ -879,7 +877,7 @@ def test_apex_end_to_end_fake_data():
         convergence_patience=1,
         num_eval_runs=1,
         seed=99,
-        verbosity="none",
+        verbosity="silent",
     )
 
     student = PromptDrivenModule(initial_prompt="baseline")
@@ -978,7 +976,7 @@ def test_apex_high_verbosity_logs_analysis():
         num_hypotheses=1,
         convergence_patience=1,
         seed=8,
-        verbosity="high",
+        verbosity="detailed",
     )
 
     messages: list[tuple[Verbosity, str]] = []
@@ -1029,7 +1027,7 @@ def test_apex_checkpoint_and_resume(tmp_path):
         num_hypotheses=1,
         convergence_patience=None,  # Rely on max_iterations
         checkpoint_dir=tmp_path,
-        verbosity="none",
+        verbosity="silent",
         seed=42,
     )
 
@@ -1054,7 +1052,7 @@ def test_apex_checkpoint_and_resume(tmp_path):
         num_hypotheses=1,
         convergence_patience=None,
         checkpoint_dir=tmp_path,
-        verbosity="none",
+        verbosity="silent",
         seed=42,
     )
 
@@ -1089,7 +1087,7 @@ def test_apex_mlflow_disabled_by_default():
         num_hypotheses=1,
         convergence_patience=1,
         seed=42,
-        verbosity="none",
+        verbosity="silent",
     )
 
     assert not optimizer.tracker.use_mlflow
@@ -1126,7 +1124,7 @@ def test_apex_mlflow_enabled(mock_mlflow):
         num_hypotheses=1,
         convergence_patience=1,
         seed=42,
-        verbosity="none",
+        verbosity="silent",
         use_mlflow=True,
         mlflow_tracking_uri="http://localhost:5000",
         mlflow_experiment_name="test-experiment",
@@ -1183,7 +1181,7 @@ def test_apex_mlflow_graceful_fallback():
         num_hypotheses=1,
         convergence_patience=1,
         seed=42,
-        verbosity="none",
+        verbosity="silent",
         use_mlflow=True,
     )
 
@@ -1220,7 +1218,7 @@ def test_apex_mlflow_iteration_tracking(mock_mlflow):
         num_hypotheses=1,
         convergence_patience=1,
         seed=42,
-        verbosity="none",
+        verbosity="silent",
         use_mlflow=True,
     )
 
@@ -1258,7 +1256,7 @@ def test_apex_mlflow_artifact_logging(mock_mlflow):
         num_hypotheses=1,
         convergence_patience=1,
         seed=42,
-        verbosity="none",
+        verbosity="silent",
         use_mlflow=True,
     )
 
@@ -1331,7 +1329,7 @@ def test_apex_tracking_utils_format_functions():
             prompt_changes={
                 "predictor": MagicMock(
                     new_prompt="new prompt text",
-                    rationale="test rationale",
+                    change_summary="test change",
                     change_magnitude=ChangeMagnitude.MINIMAL,
                 )
             },
@@ -1446,7 +1444,7 @@ def test_apex_end_to_end_with_deepcopy():
         num_eval_runs=1,
         train_sample=None,
         seed=99,
-        verbosity="none",
+        verbosity="silent",
     )
 
     student = PromptDrivenModule(initial_prompt="bad")

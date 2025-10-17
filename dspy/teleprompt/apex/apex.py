@@ -13,6 +13,7 @@ from dspy.primitives import Example, Module
 from dspy.teleprompt.teleprompt import Teleprompter
 
 from . import tracking_utils
+from .summary import generate_optimization_summary
 from .analysis import (
     analyze_examples,
     analyze_successes,
@@ -377,7 +378,7 @@ class APEX(Teleprompter):
 
                 self._log(
                     f"APEX: running with num_threads={self.num_threads}",
-                    Verbosity.NORMAL,
+                    Verbosity.DETAILED,
                 )
                 max_iter_str = f"{self.max_iterations}" if self.max_iterations is not None else "until convergence"
                 patience_str = f"{self.convergence_patience}" if self.convergence_patience is not None else "disabled"
@@ -387,11 +388,11 @@ class APEX(Teleprompter):
                     f"num_hypotheses={self.num_hypotheses}, "
                     f"success_threshold={self.success_threshold:.2f}, "
                     f"convergence_patience={patience_str}",
-                    Verbosity.HIGH,
+                    Verbosity.DETAILED,
                 )
                 self._log(
                     f"APEX: Using seed={self.seed} for reproducibility",
-                    Verbosity.HIGH,
+                    Verbosity.DETAILED,
                 )
                 self._log(
                     "APEX: Evaluating initial baseline on validation set",
@@ -463,13 +464,12 @@ class APEX(Teleprompter):
                         sampler=sampler,
                     )
                     self._log(
-                        "APEX: iteration "
-                        f"{iteration} started (train sample={len(sampled_train)}, val size={len(valset)})",
+                        f"APEX: Iteration {iteration} started | Train: {len(sampled_train)} samples, Val: {len(valset)} samples",
                         Verbosity.NORMAL,
                     )
                     self._log(
                         f"APEX: Sampled {len(sampled_train)} training examples from {len(trainset)} total",
-                        Verbosity.HIGH,
+                        Verbosity.DETAILED,
                     )
 
                     baseline_for_analysis = state.current_program.deepcopy()
@@ -483,13 +483,12 @@ class APEX(Teleprompter):
                     )
                     self._log(
                         f"APEX: Train evaluation complete - {len(failures)} failures, {len(successes)} successes",
-                        Verbosity.HIGH,
+                        Verbosity.DETAILED,
                     )
 
                     if not failures:
                         self._log(
-                            "APEX: iteration "
-                            f"{iteration} - No failures found! All examples succeeded. Skipping to next iteration.",
+                            f"APEX: Iteration {iteration} - Perfect performance! All {len(successes)} examples succeeded",
                             Verbosity.NORMAL,
                         )
                         state.iteration_logs.append(
@@ -552,11 +551,11 @@ class APEX(Teleprompter):
                         log=self._log,
                         iteration=iteration,
                     )
-                    if self._is_enabled(Verbosity.HIGH):
+                    if self._is_enabled(Verbosity.DETAILED):
                         self._log(
                             "APEX: iteration "
                             f"{iteration} analyzed {len(failure_summaries)} failure(s) and {len(success_summaries)} success(es)",
-                            Verbosity.HIGH,
+                            Verbosity.DETAILED,
                         )
 
                     hypotheses = generate_hypotheses(
@@ -576,7 +575,7 @@ class APEX(Teleprompter):
                         tracker=self.tracker,
                     )
                     self._log(
-                        f"APEX: iteration {iteration} produced {len(hypotheses)} hypothesis(es)",
+                        f"APEX: Generated {len(hypotheses)} hypothesis{'es' if len(hypotheses) != 1 else ''} for iteration {iteration}",
                         Verbosity.NORMAL,
                     )
                     if hypotheses and self._is_enabled(Verbosity.NORMAL):
@@ -585,15 +584,14 @@ class APEX(Teleprompter):
                                 list(hypothesis.prompt_changes.keys()) if hypothesis.prompt_changes else []
                             )
                             self._log(
-                                "APEX: hypothesis #"
-                                f"{idx} - strategy: {hypothesis.strategy}, impact: {hypothesis.impact_score:.2f}, "
-                                f"updating: {', '.join(predictors_updated) if predictors_updated else 'no predictors'}",
+                                f"  → Hypothesis #{idx}: {hypothesis.strategy} | Impact: {hypothesis.impact_score:.2f} | "
+                                f"Targets: {', '.join(predictors_updated) if predictors_updated else 'none'}",
                                 Verbosity.NORMAL,
                             )
-                    if self._is_enabled(Verbosity.HIGH) and hypotheses:
+                    if self._is_enabled(Verbosity.DETAILED) and hypotheses:
                         self._log(
                             "APEX: Detailed hypothesis info follows...",
-                            Verbosity.HIGH,
+                            Verbosity.DETAILED,
                         )
 
                     iteration_candidates = self.evaluator.evaluate_candidates(
@@ -646,10 +644,10 @@ class APEX(Teleprompter):
                                 f"strategy: {state.best_candidate.hypothesis.strategy}",
                                 Verbosity.NORMAL,
                             )
-                            if self._is_enabled(Verbosity.HIGH):
+                            if self._is_enabled(Verbosity.DETAILED):
                                 self._log(
                                     "APEX: Detailed improved prompts:",
-                                    Verbosity.HIGH,
+                                    Verbosity.DETAILED,
                                 )
                                 for (
                                     predictor_name,
@@ -660,15 +658,15 @@ class APEX(Teleprompter):
                                         if len(changes.new_prompt) > 300
                                         else f"  → {predictor_name}: {changes.new_prompt}"
                                     )
-                                    self._log(preview, Verbosity.HIGH)
+                                    self._log(preview, Verbosity.DETAILED)
 
                     state.baseline_candidate = iteration_candidates[0]
                     self._log(
-                        f"APEX: iteration {iteration} best score={best_candidate_for_iteration.overall_score:.4f}",
+                        f"APEX: Iteration {iteration} best score: {best_candidate_for_iteration.overall_score:.4f}",
                         Verbosity.NORMAL,
                     )
 
-                    if self._is_enabled(Verbosity.HIGH):
+                    if self._is_enabled(Verbosity.DETAILED):
                         score_improvements = [
                             candidate.overall_score - state.baseline_candidate.overall_score
                             for candidate in iteration_candidates[1:]
@@ -676,7 +674,7 @@ class APEX(Teleprompter):
                         if score_improvements:
                             self._log(
                                 f"APEX: Score improvements from baseline: {score_improvements}",
-                                Verbosity.HIGH,
+                                Verbosity.DETAILED,
                             )
 
                     if best_candidate_for_iteration is state.baseline_candidate:
@@ -685,7 +683,7 @@ class APEX(Teleprompter):
                             self._log(
                                 "APEX: No improvement ("
                                 f"{state.no_improvement_count}/{self.convergence_patience} patience)",
-                                Verbosity.HIGH,
+                                Verbosity.DETAILED,
                             )
                             if state.no_improvement_count >= self.convergence_patience:
                                 state.stop_reason = "patience"
@@ -697,14 +695,14 @@ class APEX(Teleprompter):
                         else:
                             self._log(
                                 f"APEX: No improvement in iteration {iteration} (patience disabled)",
-                                Verbosity.HIGH,
+                                Verbosity.DETAILED,
                             )
                     else:
                         state.no_improvement_count = 0
                         state.current_program = best_candidate_for_iteration.program
                         self._log(
                             "APEX: Updating program with hypothesis improvements",
-                            Verbosity.HIGH,
+                            Verbosity.DETAILED,
                         )
 
                     state.current_baseline_candidate = best_candidate_for_iteration
@@ -762,14 +760,24 @@ class APEX(Teleprompter):
             state.stop_reason = "completed"
 
         self._log(
-            f"APEX: Optimization complete - stopped after {len(state.iteration_logs)} iterations ({state.stop_reason})",
+            f"APEX: ✓ Optimization complete | {len(state.iteration_logs)} iterations | Reason: {state.stop_reason}",
             Verbosity.NORMAL,
         )
+        improvement = state.best_candidate.overall_score - state.initial_baseline.overall_score
         self._log(
-            "APEX: Final score: "
-            f"{state.best_candidate.overall_score:.4f} (initial baseline: {state.initial_baseline.overall_score:.4f})",
+            f"APEX: Final score: {state.best_candidate.overall_score:.4f} "
+            f"({'+' if improvement >= 0 else ''}{improvement:.4f} from baseline {state.initial_baseline.overall_score:.4f})",
             Verbosity.NORMAL,
         )
+
+        # Generate and display optimization summary table
+        if self._is_enabled(Verbosity.NORMAL):
+            summary_table = generate_optimization_summary(
+                iterations=state.iteration_logs,
+                best_candidate=state.best_candidate,
+                initial_score=state.initial_baseline.overall_score,
+            )
+            print(summary_table)
 
         if self.tracker.is_active():
             summary = tracking_utils.format_optimization_summary(
@@ -799,19 +807,19 @@ class APEX(Teleprompter):
                             "change_summary": change.change_summary if hasattr(change, "change_summary") else "",
                         }
                 self.tracker.log_best_program(best_program_data)
-        if self._is_enabled(Verbosity.HIGH):
+        if self._is_enabled(Verbosity.DETAILED):
             total_candidates = sum(len(log.candidates) for log in state.iteration_logs)
             total_hypotheses = sum(len(log.hypotheses) for log in state.iteration_logs)
             self._log(
                 f"APEX: Summary - evaluated {total_candidates} candidates from {total_hypotheses} hypotheses",
-                Verbosity.HIGH,
+                Verbosity.DETAILED,
             )
             score_trajectory = [
                 max(c.overall_score for c in log.candidates) if log.candidates else 0.0 for log in state.iteration_logs
             ]
             self._log(
                 f"APEX: Best score trajectory across iterations: {score_trajectory}",
-                Verbosity.HIGH,
+                Verbosity.DETAILED,
             )
 
         optimized_program = state.best_candidate.program

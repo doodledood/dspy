@@ -167,10 +167,10 @@ class EvaluationEngine:
                 Verbosity.NORMAL,
                 "info",
             )
-            if self.is_enabled(Verbosity.HIGH):
+            if self.is_enabled(Verbosity.DETAILED):
                 self.log(
                     f"APEX: hypothesis details → {hypothesis.model_dump()}",
-                    Verbosity.HIGH,
+                    Verbosity.DETAILED,
                     "info",
                 )
 
@@ -354,7 +354,7 @@ class EvaluationEngine:
                 except Exception as exc:  # pragma: no cover - defensive
                     self.log(
                         f"APEX: Program execution failed on example: {str(exc)[:200]}",
-                        Verbosity.HIGH,
+                        Verbosity.DETAILED,
                         "warning",
                     )
                     error_message = f"execution_error: {exc}"
@@ -372,13 +372,13 @@ class EvaluationEngine:
             elif error_message:
                 self.log(
                     f"APEX: No prediction to evaluate due to error: {error_message[:100]}",
-                    Verbosity.HIGH,
+                    Verbosity.DETAILED,
                     "debug",
                 )
         except Exception as exc:  # pragma: no cover - defensive
             self.log(
                 f"APEX: Metric evaluation failed: {str(exc)[:200]}",
-                Verbosity.HIGH,
+                Verbosity.DETAILED,
                 "warning",
             )
             metric_score = self.min_metric
