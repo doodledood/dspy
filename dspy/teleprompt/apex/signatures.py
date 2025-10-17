@@ -610,9 +610,9 @@ class HypothesisGenerationSignature(Signature):
     - **best_validation_score**: Best validation score achieved so far (initial baseline at minimum). If unavailable, will be "N/A".
     - **current_iteration**: Current optimizer iteration number (0-indexed) to ground hypotheses in trajectory stage
     - **hypothesis_history**: Chronological record of prior hypotheses with validation scores, iteration numbers, and prompt
-      change rationales (no raw prompts). The history always begins with an iteration 0 baseline line, followed by each tested
+      change summaries. The history always begins with an iteration 0 baseline line, followed by each tested
       hypothesis annotated with the score delta relative to the prior best-so-far score. Use this trajectory to track which
-      prompt adjustments boosted or hurt validation, protect improvements by preserving successful rationales, and steer clear
+      prompt adjustments boosted or hurt validation, protect improvements by preserving successful changes, and steer clear
       of ideas that previously regressed the score. When unavailable, this field will be "N/A"; in that case rely on the
       current failure and success analyses to propose minimal, high-leverage changes.
 
@@ -650,9 +650,9 @@ class HypothesisGenerationSignature(Signature):
     ## Leveraging Validation History
 
     Treat hypothesis_history as a longitudinal study when present:
-    - Identify which prompt rationales coincided with validation gains and carry those principles forward
-    - Avoid reintroducing rationales that preceded regressions unless you can explicitly correct the flaw they introduced
-    - Combine current failure analyses with past rationales to craft refinements rather than wholesale rewrites when possible
+    - Identify which prompt changes coincided with validation gains and carry those principles forward
+    - Avoid reintroducing changes that preceded regressions unless you can explicitly correct the flaw they introduced
+    - Combine current failure analyses with past change summaries to craft refinements rather than wholesale rewrites when possible
     If the history input is "N/A", you have no prior trajectory—lean entirely on the latest analyses to choose the smallest
     effective adjustments.
 
@@ -662,25 +662,25 @@ class HypothesisGenerationSignature(Signature):
 
     **Single Dominant Pattern**
     When one root cause appears repeatedly across the sample and history shows related tweaks improved validation:
-    → minimal hypothesis: Add single constraint/example/clarification that aligns with past successful rationales
+    → minimal hypothesis: Add single constraint/example/clarification that aligns with past successful changes
     Example: "Missing format specification" → Add JSON schema
     Note: If this pattern represents most failures, fixing it alone may be sufficient
 
     **Multiple Related Failures**
-    When several issues share underlying cause and prior rationales hint at partial fixes to refine:
+    When several issues share underlying cause and prior changes hint at partial fixes to refine:
     → moderate hypothesis: Fix root cause with small coordinated changes that retain elements tied to higher validation scores
     Example: "Ambiguous terminology" across predictors → Standardize terms
     Note: More efficient than fixing each individually
 
     **Cascade Failures** (Check program_flow carefully)
     When upstream errors cause downstream problems and history shows which predictors stayed stable:
-    → moderate hypothesis: Align dependent predictors while preserving the rationales tied to working components
+    → moderate hypothesis: Align dependent predictors while preserving the changes tied to working components
     Example: Extractor output incompatible with Validator → Fix both
     Note: Must fix source AND affected predictors together
 
     **Fundamental Issues**
     When core approach flawed (use sparingly) and history shows repeated regressions despite incremental tweaks:
-    → substantial hypothesis: Restructure while preserving working elements explicitly credited in successful rationales
+    → substantial hypothesis: Restructure while preserving working elements explicitly credited in successful changes
     Only when patterns show no smaller fix possible
     Note: High risk - only if confident no alternative exists
 
@@ -701,7 +701,7 @@ class HypothesisGenerationSignature(Signature):
       "prompt_changes": {
         "PredictorName": {
           "new_prompt": "COMPLETE replacement text",
-          "rationale": "Why this fixes issue + what's preserved",
+          "change_summary": "Compact summary that includes what changed + why (e.g., 'Added step-by-step breakdown requirement to fix ambiguous instructions causing incomplete solutions')",
           "change_magnitude": "minimal|moderate|substantial"
         }
       }
@@ -714,6 +714,9 @@ class HypothesisGenerationSignature(Signature):
     - new_prompt contains ONLY the instructions text (the part shown as "Instructions:" in program_flow)
     - new_prompt is COMPLETE replacement of the instructions (all original + changes)
     - DO NOT include field definitions in new_prompt (input/output fields are handled by DSPy framework)
+    - change_summary must be a COMPACT SUMMARY that describes both WHAT changed and WHY in one sentence
+      Format: "Added/Modified/Removed X to address Y issue" (e.g., "Added explicit step-by-step requirement to fix incomplete reasoning")
+      This will appear in hypothesis_history for future iterations, so be informative but concise
     - Sort by impact_score descending, then generalizability_score
     - change_magnitude must be exactly: minimal, moderate, or substantial (lowercase)
 
@@ -812,7 +815,7 @@ class HypothesisGenerationSignature(Signature):
       "prompt_changes": {
         "predict": {
           "new_prompt": "Extract key information from the provided text and output in a structured format.\n\nRequirements:\n- Identify main entities and relationships\n- Preserve numerical data exactly\n- Include confidence scores when applicable\n\nYour output must be well-structured and consistent. Ensure all data is properly formatted with clear field names and appropriate data types.",
-          "rationale": "Adds clear formatting requirements and structure guidance to prevent JSON parsing errors. Preserves successful extraction logic.",
+          "change_summary": "Added explicit output structure requirements and data formatting guidelines to address JSON parsing errors while preserving entity extraction approach",
           "change_magnitude": "minimal"
         }
       }

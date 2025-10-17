@@ -67,7 +67,7 @@ as your programs and datasets grow.
 2. Call ``compile(student, trainset=train, valset=cal)``.  The teleprompter will
    manage sampling, language model calls, evaluation, and selection.
 3. Inspect the returned module and history (if requested) to understand what
-   changed and why.  Because every hypothesis includes rationale text, you can
+   changed and why.  Because every hypothesis includes change summary text, you can
    audit improvements or feed them into additional tooling.
 
 APEX provides a structured bridge between human-style error analysis and the

@@ -22,7 +22,9 @@ class PromptChange(BaseModel):
     """A single prompt change for a predictor."""
 
     new_prompt: str = Field(description="Complete replacement text for the predictor's prompt")
-    rationale: str = Field(description="Why this change fixes the identified issues")
+    change_summary: str = Field(
+        description="Compact summary of what changed and why (e.g., 'Added step-by-step requirement to fix incomplete reasoning')"
+    )
     change_magnitude: ChangeMagnitude = Field(description="How significant this change is")
 
 

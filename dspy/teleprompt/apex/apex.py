@@ -796,7 +796,7 @@ class APEX(Teleprompter):
                     for pred_name, change in state.best_candidate.hypothesis.prompt_changes.items():
                         best_program_data["prompt_changes"][pred_name] = {
                             "new_prompt": change.new_prompt,
-                            "rationale": change.rationale if hasattr(change, "rationale") else "",
+                            "change_summary": change.change_summary if hasattr(change, "change_summary") else "",
                         }
                 self.tracker.log_best_program(best_program_data)
         if self._is_enabled(Verbosity.HIGH):

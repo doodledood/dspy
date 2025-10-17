@@ -52,7 +52,7 @@ def format_iteration_metrics(
             for pred_name, change in h.prompt_changes.items():
                 hypothesis_data["prompt_changes"][pred_name] = {
                     "new_prompt": change.new_prompt,  # Full prompt, no truncation
-                    "rationale": change.rationale if hasattr(change, "rationale") else "",
+                    "change_summary": change.change_summary if hasattr(change, "change_summary") else "",
                     "magnitude": str(change.change_magnitude) if hasattr(change, "change_magnitude") else "unknown",
                 }
 
@@ -190,8 +190,8 @@ def format_hypothesis_details(hypothesis) -> str:
         lines.append("\nPrompt Changes:")
         for pred_name, change in hypothesis.prompt_changes.items():
             lines.append(f"  {pred_name}:")
-            if hasattr(change, "rationale"):
-                lines.append(f"    Rationale: {change.rationale}")
+            if hasattr(change, "change_summary"):
+                lines.append(f"    Change Summary: {change.change_summary}")
             if hasattr(change, "change_magnitude"):
                 lines.append(f"    Magnitude: {change.change_magnitude}")
             if hasattr(change, "new_prompt"):

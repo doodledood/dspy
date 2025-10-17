@@ -88,9 +88,11 @@ def build_hypothesis_history_text(*, include_history: bool, candidate_history: S
             continue
 
         for predictor_name, change in changes.items():
-            rationale_text = _normalize_whitespace(change.rationale) if change.rationale else "No rationale provided"
+            summary_text = (
+                _normalize_whitespace(change.change_summary) if change.change_summary else "No summary provided"
+            )
             magnitude = change.change_magnitude.value
-            lines.append(f"    * {predictor_name} [{magnitude}]: {rationale_text}")
+            lines.append(f"    * {predictor_name} [{magnitude}]: {summary_text}")
 
     return "\n".join(lines)
 
@@ -509,9 +511,9 @@ def generate_hypotheses(
                     f"  → {predictor_name}: {prompt_preview}",
                     Verbosity.HIGH,
                 )
-                if changes.rationale:
+                if changes.change_summary:
                     log_fn(
-                        f"     Rationale: {changes.rationale}",
+                        f"     Summary: {changes.change_summary}",
                         Verbosity.HIGH,
                     )
 
