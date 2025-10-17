@@ -74,14 +74,28 @@ class FailureAnalysisSignature(Signature):
     - **MODERATE** (margin 0.1-0.3): Clear failure, targeted fix required
     - **SEVERE** (margin > 0.3): Major failure, may need substantial changes
 
-    ### 2. Prompt Deficiency Analysis
-    CRITICAL: Analyze the ACTUAL prompt instructions to identify what's missing:
+    ### 2. Model Perspective Analysis - What Was Missing?
+    Put yourself in the model's position with these instructions:
     1. Read the current prompt text from execution_flow
-    2. Compare to what the model actually did (outputs)
-    3. Identify the GAP - what instruction would have guided correct behavior?
-    4. Be SPECIFIC about the missing guidance, not generic
-       - ✓ "Lacks instruction to expand before computing"
-       - ✗ "Model made computational error"
+    2. Observe what the model actually did (even if reasoning unavailable)
+    3. Ask: "Running with these instructions, why would I make this error?"
+    4. Identify the MISSING instruction that would have prevented it
+
+    **Mental Backtracking Process**:
+    - Start with the error/wrong output
+    - Look at what instructions the model HAD
+    - Infer what instruction was MISSING that would guide correct behavior
+    - Consider: "What would I need to be told to avoid this mistake?"
+
+    Examples of DEEP analysis:
+       - ✓ "Lacks instruction to verify algebraic expansion before substituting"
+       - ✓ "Missing 'enumerate ALL cases' - model stopped after finding one"
+       - ✓ "No guidance to output as integer - model gave fraction"
+
+    Examples of SHALLOW analysis:
+       - ✗ "Model got wrong answer" (what instruction would fix it?)
+       - ✗ "Computational error" (what guidance was missing?)
+       - ✗ "Didn't understand problem" (too vague)
 
     ### 3. Root Cause Categorization
     Based on I/O analysis, classify the ROOT cause (not symptoms):
@@ -269,20 +283,26 @@ class FailureAnalysisSignature(Signature):
     key_details: "SEVERITY: MODERATE. PRIMARY_FAILURE: DateExtractor. FIXABLE: Add context handling. NOT_FIXABLE: None. SUGGESTED_FIX: Add 'Use provided reference_date field for relative dates'."
     ```
 
-    ## CRITICAL: Analyze What's MISSING in the Prompt
+    ## CRITICAL: Take the Model's Perspective on Failure
 
-    - Look at the ACTUAL prompt text in execution_flow
-    - Compare what the prompt says vs what the model did wrong
-    - Infer the SPECIFIC instruction that would prevent this error
-    - Don't just describe the error - identify the MISSING GUIDANCE
-    - Examples of good analysis:
-      - "Prompt lacks instruction to verify intermediate steps"
-      - "Prompt missing explicit requirement for integer output"
-      - "Prompt doesn't specify to handle edge cases"
-    - Examples of bad analysis:
-      - "Model got the wrong answer"
-      - "Model didn't complete the calculation"
-      - "Model made an error"
+    **Mental Exercise**: "If I were the model with these instructions,
+    why would I make this specific error?"
+
+    - Put yourself in the model's position with the ACTUAL prompt
+    - Consider what's MISSING that would have prevented the error
+    - Work backwards: Error → Model's likely thought process → Missing guidance
+    - Even without reasoning trace, infer from instructions + wrong output
+
+    **Analysis Pattern**:
+    1. "Model did X wrong" (observation)
+    2. "Current prompt says..." (what model had)
+    3. "Model likely thought..." (inference)
+    4. "Missing instruction: Y would have prevented this" (gap)
+
+    **Key Insight**: Models follow instructions literally. If it went wrong,
+    either an instruction was missing, ambiguous, or contradictory.
+
+    Find the SPECIFIC instruction gap, not generic issues.
 
     ## Quality Checklist
 
@@ -394,16 +414,28 @@ class SuccessAnalysisSignature(Signature):
     - **SOLID** (margin 0.1-0.3): Good success, preserve core mechanisms
     - **EXCELLENT** (margin >= 0.3): High-quality pattern, strong preservation candidate
 
-    ### 2. Prompt Feature Identification
-    Analyze the prompt to identify WHICH instruction enabled success:
+    ### 2. Model Perspective Analysis - What Guided Success?
+    Put yourself in the model's position with these instructions:
     - Read the actual prompt text from execution_flow
-    - Match prompt instructions to successful behaviors
-    - Identify the KEY instruction that guided correct execution
-    - Be SPECIFIC about the enabling feature:
-      - ✓ "The 'verify all conditions' instruction caught edge cases"
-      - ✓ "The 'output as integer' requirement ensured correct format"
-      - ✗ "The prompt worked well"
-      - ✗ "Clear instructions led to success"
+    - Consider: "If I were the model, which instruction would lead me to this successful approach?"
+    - Work backwards from the successful outcome to the enabling instruction
+    - When reasoning trace unavailable, infer from instructions + inputs + outputs
+
+    **Mental Backtracking Process**:
+    1. Observe the successful output/approach
+    2. Look at the prompt instructions
+    3. Ask: "Which specific instruction most likely triggered this behavior?"
+    4. Consider multiple possibilities, choose the most direct cause
+
+    Examples of GOOD analysis:
+    - ✓ "The 'verify each step algebraically' instruction led to systematic expansion"
+    - ✓ "The 'enumerate all cases' requirement triggered exhaustive search"
+    - ✓ "The 'output must be integer' constraint prevented fractional answers"
+
+    Examples of SHALLOW analysis:
+    - ✗ "Success from correct format" (unless format truly was the key constraint)
+    - ✗ "Clear instructions led to success" (too generic)
+    - ✗ "Model understood the problem" (not actionable)
 
     ### 3. Preservation Categories Clarified
 
@@ -427,10 +459,10 @@ class SuccessAnalysisSignature(Signature):
 
     ### 4. Preservation Decision Tree
 
-    **Category Selection Guide**:
+    **Category Selection Guide** (Think from model's perspective):
     • Success from organized approach → `structured-methodology`
     • Success from rules/boundaries → `explicit-constraints`
-    • Success from output format → `format-specification`
+    • Success from output format requirements → `format-specification`
     • Success from exhaustive checking → `comprehensive-coverage`
     • Success from problem breakdown → `decomposition-strategy`
     • Success from self-checking → `verification-step`
@@ -442,6 +474,10 @@ class SuccessAnalysisSignature(Signature):
     • Success from domain language → `domain-notation`
     • Just lucky input → `input-pattern-match`
     • None fit → Create custom category
+
+    **Backtracking Tip**: Start with the outcome, trace back to the most direct
+    instructional cause. Sometimes format IS key (e.g., integer requirement
+    preventing wrong type). Sometimes it's methodology. Be precise about causation.
 
     **Quick Tests for Preservation**:
     MUST PRESERVE tests:
@@ -625,20 +661,23 @@ class SuccessAnalysisSignature(Signature):
 
     *Key lesson: Success ≠ worth preserving. Expensive workarounds should be replaced, not protected*
 
-    ## CRITICAL: Identify the Enabling Prompt Feature
+    ## CRITICAL: Take the Model's Perspective
 
-    - Look at the ACTUAL prompt text in execution_flow
-    - Match successful behavior to SPECIFIC instructions
-    - Identify which prompt feature was KEY (not just "it worked")
-    - Don't describe what model did - identify what PROMPTED it
-    - Examples of good analysis:
-      - "Success from 'verify all cases' instruction"
-      - "Success due to explicit step ordering"
-      - "Success from 'output as integer' constraint"
-    - Examples of bad analysis:
-      - "Model correctly solved the problem"
-      - "Systematic approach led to success"
-      - "Clear reasoning produced right answer"
+    **Mental Exercise**: "If I were the model with these exact instructions,
+    what would make me produce this successful outcome?"
+
+    - Put yourself in the model's shoes with the given prompt
+    - Work backwards from successful behavior to triggering instruction
+    - When reasoning unavailable, infer from instructions + outcome
+    - Be specific about causal link between instruction and behavior
+
+    **Good Analysis Pattern**:
+    1. "Model did X successfully" (observation)
+    2. "Prompt says Y" (instruction)
+    3. "Y directly led to X because..." (causal link)
+
+    **Remember**: Different instructions might lead to same outcome.
+    Find the MOST DIRECT causal instruction, not just any related text.
 
     ## Quality Checklist
 
