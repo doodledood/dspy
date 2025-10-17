@@ -66,6 +66,59 @@ def generate_optimization_summary(
 
     lines.append("╚══════╧═══════════╧════════════╧════════════╧══════════════╝")
 
+    # Prompt evolution lineage - only show improvements that became best so far
+    lines.append("\n╔═══════════════════════════════════════════════════════════════╗")
+    lines.append("║                  Prompt Evolution Lineage                    ║")
+    lines.append("╠═══════════════════════════════════════════════════════════════╣")
+
+    # Build lineage by tracking best score improvements
+    lineage = []
+    best_so_far = initial_score
+
+    for it in iterations:
+        # Find the best candidate in this iteration
+        if it.candidates:
+            iteration_best = max(it.candidates, key=lambda c: c.overall_score)
+
+            # Only include if it improved over previous best and has a hypothesis
+            if iteration_best.overall_score > best_so_far and iteration_best.hypothesis is not None:
+                lineage.append((iteration_best, best_so_far))
+                best_so_far = iteration_best.overall_score
+
+    if lineage:
+        for candidate, prev_score in lineage:
+            score = candidate.overall_score
+            delta = score - prev_score
+            delta_str = f"{'+' if delta >= 0 else ''}{delta:.4f}"
+
+            header = f"Iteration {candidate.iteration} (score={score:.4f}, Δ={delta_str})"
+            lines.append(f"║ {header:<61} ║")
+
+            if candidate.hypothesis and candidate.hypothesis.prompt_changes:
+                for predictor_name, change in candidate.hypothesis.prompt_changes.items():
+                    summary = change.change_summary or "No summary provided"
+                    magnitude = change.change_magnitude.value
+                    prefix = f"  * {predictor_name} [{magnitude}]: "
+
+                    # Word-wrap the summary
+                    words = summary.split()
+                    current_line = prefix
+
+                    for word in words:
+                        test_line = current_line + (" " if current_line != prefix else "") + word
+                        if len(test_line) <= 61:
+                            current_line = test_line
+                        else:
+                            lines.append(f"║ {current_line:<61} ║")
+                            current_line = "    " + word
+
+                    if current_line:
+                        lines.append(f"║ {current_line:<61} ║")
+    else:
+        lines.append("║ No improvements found during optimization                     ║")
+
+    lines.append("╚═══════════════════════════════════════════════════════════════╝")
+
     # Best hypothesis details if available
     if best_candidate.hypothesis:
         lines.append("\n╔═══════════════════════════════════════════════════════════════╗")
@@ -82,9 +135,50 @@ def generate_optimization_summary(
         lines.append(f"║ Iteration: {best_candidate.iteration:<54} ║")
 
         if best_candidate.hypothesis.prompt_changes:
-            lines.append(
-                f"║ Updated Predictors: {', '.join(best_candidate.hypothesis.prompt_changes.keys())[:43]:<43} ║"
-            )
+            lines.append("╟───────────────────────────────────────────────────────────────╢")
+            for predictor_name, change in best_candidate.hypothesis.prompt_changes.items():
+                # Predictor header with magnitude
+                magnitude = change.change_magnitude.value
+                header = f"{predictor_name} [{magnitude}]"
+                lines.append(f"║ {header:<61} ║")
+
+                # Change summary
+                summary = change.change_summary or "No summary provided"
+                summary_prefix = "  Summary: "
+                words = summary.split()
+                current_line = summary_prefix
+
+                for word in words:
+                    test_line = current_line + (" " if current_line != summary_prefix else "") + word
+                    if len(test_line) <= 61:
+                        current_line = test_line
+                    else:
+                        lines.append(f"║ {current_line:<61} ║")
+                        current_line = "    " + word
+
+                if current_line:
+                    lines.append(f"║ {current_line:<61} ║")
+
+                # Full prompt (word-wrapped)
+                lines.append(f"║ {'  Prompt:':<61} ║")
+                prompt = change.new_prompt
+                prompt_words = prompt.split()
+                current_line = "    "
+
+                for word in prompt_words:
+                    test_line = current_line + (" " if len(current_line) > 4 else "") + word
+                    if len(test_line) <= 61:
+                        current_line = test_line
+                    else:
+                        lines.append(f"║ {current_line:<61} ║")
+                        current_line = "    " + word
+
+                if current_line.strip():
+                    lines.append(f"║ {current_line:<61} ║")
+
+                # Add separator if there are multiple predictors
+                if len(best_candidate.hypothesis.prompt_changes) > 1:
+                    lines.append("╟───────────────────────────────────────────────────────────────╢")
 
         lines.append("╚═══════════════════════════════════════════════════════════════╝")
 
