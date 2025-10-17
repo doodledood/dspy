@@ -23,11 +23,7 @@ def to_serializable(value: Any) -> Any:
     if hasattr(value, "model_dump"):
         try:
             with warnings.catch_warnings():
-                warnings.filterwarnings(
-                    "ignore",
-                    message="PydanticSerializationUnexpectedValue",
-                    category=UserWarning,
-                )
+                warnings.filterwarnings("ignore", category=UserWarning)
                 return value.model_dump()  # type: ignore[no-untyped-call]
         except Exception:  # pragma: no cover - defensive
             pass
