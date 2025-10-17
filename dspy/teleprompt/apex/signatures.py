@@ -622,6 +622,23 @@ class HypothesisGenerationSignature(Signature):
 
     Key insight: The program_flow shows predictor dependencies. Changes to upstream predictors affect all downstream branches - coordinate changes accordingly.
 
+    ## CRITICAL: What Can and Cannot Be Modified in Prompts
+
+    **IMPORTANT**: The input and output field definitions shown in program_flow are PROVIDED FOR CONTEXT ONLY and are STATIC:
+    - Input fields (e.g., "problem: A mathematical problem to solve") - DO NOT MODIFY
+    - Output fields (e.g., "answer: The final numerical answer") - DO NOT MODIFY
+    - These field structures are part of the program architecture and cannot be changed via prompt optimization
+
+    **What you CAN modify**:
+    - ONLY the "Instructions" part of each predictor's prompt
+    - This is the text that guides HOW the predictor should process the inputs to produce outputs
+    - Example: "Solve the problem step by step" → "Break down the problem into smaller parts and solve methodically"
+
+    **Why this matters**:
+    - The field definitions tell you WHAT data the predictor receives and produces (context for understanding)
+    - The instructions tell the model HOW to perform the transformation (what you optimize)
+    - Attempting to modify field definitions in new_prompt will cause failures since the DSPy framework expects fixed field structures
+
     ## Success Pattern Preservation
 
     From success_analyses, identify what works. Your hypotheses must:
@@ -694,7 +711,9 @@ class HypothesisGenerationSignature(Signature):
     **Critical Requirements:**
 
     - PredictorName must EXACTLY match existing predictor names referenced in program_flow or prior history
-    - new_prompt is COMPLETE replacement (all original + changes)
+    - new_prompt contains ONLY the instructions text (the part shown as "Instructions:" in program_flow)
+    - new_prompt is COMPLETE replacement of the instructions (all original + changes)
+    - DO NOT include field definitions in new_prompt (input/output fields are handled by DSPy framework)
     - Sort by impact_score descending, then generalizability_score
     - change_magnitude must be exactly: minimal, moderate, or substantial (lowercase)
 
@@ -791,24 +810,27 @@ class HypothesisGenerationSignature(Signature):
       "strategy": "Add format specification without changing extraction logic",
       "expected_impact": "Eliminate JSON parsing errors affecting 35% of cases",
       "prompt_changes": {
-        "ExtractorPredictor": {
-          "new_prompt": "Extract key information from the provided text.\n\nRequirements:\n- Identify main entities and relationships\n- Preserve numerical data exactly\n- Include confidence scores\n\nOutput MUST be valid JSON:\n{\n  \"entities\": [...],\n  \"relationships\": [...],\n  \"confidence\": 0.0-1.0\n}\n\nFormat rules:\n- Use double quotes for strings\n- No trailing commas\n- Numbers without quotes",
-          "rationale": "Adds format spec to fix parsing. Preserves successful extraction approach.",
+        "predict": {
+          "new_prompt": "Extract key information from the provided text and output in a structured format.\n\nRequirements:\n- Identify main entities and relationships\n- Preserve numerical data exactly\n- Include confidence scores when applicable\n\nYour output must be well-structured and consistent. Ensure all data is properly formatted with clear field names and appropriate data types.",
+          "rationale": "Adds clear formatting requirements and structure guidance to prevent JSON parsing errors. Preserves successful extraction logic.",
           "change_magnitude": "minimal"
         }
       }
     }
     ```
 
+    Note: The new_prompt contains ONLY the instructions text, NOT the field definitions. The fields (input/output) shown in program_flow are handled by the DSPy framework and remain static.
+
     ## Key Principles
 
     1. **Minimal effective change** - Smallest fix that solves the problem
-    1. **Preserve success** - Don’t modify what works
-    1. **Complete replacements** - new_prompt contains everything
-    1. **Pattern-based** - Work from summaries, not detailed instructions
-    1. **Testable impact** - Clear, measurable predictions
+    2. **Preserve success** - Don't modify what works
+    3. **Instructions only** - new_prompt contains ONLY the instructions text, never field definitions
+    4. **Complete replacements** - new_prompt is the complete replacement instructions (not a patch)
+    5. **Pattern-based** - Work from summaries, not overfitting to specific examples
+    6. **Testable impact** - Clear, measurable predictions
 
-    Remember: You’re working with pattern summaries. Focus on fixing clear problems while preserving successful approaches. Conservative improvements beat risky rewrites."""
+    Remember: You're modifying ONLY the instructions that guide HOW predictors process data, NOT the field structures that define WHAT data they handle. Field definitions shown in program_flow are for your understanding only. Focus on fixing clear problems while preserving successful approaches. Conservative improvements beat risky rewrites."""
 
     failure_analyses: list[FailureSummaryRecord] = InputField(
         desc="Structured failure analyses (FailureSummaryRecord) for this iteration"
@@ -825,9 +847,7 @@ class HypothesisGenerationSignature(Signature):
     success_category_counts: dict[str, int] = InputField(
         desc="Pre-aggregated counts of successes per category for the sampled batch"
     )
-    success_rate_percentage: float = InputField(
-        desc="Percentage of analyzed examples that were successes (0-100)"
-    )
+    success_rate_percentage: float = InputField(desc="Percentage of analyzed examples that were successes (0-100)")
     best_validation_score: str = InputField(
         desc="Best validation score achieved so far; 'N/A' if unavailable",
         default="N/A",

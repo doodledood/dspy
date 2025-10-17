@@ -296,8 +296,7 @@ def generate_hypotheses(
 
         known_predictors = sorted(available_prompts.keys())
         raise ValueError(
-            "APEX hypothesis generation aborted: unknown predictor "
-            f"'{raw_name}'. Known predictors: {known_predictors}"
+            f"APEX hypothesis generation aborted: unknown predictor '{raw_name}'. Known predictors: {known_predictors}"
         )
 
     def build_program_flow_text() -> str:
@@ -306,10 +305,15 @@ def generate_hypotheses(
         if not available_prompts:
             return snapshot.flow_description
 
-        lines: list[str] = [f"Program structure: {snapshot.flow_description}", "", "Predictor prompts:"]
+        lines: list[str] = [
+            f"Program structure: {snapshot.flow_description}",
+            "",
+            "Predictor prompts and configurations:",
+        ]
         for predictor_name, prompt in available_prompts.items():
             prompt_text = prompt if prompt else "(no prompt provided)"
-            lines.append(f"- {predictor_name}: {prompt_text}")
+            lines.append(f"\n### {predictor_name} ###")
+            lines.append(prompt_text)
         return "\n".join(lines)
 
     def build_failure_records() -> tuple[list[FailureSummaryRecord], Counter[str]]:
