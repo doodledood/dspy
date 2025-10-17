@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+from collections import Counter
 from contextlib import nullcontext
 from typing import Callable, Sequence
 
@@ -277,32 +278,121 @@ def generate_hypotheses(
         "num_successes": len(success_summaries),
     }
 
-    predictor = dspy.Predict(HypothesisGenerationSignature)
-    prompt_text = getattr(predictor.signature, "instructions", "")
+    available_prompts = snapshot.prompts or {}
+    available_predictor_names = list(available_prompts.keys())
 
-    failure_records = [
-        FailureSummaryRecord(
-            root_cause=getattr(f, "root_cause", ""),
-            involved_predictors=list(getattr(f, "involved_predictors", []) or []),
-            context=getattr(f, "context", "") or "",
-            category=getattr(f, "category", "") or "",
-            key_details=getattr(f, "key_details", "") or "",
+    def normalize_predictor_name(raw_name: str) -> str:
+        """Return the canonical predictor name or raise when it cannot be resolved."""
+
+        normalized = (raw_name or "").strip()
+        if not normalized:
+            return normalized
+        if normalized in available_prompts:
+            return normalized
+
+        matches = [candidate for candidate in available_predictor_names if candidate.lower() == normalized.lower()]
+        if len(matches) == 1:
+            return matches[0]
+
+        known_predictors = sorted(available_prompts.keys())
+        raise ValueError(
+            "APEX hypothesis generation aborted: unknown predictor "
+            f"'{raw_name}'. Known predictors: {known_predictors}"
         )
-        for f in shuffled_failures
-    ]
 
-    success_records = [
-        SuccessSummaryRecord(
-            success_pattern=getattr(s, "success_pattern", ""),
-            contributing_predictors=list(getattr(s, "contributing_predictors", []) or []),
-            context=getattr(s, "context", "") or "",
-            category=getattr(s, "category", "") or "",
-            key_details=getattr(s, "key_details", "") or "",
-        )
-        for s in success_summaries
-    ]
+    def build_program_flow_text() -> str:
+        """Return the text describing the DAG structure plus each predictor prompt."""
 
-    program_flow = snapshot.flow_description
+        if not available_prompts:
+            return snapshot.flow_description
+
+        lines: list[str] = [f"Program structure: {snapshot.flow_description}", "", "Predictor prompts:"]
+        for predictor_name, prompt in available_prompts.items():
+            prompt_text = prompt if prompt else "(no prompt provided)"
+            lines.append(f"- {predictor_name}: {prompt_text}")
+        return "\n".join(lines)
+
+    def build_failure_records() -> tuple[list[FailureSummaryRecord], Counter[str]]:
+        """Normalize predictor names and collect aggregate failure metadata."""
+
+        category_counts: Counter[str] = Counter()
+        records: list[FailureSummaryRecord] = []
+        for failure in shuffled_failures:
+            category = getattr(failure, "category", "") or "uncategorized"
+            category_counts[category] += 1
+            normalized_predictors = [
+                normalize_predictor_name(predictor)
+                for predictor in list(getattr(failure, "involved_predictors", []) or [])
+            ]
+            records.append(
+                FailureSummaryRecord(
+                    root_cause=getattr(failure, "root_cause", ""),
+                    involved_predictors=[p for p in normalized_predictors if p],
+                    category=category,
+                )
+            )
+        return records, category_counts
+
+    def build_success_records() -> tuple[list[SuccessSummaryRecord], Counter[str]]:
+        """Normalize predictor names and collect aggregate success metadata."""
+
+        category_counts: Counter[str] = Counter()
+        records: list[SuccessSummaryRecord] = []
+        for success in success_summaries:
+            category = getattr(success, "category", "") or "uncategorized"
+            category_counts[category] += 1
+            normalized_predictors = [
+                normalize_predictor_name(predictor)
+                for predictor in list(getattr(success, "contributing_predictors", []) or [])
+            ]
+            records.append(
+                SuccessSummaryRecord(
+                    root_cause=getattr(success, "success_pattern", ""),
+                    contributing_predictors=[p for p in normalized_predictors if p],
+                    category=category,
+                )
+            )
+        return records, category_counts
+
+    failure_records, failure_category_counts = build_failure_records()
+    success_records, success_category_counts = build_success_records()
+
+    total_examples = len(failure_summaries) + len(success_summaries)
+    success_rate_percentage = (len(success_summaries) / total_examples * 100.0) if total_examples else 0.0
+
+    predictor_module = dspy.Predict(HypothesisGenerationSignature)
+    prompt_text = getattr(predictor_module.signature, "instructions", "")
+
+    validation_error: list[str] = []
+
+    def validate_prediction(prediction: Prediction | None) -> str | None:
+        """Return an error message when validation fails, otherwise ``None``."""
+
+        if prediction is None:
+            return "APEX hypothesis generation failed: no prediction returned for validation"
+
+        hypotheses = getattr(prediction, "hypotheses", None) or []
+        invalid_predictors: set[str] = set()
+        for spec in hypotheses:
+            prompt_changes = getattr(spec, "prompt_changes", {}) or {}
+            invalid_predictors.update({name for name in prompt_changes if name not in available_prompts})
+
+        if invalid_predictors:
+            missing = sorted(invalid_predictors)
+            known_predictors = sorted(available_prompts.keys())
+            return (
+                "APEX hypothesis generation aborted: unknown predictor(s) "
+                f"{missing}. Known predictors: {known_predictors}"
+            )
+
+        return None
+
+    def hypothesis_reward_fn(_, prediction: Prediction | None) -> float:
+        error_message = validate_prediction(prediction)
+        validation_error[:] = [error_message] if error_message else []
+        return 0.0 if error_message else 1.0
+
+    program_flow = build_program_flow_text()
     history_text = build_hypothesis_history_text(
         include_history=include_history,
         candidate_history=candidate_history,
@@ -313,6 +403,9 @@ def generate_hypotheses(
         "failure_analyses": failure_records,
         "success_analyses": success_records,
         "program_flow": program_flow,
+        "failure_category_counts": dict(failure_category_counts),
+        "success_category_counts": dict(success_category_counts),
+        "success_rate_percentage": success_rate_percentage,
         "best_validation_score": best_val_text,
         "current_iteration": iteration if iteration is not None else -1,
         "hypothesis_history": history_text,
@@ -333,7 +426,41 @@ def generate_hypotheses(
 
     with span_cm as span:
         with dspy.context(lm=hypothesis_lm, adapter=hypothesis_adapter):
-            result = predictor(**generation_payload)
+            answers = getattr(hypothesis_lm, "answers", None)
+            if answers is not None and not hasattr(answers, "__deepcopy__"):
+
+                class _SharedIterator:
+                    def __init__(self, iterator):
+                        self._iterator = iterator
+
+                    def __iter__(self):
+                        return self
+
+                    def __next__(self):
+                        return next(self._iterator)
+
+                    def __deepcopy__(self, memo):
+                        return self
+
+                hypothesis_lm.answers = _SharedIterator(answers)
+
+            validator = dspy.Refine(
+                module=predictor_module,
+                N=1,
+                reward_fn=hypothesis_reward_fn,
+                threshold=1.0,
+                fail_count=1,
+            )
+
+            try:
+                result = validator(**generation_payload)
+            except Exception as exc:
+                if validation_error:
+                    raise ValueError(validation_error[0]) from exc
+                raise
+
+        if validation_error:
+            raise ValueError(validation_error[0])
 
         validated_specs = result.hypotheses if result.hypotheses else []
         validated_specs.sort(key=lambda h: (h.impact_score, h.generalizability_score), reverse=True)
@@ -347,6 +474,9 @@ def generate_hypotheses(
                     "current_iteration": iteration if iteration is not None else -1,
                     "failure_analyses": [to_serializable(record) for record in failure_records],
                     "success_analyses": [to_serializable(record) for record in success_records],
+                    "failure_category_counts": dict(failure_category_counts),
+                    "success_category_counts": dict(success_category_counts),
+                    "success_rate_percentage": success_rate_percentage,
                     "prompt": prompt_text,
                     "hypotheses": [to_serializable(spec) for spec in validated_specs],
                 }

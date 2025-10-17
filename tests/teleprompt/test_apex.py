@@ -261,15 +261,20 @@ def test_generate_hypotheses_traces_include_full_context():
     assert failure_entry["root_cause"] == "Extractor dropped required field"
     assert failure_entry["involved_predictors"] == ["predictor"]
     assert failure_entry["category"] == "format_ambiguity"
-    assert failure_entry["key_details"] == "Needs to say good"
+    assert "key_details" not in failure_entry
 
     success_records = payload["success_analyses"]
     assert isinstance(success_records, list) and success_records, "Expected serialized success analyses"
     success_entry = success_records[0]
-    assert success_entry["success_pattern"] == "Validator preserved schema"
+    assert success_entry["root_cause"] == "Validator preserved schema"
     assert success_entry["contributing_predictors"] == ["predictor"]
     assert success_entry["category"] == "clear_format_compliance"
-    assert success_entry["key_details"] == "Keep current instructions"
+    assert "key_details" not in success_entry
+
+    assert payload["failure_category_counts"] == {"format_ambiguity": 1}
+    assert payload["success_category_counts"] == {"clear_format_compliance": 1}
+    assert payload["success_rate_percentage"] == pytest.approx(50.0)
+    assert "Predictor prompts:" in payload["program_flow"]
 
     assert payload["best_validation_score"] == "0.5000"
     assert payload["current_iteration"] == 2
@@ -277,7 +282,10 @@ def test_generate_hypotheses_traces_include_full_context():
     outputs = span["outputs"]
     assert outputs["best_val_score"] == 0.5
     assert outputs["failure_analyses"][0]["root_cause"] == "Extractor dropped required field"
-    assert outputs["success_analyses"][0]["success_pattern"] == "Validator preserved schema"
+    assert outputs["success_analyses"][0]["root_cause"] == "Validator preserved schema"
+    assert outputs["failure_category_counts"] == {"format_ambiguity": 1}
+    assert outputs["success_category_counts"] == {"clear_format_compliance": 1}
+    assert outputs["success_rate_percentage"] == pytest.approx(50.0)
 @pytest.mark.parametrize(
     "kwargs, error_match",
     [
