@@ -73,23 +73,31 @@ class ExecutionFlowEntry(BaseModel):
 class FailureSummaryRecord(BaseModel):
     """Compact failure summary provided to hypothesis generation."""
 
-    root_cause: str = Field(description="Fundamental issue identified by FailureDetective")
+    potential_root_causes: list[str] = Field(
+        description="Potential root causes ordered by likelihood (most likely first). Multiple causes possible since we infer from limited info."
+    )
     involved_predictors: list[str] = Field(
         default_factory=list,
         description="Predictors in causal order (primary failure first, then affected downstream)",
     )
-    category: str = Field(description="Canonical category label for grouping similar failures")
+    categories: list[str] = Field(
+        description="Potential categories for this failure, ordered by likelihood. Multiple may apply."
+    )
 
 
 class SuccessSummaryRecord(BaseModel):
     """Compact success summary provided to hypothesis generation."""
 
-    root_cause: str = Field(description="Mechanism or pattern that produced the success")
+    potential_root_causes: list[str] = Field(
+        description="Potential enabling factors ordered by likelihood (most likely first). Multiple factors may have contributed."
+    )
     contributing_predictors: list[str] = Field(
         default_factory=list,
         description="Predictors responsible for the success pattern",
     )
-    category: str = Field(description="Categorization of the success pattern")
+    categories: list[str] = Field(
+        description="Potential categories for this success, ordered by relevance. Multiple may apply."
+    )
 
 
 class TrainExampleRecord(BaseModel):

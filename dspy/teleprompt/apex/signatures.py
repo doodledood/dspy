@@ -183,15 +183,16 @@ class FailureAnalysisSignature(Signature):
 
     Provide focused analysis with these EXACT fields:
 
-    **root_cause**: What SPECIFIC instruction/guidance is missing or unclear in the prompt
-    - Start with: "In [Predictor], prompt lacks..."
-    - Be SPECIFIC about missing instruction, not just stating the error
-    - Focus on WHAT TO ADD to the prompt to prevent this failure
+    **potential_root_causes**: List of POTENTIAL missing instructions/issues (ordered by likelihood)
+    - List 1-3 most plausible explanations for the failure
+    - Order by likelihood (most probable first)
+    - Each entry should be specific about what's missing
+    - Format each: "In [Predictor], prompt lacks/has..."
+    - Acknowledge uncertainty when multiple causes equally likely
     - Examples:
-      - GOOD: "In predict, prompt lacks instruction to expand algebraic expressions before computing final values."
-      - GOOD: "In predict, prompt missing requirement to verify answer satisfies all original constraints."
-      - BAD: "In predict, model got wrong answer 13 instead of 33."
-      - BAD: "In predict, model didn't complete the derivation."
+      - ["In predict, prompt lacks algebraic expansion requirement",
+       "In predict, missing verification step instruction",
+       "In predict, input complexity exceeds single-pass capability"]
 
     **involved_predictors**: Predictors contributing to failure
     - List in order of causality (primary failure first)
@@ -203,12 +204,12 @@ class FailureAnalysisSignature(Signature):
     - Include data patterns from I/O analysis
     - Defines when this failure occurs
 
-    **category**: Primary failure classification
-    Use the specific categories from framework:
-    - Prompt-related: missing-format-spec, ambiguous-instruction, etc.
-    - Data-flow: type-mismatch, schema-mismatch, etc.
-    - Architecture: missing-retrieval, model-limitation, etc.
-    - Create new specific category if none fit (be descriptive)
+    **categories**: Potential failure classifications (ordered by likelihood)
+    - List 1-2 most applicable categories
+    - Order by relevance/certainty
+    - Can include multiple if failure has mixed causes
+    - Examples: ["unclear-methodology", "missing-constraint"]
+    - Use framework categories or create specific ones if needed
 
     **key_details**: Actionable fix information
     Structure as:
@@ -223,34 +224,44 @@ class FailureAnalysisSignature(Signature):
     ## Examples
     *All use: score_norm = (score - min) / (max - min), margin = threshold_norm - score_norm*
 
-    ### Example 1: NEAR_MISS (Missing Methodology)
+    ### Example 1: NEAR_MISS (Multiple Potential Causes)
     Given: score=0.92, threshold=1.0, range=[0,1] → margin=0.08
     ```
-    root_cause: "In predict, prompt lacks instruction to fully expand algebraic expression before substituting values. Model jumped to computation without algebraic simplification."
+    potential_root_causes: [
+        "In predict, prompt lacks instruction to expand algebraically before computing",
+        "In predict, missing verification step to check answer"
+    ]
     involved_predictors: ["predict"]
     context: "Algebraic problems requiring symbolic manipulation"
-    category: "unclear-methodology"
-    key_details: "SEVERITY: NEAR_MISS. PRIMARY_FAILURE: predict. FIXABLE: Add 'First expand and simplify algebraically, then compute numerical result'. NOT_FIXABLE: None. SUGGESTED_FIX: Add explicit algebraic expansion step to methodology."
+    categories: ["unclear-methodology", "incomplete-instruction"]
+    key_details: "SEVERITY: NEAR_MISS. PRIMARY_FAILURE: predict. FIXABLE: Add algebraic expansion or verification step. NOT_FIXABLE: None. SUGGESTED_FIX: Most likely needs explicit expansion instruction."
     ```
 
-    ### Example 2: MODERATE (Missing Verification)
+    ### Example 2: MODERATE (Clear Primary Cause)
     Given: score=18, threshold=50, range=[0,100] → margin=0.32
     ```
-    root_cause: "In predict, prompt lacks instruction to enumerate ALL arithmetic progressions systematically. Current prompt says 'find progressions' but doesn't specify exhaustive search."
+    potential_root_causes: [
+        "In predict, prompt lacks instruction to enumerate ALL cases systematically",
+        "In predict, missing explicit 'check boundary cases' requirement"
+    ]
     involved_predictors: ["predict"]
     context: "Combinatorial problems requiring complete enumeration"
-    category: "incomplete-instruction"
-    key_details: "SEVERITY: MODERATE. PRIMARY_FAILURE: predict. FIXABLE: Add 'Systematically check ALL possible 4-term progressions including boundary cases'. NOT_FIXABLE: None. SUGGESTED_FIX: Add explicit exhaustive enumeration requirement."
+    categories: ["incomplete-instruction"]
+    key_details: "SEVERITY: MODERATE. PRIMARY_FAILURE: predict. FIXABLE: Add exhaustive enumeration requirement. NOT_FIXABLE: None. SUGGESTED_FIX: Add 'Systematically check ALL possible cases'."
     ```
 
-    ### Example 3: SEVERE (Missing Structure)
+    ### Example 3: SEVERE (High Uncertainty)
     Given: score=0.15, threshold=0.7, range=[0,1] → margin=0.55
     ```
-    root_cause: "In predict, lacks systematic approach instruction. Model attempted direct solution without proper setup."
+    potential_root_causes: [
+        "In predict, prompt lacks step-by-step methodology",
+        "In predict, problem complexity exceeds single-pass capability",
+        "In predict, missing required mathematical notation guidance"
+    ]
     involved_predictors: ["predict"]
     context: "Multi-step optimization problems"
-    category: "unclear-methodology"
-    key_details: "SEVERITY: SEVERE. PRIMARY_FAILURE: predict. FIXABLE: Add step-by-step methodology. NOT_FIXABLE: None. SUGGESTED_FIX: Add 'Break down into steps: 1) Set up constraints, 2) Identify critical points, 3) Verify optimality'."
+    categories: ["unclear-methodology", "computational-complexity"]
+    key_details: "SEVERITY: SEVERE. PRIMARY_FAILURE: predict. FIXABLE: Try structured approach. NOT_FIXABLE: May need decomposition. SUGGESTED_FIX: Add step-by-step methodology first."
     ```
 
     *Key lesson: Always trace cascades to their origin - fixing downstream symptoms wastes iterations*
@@ -328,8 +339,8 @@ class FailureAnalysisSignature(Signature):
     min_metric: float = InputField(desc="The minimum possible metric score")
     max_metric: float = InputField(desc="The maximum possible metric score")
 
-    root_cause: str = OutputField(
-        desc="Fundamental issue with I/O evidence. Start with 'In [Predictor],...' and include data from execution flow"
+    potential_root_causes: list[str] = OutputField(
+        desc="List of 1-3 potential root causes ordered by likelihood. Each: 'In [Predictor], prompt lacks/has...'"
     )
     involved_predictors: list[str] = OutputField(
         desc="List of predictors in causal order: primary failure first, then affected downstream", default_factory=list
@@ -337,8 +348,8 @@ class FailureAnalysisSignature(Signature):
     context: str = OutputField(
         desc="Specific input/data characteristics that trigger this failure (e.g., 'nested JSON', 'text >500 chars')"
     )
-    category: str = OutputField(
-        desc="Primary failure type: missing-format-spec, type-mismatch, ambiguous-instruction, etc."
+    categories: list[str] = OutputField(
+        desc="List of 1-2 potential categories ordered by likelihood (e.g., ['unclear-methodology', 'missing-constraint'])"
     )
     key_details: str = OutputField(
         desc="Structured fix information: SEVERITY / PRIMARY_FAILURE / FIXABLE / NOT_FIXABLE / SUGGESTED_FIX"
@@ -542,15 +553,15 @@ class SuccessAnalysisSignature(Signature):
 
     Provide focused analysis with these EXACT fields:
 
-    **success_pattern**: The SPECIFIC prompt feature that enabled success
-    - Format: "Success due to prompt's [specific instruction/feature]"
-    - Identify the KEY instruction from the actual prompt text
-    - Length: 1 sentence max
+    **potential_success_patterns**: List of POTENTIAL enabling prompt features (ordered by likelihood)
+    - List 1-3 possible prompt features that enabled success
+    - Order by likelihood (most probable first)
+    - Format each: "Success due to [specific instruction/feature]"
+    - Acknowledge when multiple factors equally likely
     - Examples:
-      - GOOD: "Success due to prompt's 'expand algebraically first' instruction"
-      - GOOD: "Success from explicit 'verify answer' requirement"
-      - BAD: "Model successfully solved the problem"
-      - BAD: "Clear instructions led to correct answer"
+      - ["Success due to 'expand algebraically' instruction",
+       "Success from 'verify answer' requirement",
+       "Success from clear output format specification"]
 
     **contributing_predictors**: List of essential predictors
     - Include ONLY if changing them would break this success
@@ -561,8 +572,11 @@ class SuccessAnalysisSignature(Signature):
     - Avoid vague: "simple inputs", "normal cases"
     - This defines the pattern's DOMAIN
 
-    **category**: Classification for pattern grouping
-    Pick the MOST SPECIFIC that applies:
+    **categories**: Potential success classifications (ordered by relevance)
+    - List 1-2 most applicable categories
+    - Order by relevance/certainty
+    - Multiple factors may have contributed
+    - Examples: ["structured-methodology", "format-specification"]
     - "structured-methodology" - Success from step-by-step or systematic approach
     - "explicit-constraints" - Success from clear boundaries/validation rules
     - "format-specification" - Success from well-defined output format
@@ -610,43 +624,55 @@ class SuccessAnalysisSignature(Signature):
     ## Examples
     *All use: score_norm = (score - min) / (max - min), margin = score_norm - threshold_norm*
 
-    ### Example 1: EXCELLENT (Structured Approach)
+    ### Example 1: EXCELLENT (Multiple Contributing Factors)
     Given: score=0.95, threshold=0.5, range=[0,1] → margin=0.45
     ```
-    success_pattern: "Success due to prompt's 'Break into steps: 1) Expand, 2) Simplify, 3) Compute' instruction."
+    potential_success_patterns: [
+        "Success due to 'Break into steps: 1) Expand, 2) Simplify, 3) Compute' instruction",
+        "Success from 'verify your answer' requirement"
+    ]
     contributing_predictors: ["predict"]
     context: "Complex multi-step algebraic problems"
-    category: "structured-methodology"
-    key_details: "MUST PRESERVE: Explicit step enumeration. CAN MODIFY: Wording of steps. FRAGILE: None. RELIABILITY: High - explicit steps guide systematic solving."
+    categories: ["structured-methodology", "verification-step"]
+    key_details: "MUST PRESERVE: Step structure OR verification. CAN MODIFY: Exact wording. FRAGILE: None. RELIABILITY: High - multiple reinforcing features."
     ```
 
-    ### Example 2: SOLID (Format Control)
+    ### Example 2: SOLID (Clear Primary Factor)
     Given: score=72, threshold=50, range=[0,100] → margin=0.22
     ```
-    success_pattern: "Success from prompt's 'Output must be a single integer value' requirement."
+    potential_success_patterns: [
+        "Success from 'Output must be a single integer value' requirement"
+    ]
     contributing_predictors: ["predict"]
     context: "AIME problems requiring integer answers"
-    category: "format-specification"
-    key_details: "MUST PRESERVE: Explicit integer requirement. CAN MODIFY: Phrasing style. FRAGILE: None. RELIABILITY: High - clear format spec prevents fractional answers."
+    categories: ["format-specification"]
+    key_details: "MUST PRESERVE: Integer output requirement. CAN MODIFY: Phrasing. FRAGILE: None. RELIABILITY: High - format prevented fractional answers."
     ```
 
-    ### Example 3: MARGINAL
+    ### Example 3: MARGINAL (High Uncertainty)
     Given: score=0.52, threshold=0.5, range=[0,1] → margin=0.02
     ```
-    success_pattern: "Succeeded only because input was pre-formatted. Predictors did minimal processing."
+    potential_success_patterns: [
+        "Success possibly from input simplicity",
+        "Success possibly from output format alignment",
+        "Success possibly from lucky pattern match"
+    ]
     contributing_predictors: []
-    context: "Pre-formatted JSON matching output requirements"
-    category: "input-pattern-match"
-    key_details: "MUST PRESERVE: Nothing. CAN MODIFY: All prompts need improvement. FRAGILE: N/A. RELIABILITY: Low - only works when pre-formatted"
+    context: "Simple inputs with pre-formatted structure"
+    categories: ["input-pattern-match"]
+    key_details: "MUST PRESERVE: Nothing certain. CAN MODIFY: Everything. FRAGILE: N/A. RELIABILITY: Low - unclear what enabled success."
     ```
 
     ### Example 4: Verification Success
     ```
-    success_pattern: "Success due to prompt's 'After solving, verify your answer satisfies all original constraints' instruction."
+    potential_success_patterns: [
+        "Success due to 'verify your answer satisfies all constraints' instruction",
+        "Success from systematic constraint checking approach"
+    ]
     contributing_predictors: ["predict"]
     context: "Constraint satisfaction problems"
-    category: "verification-step"
-    key_details: "MUST PRESERVE: Post-solution verification requirement. CAN MODIFY: Verification phrasing. FRAGILE: 'all original constraints' specificity. RELIABILITY: High - catches computation errors."
+    categories: ["verification-step", "comprehensive-coverage"]
+    key_details: "MUST PRESERVE: Verification requirement. CAN MODIFY: Phrasing. FRAGILE: 'all constraints' scope. RELIABILITY: High - verification catches errors."
     ```
 
     ### Example 5: Suboptimal Success
@@ -699,12 +725,16 @@ class SuccessAnalysisSignature(Signature):
     min_metric: float = InputField(desc="The minimum possible metric score")
     max_metric: float = InputField(desc="The maximum possible metric score")
 
-    success_pattern: str = OutputField(desc="Clear causal description of what mechanism made this execution successful")
+    potential_success_patterns: list[str] = OutputField(
+        desc="List of 1-3 potential enabling factors ordered by likelihood. Each: 'Success due to...'"
+    )
     contributing_predictors: list[str] = OutputField(
         desc="List of predictors essential to this success pattern", default_factory=list
     )
     context: str = OutputField(desc="Specific input characteristics that define when this pattern applies")
-    category: str = OutputField(desc="Classification label for grouping similar success patterns")
+    categories: list[str] = OutputField(
+        desc="List of 1-2 potential categories ordered by relevance (e.g., ['structured-methodology', 'verification-step'])"
+    )
     key_details: str = OutputField(
         desc="Preservation requirements in format: MUST PRESERVE / CAN MODIFY / FRAGILE / RELIABILITY"
     )
@@ -736,14 +766,17 @@ class HypothesisGenerationSignature(Signature):
     You receive structured summaries (not raw data) from a SAMPLE of training examples:
 
     - **failure_analyses**: List[FailureSummaryRecord]. Each record captures:
-      - root_cause: CONCISE description of missing/unclear instruction (not computational details)
-      - category: Actionable category focusing on fixable prompt issues
-      - involved_predictors: Which predictors need fixing
+      - potential_root_causes: List of POTENTIAL causes ordered by likelihood (uncertainty acknowledged)
+      - categories: Multiple potential categories that may apply
+      - involved_predictors: Which predictors were involved
 
     - **success_analyses**: List[SuccessSummaryRecord]. Each record captures:
-      - root_cause: The specific PROMPT FEATURE that enabled success
-      - category: Differentiated category (e.g., "structured-methodology", "format-specification")
+      - potential_success_patterns: List of POTENTIAL enabling factors ordered by likelihood
+      - categories: Multiple potential categories that may apply
       - contributing_predictors: Which predictors benefited
+
+    **CRITICAL**: These are INFERENCES from limited information (prompt + I/O), not definitive diagnoses.
+    Multiple causes are listed because we cannot always determine the exact cause with certainty.
       *Count them carefully.* The mix of success and failure analyses mirrors the
       outcomes in this batch. A high success-to-failure ratio signals you should
       propose very small, low-risk tweaks; a low ratio indicates broader fixes may be
@@ -804,19 +837,24 @@ class HypothesisGenerationSignature(Signature):
 
     ## Hypothesis Generation Strategy
 
-    Choose approach based on failure patterns and validation trajectory:
+    Choose approach based on failure patterns, considering UNCERTAINTY in analyses:
 
-    **Single Dominant Pattern**
-    When one root cause appears repeatedly across the sample and history shows related tweaks improved validation:
-    → minimal hypothesis: Add single constraint/example/clarification that aligns with past successful changes
-    Example: "Missing format specification" → Add JSON schema
-    Note: If this pattern represents most failures, fixing it alone may be sufficient
+    **Handling Uncertainty**
+    - When analyses show multiple potential causes, consider hypotheses that address the MOST LIKELY ones
+    - If causes have similar likelihood, generate diverse hypotheses covering different possibilities
+    - Acknowledge that some hypotheses are exploratory (testing which cause is actual)
 
-    **Multiple Related Failures**
-    When several issues share underlying cause and prior changes hint at partial fixes to refine:
-    → moderate hypothesis: Fix root cause with small coordinated changes that retain elements tied to higher validation scores
-    Example: "Ambiguous terminology" across predictors → Standardize terms
-    Note: More efficient than fixing each individually
+    **Pattern Recognition Despite Uncertainty**
+    When similar potential causes appear across multiple failures:
+    → Generate hypothesis addressing the most common potential cause
+    Example: Multiple failures show "possibly missing verification" → Add verification step
+    Note: Even if uncertain, recurring patterns suggest likely issue
+
+    **Diverse Hypothesis Strategy**
+    When uncertainty is high (many equally-likely causes):
+    → Generate multiple hypotheses testing different theories
+    Example: If unclear whether format or methodology issue → One hypothesis for each
+    Note: Let validation determine which theory is correct
 
     **Cascade Failures** (Check program_flow carefully)
     When upstream errors cause downstream problems and history shows which predictors stayed stable:
@@ -947,22 +985,22 @@ class HypothesisGenerationSignature(Signature):
     Better to return [] than low-quality hypotheses that won’t survive validation.
 
 
-    ## Example Hypothesis
+    ## Example Hypothesis (Handling Uncertainty)
 
     ```json
     {
-      "observation": "JSON format errors dominate failures while extraction logic succeeds",
-      "fixable_root_causes": ["Missing JSON format specification"],
+      "observation": "Multiple failures show potential format OR methodology issues - analyses uncertain which is primary",
+      "fixable_root_causes": ["Possibly missing format specification", "Possibly unclear methodology"],
       "non_fixable_root_causes": [],
-      "impact_score": 0.85,
-      "generalizability_score": 0.9,
-      "strategy": "Add format specification without changing extraction logic",
-      "expected_impact": "Eliminate JSON parsing errors affecting 35% of cases",
+      "impact_score": 0.75,
+      "generalizability_score": 0.8,
+      "strategy": "Address most likely cause (format) based on pattern frequency, while adding light methodology guidance",
+      "expected_impact": "Should fix ~30% of failures if format is issue, ~20% if methodology",
       "prompt_changes": {
         "predict": {
-          "new_prompt": "Extract key information from the provided text and output in a structured format.\n\nRequirements:\n- Identify main entities and relationships\n- Preserve numerical data exactly\n- Include confidence scores when applicable\n\nYour output must be well-structured and consistent. Ensure all data is properly formatted with clear field names and appropriate data types.",
-          "change_summary": "Added explicit output structure requirements and data formatting guidelines to address JSON parsing errors while preserving entity extraction approach",
-          "change_magnitude": "minimal"
+          "new_prompt": "Extract key information from the provided text and output in a structured format.\n\nApproach:\n1. First identify all key entities\n2. Then extract relationships\n3. Finally format output consistently\n\nRequirements:\n- Output must be valid JSON with consistent field names\n- Preserve numerical data exactly\n- Include all identified entities\n\nEnsure your output follows the structure above with proper JSON formatting.",
+          "change_summary": "Added both format specification AND light methodology structure to address uncertainty about root cause",
+          "change_magnitude": "moderate"
         }
       }
     }

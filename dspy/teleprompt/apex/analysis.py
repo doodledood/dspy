@@ -172,9 +172,9 @@ def analyze_examples(
                             "analysis": to_serializable(result),
                         }
                         if mode == "failure":
-                            payload["root_cause"] = getattr(result, "root_cause", "")
+                            payload["potential_root_causes"] = getattr(result, "potential_root_causes", [])
                         else:
-                            payload["success_pattern"] = getattr(result, "success_pattern", "")
+                            payload["potential_success_patterns"] = getattr(result, "potential_success_patterns", [])
                         span.set_outputs(payload)
                     except Exception:  # pragma: no cover - defensive
                         pass
@@ -198,13 +198,35 @@ def analyze_examples(
     if runtime.is_enabled(Verbosity.HIGH):
         for index, analysis in enumerate(analyses, start=1):
             if mode == "failure":
+                categories = getattr(analysis, "categories", [])
+                if len(categories) > 1:
+                    category_str = f"{categories[0]}+{len(categories)-1}"
+                else:
+                    category_str = categories[0] if categories else "unknown"
+
+                root_causes = getattr(analysis, "potential_root_causes", [])
+                cause_str = root_causes[0] if root_causes else "unknown cause"
+                if len(root_causes) > 1:
+                    cause_str += f" (+{len(root_causes)-1} alt)"
+
                 log_fn(
-                    f"APEX: failure analysis #{index} ({analysis.category}) → {analysis.root_cause}",
+                    f"APEX: failure analysis #{index} ({category_str}) → {cause_str}",
                     level=Verbosity.HIGH,
                 )
             else:
+                categories = getattr(analysis, "categories", [])
+                if len(categories) > 1:
+                    category_str = f"{categories[0]}+{len(categories)-1}"
+                else:
+                    category_str = categories[0] if categories else "unknown"
+
+                patterns = getattr(analysis, "potential_success_patterns", [])
+                pattern_str = patterns[0] if patterns else "unknown pattern"
+                if len(patterns) > 1:
+                    pattern_str += f" (+{len(patterns)-1} alt)"
+
                 log_fn(
-                    f"APEX: success analysis #{index} ({analysis.category}) → {analysis.success_pattern}",
+                    f"APEX: success analysis #{index} ({category_str}) → {pattern_str}",
                     level=Verbosity.HIGH,
                 )
     return analyses
@@ -324,17 +346,18 @@ def generate_hypotheses(
         category_counts: Counter[str] = Counter()
         records: list[FailureSummaryRecord] = []
         for failure in shuffled_failures:
-            category = getattr(failure, "category", "") or "uncategorized"
-            category_counts[category] += 1
+            categories = getattr(failure, "categories", []) or ["uncategorized"]
+            for category in categories:
+                category_counts[category] += 1
             normalized_predictors = [
                 normalize_predictor_name(predictor)
                 for predictor in list(getattr(failure, "involved_predictors", []) or [])
             ]
             records.append(
                 FailureSummaryRecord(
-                    root_cause=getattr(failure, "root_cause", ""),
+                    potential_root_causes=getattr(failure, "potential_root_causes", []) or ["Unknown cause"],
                     involved_predictors=[p for p in normalized_predictors if p],
-                    category=category,
+                    categories=categories,
                 )
             )
         return records, category_counts
@@ -345,17 +368,18 @@ def generate_hypotheses(
         category_counts: Counter[str] = Counter()
         records: list[SuccessSummaryRecord] = []
         for success in success_summaries:
-            category = getattr(success, "category", "") or "uncategorized"
-            category_counts[category] += 1
+            categories = getattr(success, "categories", []) or ["uncategorized"]
+            for category in categories:
+                category_counts[category] += 1
             normalized_predictors = [
                 normalize_predictor_name(predictor)
                 for predictor in list(getattr(success, "contributing_predictors", []) or [])
             ]
             records.append(
                 SuccessSummaryRecord(
-                    root_cause=getattr(success, "success_pattern", ""),
+                    potential_root_causes=getattr(success, "potential_success_patterns", []) or ["Unknown pattern"],
                     contributing_predictors=[p for p in normalized_predictors if p],
-                    category=category,
+                    categories=categories,
                 )
             )
         return records, category_counts
