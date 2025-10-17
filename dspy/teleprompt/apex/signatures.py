@@ -28,14 +28,15 @@ class FailureAnalysisSignature(Signature):
 
     ## Task
 
-    Analyze a FAILED execution to identify the root cause and provide actionable insights for fixing it.
+    Analyze a FAILED execution to identify what SPECIFIC INSTRUCTION is missing or unclear in the prompt that caused the failure.
 
     ## CRITICAL: Priority Analysis Order
 
     Follow this order rigorously:
     1. **ALWAYS check metric_feedback FIRST** - it often directly states the problem
-    2. IF metric feedback insufficient → Parse execution flow I/O data
-    3. THEN apply structured analysis framework to categorize and solve
+    2. **THEN examine the actual prompt text** in execution_flow to see current instructions
+    3. **INFER what instruction is MISSING** that would have prevented the error
+    4. **Be SPECIFIC** about what to add/change in the prompt, not just "wrong answer"
 
     ## Critical: Using Metric Feedback
 
@@ -47,21 +48,23 @@ class FailureAnalysisSignature(Signature):
 
     **Start your analysis here. This is your PRIMARY diagnostic signal.**
 
-    ## Critical: Parsing Execution Flow
+    ## Critical: Parsing Execution Flow for Prompt Analysis
 
-    The execution_flow contains actual I/O data as JSON strings:
-    - Look for "Actual inputs: {JSON}" and "Actual outputs: {JSON}" for each predictor
-    - Parse these to trace where data went wrong
-    - Identify the FIRST point of failure in the pipeline
-    - Distinguish between origin failures vs cascade failures
+    The execution_flow contains BOTH the prompt instructions AND actual I/O:
+    - **Instructions**: Shows current prompt text - analyze what's MISSING
+    - **Actual inputs/outputs**: Shows what model did vs what was needed
+    - Compare prompt instructions to failure mode to infer missing guidance
+    - Ask: "What instruction would have prevented this specific error?"
 
-    Example flow entry showing failure:
+    Example analysis process:
     ```
-    1. ExtractorPredictor (ChainOfThought):
-       Instructions: Extract revenue from text
-       Actual inputs: {"text": "Revenue was 5M dollars"}
-       Actual outputs: {"revenue": "5M dollars"}  ← FAILURE: Should be 5000000
+    1. Predictor prompt says: "Solve the mathematical problem"
+    2. Model output: {"answer": "13"} instead of {"answer": "33"}
+    3. Model skipped algebraic expansion step
+    4. Missing instruction: "First expand the expression algebraically before computing final values"
     ```
+
+    DON'T just say "wrong answer" - identify the MISSING INSTRUCTION that caused it.
 
     ## Analysis Framework
 
@@ -71,14 +74,14 @@ class FailureAnalysisSignature(Signature):
     - **MODERATE** (margin 0.1-0.3): Clear failure, targeted fix required
     - **SEVERE** (margin > 0.3): Major failure, may need substantial changes
 
-    ### 2. Failure Point Identification
-    Using intermediate I/O values, pinpoint EXACTLY where failure originated:
-    1. Parse each predictor's actual inputs/outputs
-    2. Find the FIRST predictor that produced incorrect output
-    3. Determine if it's:
-       - **Input failure**: Predictor received bad input from upstream
-       - **Processing failure**: Predictor received good input but produced bad output
-       - **Instruction failure**: Predictor didn't understand what to do
+    ### 2. Prompt Deficiency Analysis
+    CRITICAL: Analyze the ACTUAL prompt instructions to identify what's missing:
+    1. Read the current prompt text from execution_flow
+    2. Compare to what the model actually did (outputs)
+    3. Identify the GAP - what instruction would have guided correct behavior?
+    4. Be SPECIFIC about the missing guidance, not generic
+       - ✓ "Lacks instruction to expand before computing"
+       - ✗ "Model made computational error"
 
     ### 3. Root Cause Categorization
     Based on I/O analysis, classify the ROOT cause (not symptoms):
@@ -166,14 +169,15 @@ class FailureAnalysisSignature(Signature):
 
     Provide focused analysis with these EXACT fields:
 
-    **root_cause**: The fundamental issue (prompt-related OR data-related OR architectural)
-    - Start with: "In [Predictor], ..."
-    - Describe the TRUE root cause, not forced to be prompt-related
-    - Length: 1-2 sentences max
+    **root_cause**: What SPECIFIC instruction/guidance is missing or unclear in the prompt
+    - Start with: "In [Predictor], prompt lacks..."
+    - Be SPECIFIC about missing instruction, not just stating the error
+    - Focus on WHAT TO ADD to the prompt to prevent this failure
     - Examples:
-      - Prompt issue: "In predict, lacks instruction to output integer format. Produced '370/3' instead."
-      - Data issue: "In predict, input missing required context about base year for calculation."
-      - Architecture issue: "In ExtractorPredictor, output schema incompatible with downstream Validator."
+      - GOOD: "In predict, prompt lacks instruction to expand algebraic expressions before computing final values."
+      - GOOD: "In predict, prompt missing requirement to verify answer satisfies all original constraints."
+      - BAD: "In predict, model got wrong answer 13 instead of 33."
+      - BAD: "In predict, model didn't complete the derivation."
 
     **involved_predictors**: Predictors contributing to failure
     - List in order of causality (primary failure first)
@@ -205,24 +209,24 @@ class FailureAnalysisSignature(Signature):
     ## Examples
     *All use: score_norm = (score - min) / (max - min), margin = threshold_norm - score_norm*
 
-    ### Example 1: NEAR_MISS (Math Problem)
+    ### Example 1: NEAR_MISS (Missing Methodology)
     Given: score=0.92, threshold=1.0, range=[0,1] → margin=0.08
     ```
-    root_cause: "In predict, lacks instruction to output integer format. Produced '370/3' instead of required integer."
+    root_cause: "In predict, prompt lacks instruction to fully expand algebraic expression before substituting values. Model jumped to computation without algebraic simplification."
     involved_predictors: ["predict"]
-    context: "AIME-style problems requiring integer answers"
-    category: "missing-format-spec"
-    key_details: "SEVERITY: NEAR_MISS. PRIMARY_FAILURE: predict. FIXABLE: Add 'Output must be a single integer value'. NOT_FIXABLE: None. SUGGESTED_FIX: Add explicit integer output requirement to instructions."
+    context: "Algebraic problems requiring symbolic manipulation"
+    category: "unclear-methodology"
+    key_details: "SEVERITY: NEAR_MISS. PRIMARY_FAILURE: predict. FIXABLE: Add 'First expand and simplify algebraically, then compute numerical result'. NOT_FIXABLE: None. SUGGESTED_FIX: Add explicit algebraic expansion step to methodology."
     ```
 
-    ### Example 2: MODERATE (Methodology Issue)
+    ### Example 2: MODERATE (Missing Verification)
     Given: score=18, threshold=50, range=[0,100] → margin=0.32
     ```
-    root_cause: "In predict, instructions don't specify to verify all conditions. Model skipped checking one arithmetic progression case."
+    root_cause: "In predict, prompt lacks instruction to enumerate ALL arithmetic progressions systematically. Current prompt says 'find progressions' but doesn't specify exhaustive search."
     involved_predictors: ["predict"]
-    context: "Problems requiring exhaustive case checking"
+    context: "Combinatorial problems requiring complete enumeration"
     category: "incomplete-instruction"
-    key_details: "SEVERITY: MODERATE. PRIMARY_FAILURE: predict. FIXABLE: Add 'Verify all possible cases before concluding'. NOT_FIXABLE: None. SUGGESTED_FIX: Add explicit exhaustive verification requirement."
+    key_details: "SEVERITY: MODERATE. PRIMARY_FAILURE: predict. FIXABLE: Add 'Systematically check ALL possible 4-term progressions including boundary cases'. NOT_FIXABLE: None. SUGGESTED_FIX: Add explicit exhaustive enumeration requirement."
     ```
 
     ### Example 3: SEVERE (Missing Structure)
@@ -265,14 +269,20 @@ class FailureAnalysisSignature(Signature):
     key_details: "SEVERITY: MODERATE. PRIMARY_FAILURE: DateExtractor. FIXABLE: Add context handling. NOT_FIXABLE: None. SUGGESTED_FIX: Add 'Use provided reference_date field for relative dates'."
     ```
 
-    ## CRITICAL: Identify the TRUE Root Cause
+    ## CRITICAL: Analyze What's MISSING in the Prompt
 
-    - Root cause: 1-2 sentences describing the ACTUAL problem
-    - Don't force everything to be a prompt issue
-    - If input lacks data → say "missing-context"
-    - If architecture wrong → say "schema-mismatch"
-    - If prompt unclear → say what's missing
-    - Use custom categories when predefined don't fit
+    - Look at the ACTUAL prompt text in execution_flow
+    - Compare what the prompt says vs what the model did wrong
+    - Infer the SPECIFIC instruction that would prevent this error
+    - Don't just describe the error - identify the MISSING GUIDANCE
+    - Examples of good analysis:
+      - "Prompt lacks instruction to verify intermediate steps"
+      - "Prompt missing explicit requirement for integer output"
+      - "Prompt doesn't specify to handle edge cases"
+    - Examples of bad analysis:
+      - "Model got the wrong answer"
+      - "Model didn't complete the calculation"
+      - "Model made an error"
 
     ## Quality Checklist
 
@@ -336,7 +346,7 @@ class SuccessAnalysisSignature(Signature):
 
     ## Task
 
-    Analyze a SUCCESSFUL execution to identify patterns that MUST be preserved during optimization. These become hard constraints for the hypothesis generator.
+    Analyze a SUCCESSFUL execution to identify what SPECIFIC prompt features/instructions enabled the success. These become preservation targets for the hypothesis generator.
 
     ## CRITICAL: Analysis Priority Order
 
@@ -358,23 +368,23 @@ class SuccessAnalysisSignature(Signature):
 
     **Start your analysis here. This determines WHAT to preserve.**
 
-    ## Critical: Parsing Execution Flow
+    ## Critical: Parsing Execution Flow for Prompt Features
 
-    The execution_flow contains actual I/O data as JSON strings:
-    - Look for "Actual inputs: {JSON}" and "Actual outputs: {JSON}" for each predictor
-    - Parse these JSON strings to analyze data transformations
-    - Trace how data changes from predictor to predictor
-    - Identify which transformations were critical to success
+    The execution_flow contains BOTH the prompt instructions AND actual I/O:
+    - **Instructions**: Shows prompt text - identify WHICH PART enabled success
+    - **Actual inputs/outputs**: Shows successful execution
+    - Match specific prompt features to successful behaviors
+    - Ask: "Which instruction or prompt feature was KEY to this success?"
 
-    Example flow entry:
+    Example analysis process:
     ```
-    1. ExtractorPredictor (ChainOfThought):
-       Instructions: Extract key facts from text
-       Depends on: Input
-       Actual inputs: {"text": "The revenue was $5M in Q1"}
-       Actual outputs: {"revenue": 5000000, "currency": "USD", "period": "Q1"}
+    1. Predictor prompt says: "Break the problem into steps. First expand algebraically, then compute."
+    2. Model output shows: Systematic step-by-step expansion followed by computation
+    3. Success enabler: The explicit "First expand algebraically" instruction
+    4. Category: structured-methodology (due to step-by-step instruction)
     ```
-    → Parse both to see ExtractorPredictor correctly extracted and normalized the value
+
+    DON'T just describe success - identify the PROMPT FEATURE that enabled it.
 
     ## Analysis Framework
 
@@ -384,14 +394,16 @@ class SuccessAnalysisSignature(Signature):
     - **SOLID** (margin 0.1-0.3): Good success, preserve core mechanisms
     - **EXCELLENT** (margin >= 0.3): High-quality pattern, strong preservation candidate
 
-    ### 2. Success Mechanism Identification
-    With intermediate values, determine PRECISELY why this succeeded:
-    - Parse the actual JSON inputs/outputs from execution_flow
-    - Trace the EXACT data transformations that led to success
-    - Identify which predictor outputs were crucial
-    - Pinpoint coordination success by examining data handoffs
-    - Distinguish lucky data matches from robust processing
-    - Consider if success was single-predictor excellence, multi-predictor coordination, or input luck
+    ### 2. Prompt Feature Identification
+    Analyze the prompt to identify WHICH instruction enabled success:
+    - Read the actual prompt text from execution_flow
+    - Match prompt instructions to successful behaviors
+    - Identify the KEY instruction that guided correct execution
+    - Be SPECIFIC about the enabling feature:
+      - ✓ "The 'verify all conditions' instruction caught edge cases"
+      - ✓ "The 'output as integer' requirement ensured correct format"
+      - ✗ "The prompt worked well"
+      - ✗ "Clear instructions led to success"
 
     ### 3. Preservation Categories Clarified
 
@@ -494,10 +506,15 @@ class SuccessAnalysisSignature(Signature):
 
     Provide focused analysis with these EXACT fields:
 
-    **success_pattern**: The CAUSAL mechanism (not just observation)
-    - Format: "X component did Y because of Z instruction/pattern"
-    - Length: 1-2 sentences max
-    - Focus: WHY it worked, not just THAT it worked
+    **success_pattern**: The SPECIFIC prompt feature that enabled success
+    - Format: "Success due to prompt's [specific instruction/feature]"
+    - Identify the KEY instruction from the actual prompt text
+    - Length: 1 sentence max
+    - Examples:
+      - GOOD: "Success due to prompt's 'expand algebraically first' instruction"
+      - GOOD: "Success from explicit 'verify answer' requirement"
+      - BAD: "Model successfully solved the problem"
+      - BAD: "Clear instructions led to correct answer"
 
     **contributing_predictors**: List of essential predictors
     - Include ONLY if changing them would break this success
@@ -560,21 +577,21 @@ class SuccessAnalysisSignature(Signature):
     ### Example 1: EXCELLENT (Structured Approach)
     Given: score=0.95, threshold=0.5, range=[0,1] → margin=0.45
     ```
-    success_pattern: "Predict succeeded by following step-by-step breakdown instruction, systematically checking each condition."
+    success_pattern: "Success due to prompt's 'Break into steps: 1) Expand, 2) Simplify, 3) Compute' instruction."
     contributing_predictors: ["predict"]
-    context: "Complex multi-constraint problems"
+    context: "Complex multi-step algebraic problems"
     category: "structured-methodology"
-    key_details: "MUST PRESERVE: Step-by-step approach. CAN MODIFY: Wording of steps. FRAGILE: None. RELIABILITY: High - methodical approach generalizes well."
+    key_details: "MUST PRESERVE: Explicit step enumeration. CAN MODIFY: Wording of steps. FRAGILE: None. RELIABILITY: High - explicit steps guide systematic solving."
     ```
 
     ### Example 2: SOLID (Format Control)
     Given: score=72, threshold=50, range=[0,100] → margin=0.22
     ```
-    success_pattern: "Predict correctly output integer due to explicit 'final answer must be an integer' instruction."
+    success_pattern: "Success from prompt's 'Output must be a single integer value' requirement."
     contributing_predictors: ["predict"]
-    context: "Mathematical problems requiring specific output format"
+    context: "AIME problems requiring integer answers"
     category: "format-specification"
-    key_details: "MUST PRESERVE: Integer output requirement. CAN MODIFY: How the requirement is phrased. FRAGILE: None. RELIABILITY: High - format instruction consistently followed."
+    key_details: "MUST PRESERVE: Explicit integer requirement. CAN MODIFY: Phrasing style. FRAGILE: None. RELIABILITY: High - clear format spec prevents fractional answers."
     ```
 
     ### Example 3: MARGINAL
@@ -589,11 +606,11 @@ class SuccessAnalysisSignature(Signature):
 
     ### Example 4: Verification Success
     ```
-    success_pattern: "Predict succeeded by following instruction to 'verify your answer satisfies all conditions' catching an initial error."
+    success_pattern: "Success due to prompt's 'After solving, verify your answer satisfies all original constraints' instruction."
     contributing_predictors: ["predict"]
-    context: "Problems with multiple constraints to satisfy"
+    context: "Constraint satisfaction problems"
     category: "verification-step"
-    key_details: "MUST PRESERVE: Explicit verification requirement. CAN MODIFY: Phrasing of verification. FRAGILE: None. RELIABILITY: High - self-checking improves accuracy."
+    key_details: "MUST PRESERVE: Post-solution verification requirement. CAN MODIFY: Verification phrasing. FRAGILE: 'all original constraints' specificity. RELIABILITY: High - catches computation errors."
     ```
 
     ### Example 5: Suboptimal Success
@@ -608,12 +625,20 @@ class SuccessAnalysisSignature(Signature):
 
     *Key lesson: Success ≠ worth preserving. Expensive workarounds should be replaced, not protected*
 
-    ## CRITICAL: Identify WHY the Prompt Worked
+    ## CRITICAL: Identify the Enabling Prompt Feature
 
-    - Success pattern: Focus on the INSTRUCTION FEATURE that enabled success
-    - Categories should differentiate success types (not all "clear-instruction-execution")
-    - Be specific: "step-by-step requirement" not "good instructions"
-    - Keep patterns concise (1 sentence) and actionable
+    - Look at the ACTUAL prompt text in execution_flow
+    - Match successful behavior to SPECIFIC instructions
+    - Identify which prompt feature was KEY (not just "it worked")
+    - Don't describe what model did - identify what PROMPTED it
+    - Examples of good analysis:
+      - "Success from 'verify all cases' instruction"
+      - "Success due to explicit step ordering"
+      - "Success from 'output as integer' constraint"
+    - Examples of bad analysis:
+      - "Model correctly solved the problem"
+      - "Systematic approach led to success"
+      - "Clear reasoning produced right answer"
 
     ## Quality Checklist
 
