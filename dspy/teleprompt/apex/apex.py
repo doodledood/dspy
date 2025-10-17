@@ -13,7 +13,6 @@ from dspy.primitives import Example, Module
 from dspy.teleprompt.teleprompt import Teleprompter
 
 from . import tracking_utils
-from .summary import generate_optimization_summary
 from .analysis import (
     analyze_examples,
     analyze_successes,
@@ -40,6 +39,7 @@ from .runtime import RuntimeTools
 from .sampling import sample_trainset
 from .snapshot import snapshot_program
 from .state import OptimizationState
+from .summary import generate_optimization_summary
 from .tracker import ExperimentTracker
 from .types import LogLevel, MetricFn, SamplerFn, TraceEntry, Verbosity
 

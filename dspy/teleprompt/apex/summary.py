@@ -75,14 +75,16 @@ def generate_optimization_summary(
         if len(best_candidate.hypothesis.strategy) > 54:
             remaining = best_candidate.hypothesis.strategy[54:]
             for i in range(0, len(remaining), 63):
-                chunk = remaining[i:i+63]
+                chunk = remaining[i : i + 63]
                 lines.append(f"║ {chunk:<63} ║")
 
         lines.append(f"║ Impact Score: {best_candidate.hypothesis.impact_score:<50.2f} ║")
         lines.append(f"║ Iteration: {best_candidate.iteration:<54} ║")
 
         if best_candidate.hypothesis.prompt_changes:
-            lines.append(f"║ Updated Predictors: {', '.join(best_candidate.hypothesis.prompt_changes.keys())[:43]:<43} ║")
+            lines.append(
+                f"║ Updated Predictors: {', '.join(best_candidate.hypothesis.prompt_changes.keys())[:43]:<43} ║"
+            )
 
         lines.append("╚═══════════════════════════════════════════════════════════════╝")
 

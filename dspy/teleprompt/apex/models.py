@@ -83,6 +83,12 @@ class FailureSummaryRecord(BaseModel):
     categories: list[str] = Field(
         description="Potential categories for this failure, ordered by likelihood. Multiple may apply."
     )
+    context: str = Field(
+        description="Specific input/data characteristics that trigger this failure (e.g., 'nested JSON', 'text >500 chars')"
+    )
+    key_details: str = Field(
+        description="Structured fix information: SEVERITY / PRIMARY_FAILURE / FIXABLE / NOT_FIXABLE / SUGGESTED_FIX"
+    )
 
 
 class SuccessSummaryRecord(BaseModel):
@@ -97,6 +103,12 @@ class SuccessSummaryRecord(BaseModel):
     )
     categories: list[str] = Field(
         description="Potential categories for this success, ordered by relevance. Multiple may apply."
+    )
+    context: str = Field(
+        description="Specific input characteristics where this pattern applies (e.g., 'numeric inputs', 'single-entity queries')"
+    )
+    key_details: str = Field(
+        description="Preservation requirements: MUST PRESERVE / CAN MODIFY / FRAGILE / RELIABILITY"
     )
 
 

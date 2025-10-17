@@ -769,11 +769,15 @@ class HypothesisGenerationSignature(Signature):
       - potential_root_causes: List of POTENTIAL causes ordered by likelihood (uncertainty acknowledged)
       - categories: Multiple potential categories that may apply
       - involved_predictors: Which predictors were involved
+      - context: Specific input characteristics that trigger this failure
+      - key_details: Structured information about severity, fixability, and suggested fixes
 
     - **success_analyses**: List[SuccessSummaryRecord]. Each record captures:
       - potential_success_patterns: List of POTENTIAL enabling factors ordered by likelihood
       - categories: Multiple potential categories that may apply
       - contributing_predictors: Which predictors benefited
+      - context: Input characteristics where this pattern applies
+      - key_details: Preservation requirements (what to preserve, what's safe to modify, fragile elements)
 
     **CRITICAL**: These are INFERENCES from limited information (prompt + I/O), not definitive diagnoses.
     Multiple causes are listed because we cannot always determine the exact cause with certainty.

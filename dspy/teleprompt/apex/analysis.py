@@ -200,14 +200,14 @@ def analyze_examples(
             if mode == "failure":
                 categories = getattr(analysis, "categories", [])
                 if len(categories) > 1:
-                    category_str = f"{categories[0]}+{len(categories)-1}"
+                    category_str = f"{categories[0]}+{len(categories) - 1}"
                 else:
                     category_str = categories[0] if categories else "unknown"
 
                 root_causes = getattr(analysis, "potential_root_causes", [])
                 cause_str = root_causes[0] if root_causes else "unknown cause"
                 if len(root_causes) > 1:
-                    cause_str += f" (+{len(root_causes)-1} alt)"
+                    cause_str += f" (+{len(root_causes) - 1} alt)"
 
                 log_fn(
                     f"APEX: failure analysis #{index} ({category_str}) → {cause_str}",
@@ -216,14 +216,14 @@ def analyze_examples(
             else:
                 categories = getattr(analysis, "categories", [])
                 if len(categories) > 1:
-                    category_str = f"{categories[0]}+{len(categories)-1}"
+                    category_str = f"{categories[0]}+{len(categories) - 1}"
                 else:
                     category_str = categories[0] if categories else "unknown"
 
                 patterns = getattr(analysis, "potential_success_patterns", [])
                 pattern_str = patterns[0] if patterns else "unknown pattern"
                 if len(patterns) > 1:
-                    pattern_str += f" (+{len(patterns)-1} alt)"
+                    pattern_str += f" (+{len(patterns) - 1} alt)"
 
                 log_fn(
                     f"APEX: success analysis #{index} ({category_str}) → {pattern_str}",
@@ -358,6 +358,8 @@ def generate_hypotheses(
                     potential_root_causes=getattr(failure, "potential_root_causes", []) or ["Unknown cause"],
                     involved_predictors=[p for p in normalized_predictors if p],
                     categories=categories,
+                    context=getattr(failure, "context", ""),
+                    key_details=getattr(failure, "key_details", ""),
                 )
             )
         return records, category_counts
@@ -380,6 +382,8 @@ def generate_hypotheses(
                     potential_root_causes=getattr(success, "potential_success_patterns", []) or ["Unknown pattern"],
                     contributing_predictors=[p for p in normalized_predictors if p],
                     categories=categories,
+                    context=getattr(success, "context", ""),
+                    key_details=getattr(success, "key_details", ""),
                 )
             )
         return records, category_counts
