@@ -596,14 +596,17 @@ class HypothesisGenerationSignature(Signature):
 
     You receive structured summaries (not raw data) from a SAMPLE of training examples:
 
-    - **failure_analyses**: List[FailureSummaryRecord]. Each record bundles root_cause, involved_predictors (causal order), context, category, and key_details for one failed example.
-    - **success_analyses**: List[SuccessSummaryRecord]. Each record bundles success_pattern, contributing_predictors, context, category, and key_details for one successful example.
+    - **failure_analyses**: List[FailureSummaryRecord]. Each record captures the root_cause, the involved_predictors (normalized against program_flow), and the category for one failed example.
+    - **success_analyses**: List[SuccessSummaryRecord]. Each record captures the root_cause (success pattern), contributing_predictors (normalized), and category for one successful example.
       *Count them carefully.* The mix of success and failure analyses mirrors the
       outcomes in this batch. A high success-to-failure ratio signals you should
       propose very small, low-risk tweaks; a low ratio indicates broader fixes may be
       justified.
     - **program_flow**: Predictor dependencies forming a directed acyclic graph (DAG) of relationships. This snapshot (including
       prompt text) always reflects the current best-so-far baseline you are improving.
+    - **failure_category_counts**: Dict[str, int] showing how many failures occurred in each category (pre-aggregated).
+    - **success_category_counts**: Dict[str, int] showing how many successes reinforce each category (pre-aggregated).
+    - **success_rate_percentage**: Percentage of analyzed examples that were successes (0-100). Use to calibrate change risk.
     - **best_validation_score**: Best validation score achieved so far (initial baseline at minimum). If unavailable, will be "N/A".
     - **current_iteration**: Current optimizer iteration number (0-indexed) to ground hypotheses in trajectory stage
     - **hypothesis_history**: Chronological record of prior hypotheses with validation scores, iteration numbers, and prompt
@@ -813,7 +816,18 @@ class HypothesisGenerationSignature(Signature):
     success_analyses: list[SuccessSummaryRecord] = InputField(
         desc="Structured success analyses (SuccessSummaryRecord) for this iteration"
     )
-    program_flow: str = InputField(desc="Program structure showing predictor relationships as a directed acyclic graph")
+    program_flow: str = InputField(
+        desc="Program structure showing predictor relationships as a directed acyclic graph with full prompt text"
+    )
+    failure_category_counts: dict[str, int] = InputField(
+        desc="Pre-aggregated counts of failures per category for the sampled batch"
+    )
+    success_category_counts: dict[str, int] = InputField(
+        desc="Pre-aggregated counts of successes per category for the sampled batch"
+    )
+    success_rate_percentage: float = InputField(
+        desc="Percentage of analyzed examples that were successes (0-100)"
+    )
     best_validation_score: str = InputField(
         desc="Best validation score achieved so far; 'N/A' if unavailable",
         default="N/A",
