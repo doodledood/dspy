@@ -60,6 +60,7 @@ def _analyze_single_example(
     max_metric: float,
     format_execution_flow: Callable[[list[ExecutionFlowEntry]], str],
     iteration: int | None,
+    available_predictor_names: list[str] | None = None,
 ) -> Prediction | None:
     signature_class = FailureAnalysisSignature if mode == "failure" else SuccessAnalysisSignature
     predictor = dspy.Predict(signature_class)
@@ -99,10 +100,46 @@ def _analyze_single_example(
         "example_index": index,
     }
 
+    validation_error: list[str] = []
+
+    def validate_analysis(prediction: Prediction | None) -> str | None:
+        """Validate that predictor names in analysis are valid."""
+        if prediction is None or available_predictor_names is None:
+            return None
+
+        predictor_field = "involved_predictors" if mode == "failure" else "contributing_predictors"
+        predictors = getattr(prediction, predictor_field, []) or []
+
+        invalid_predictors = [p for p in predictors if p and p not in available_predictor_names]
+        if invalid_predictors:
+            return (
+                f"Analysis returned unknown predictor(s) {invalid_predictors}. "
+                f"Valid predictors: {sorted(available_predictor_names)}"
+            )
+        return None
+
+    def analysis_reward_fn(_, prediction: Prediction | None) -> float:
+        error_message = validate_analysis(prediction)
+        validation_error[:] = [error_message] if error_message else []
+        return 0.0 if error_message else 1.0
+
     with tracker.span(f"apex.analysis.{mode}", inputs=span_inputs, attributes=attributes) as span:
         try:
             with dspy.context(lm=analysis_lm, adapter=analysis_adapter):
-                result = predictor(**call_inputs)
+                if available_predictor_names:
+                    validator = dspy.Refine(
+                        module=predictor,
+                        N=3,
+                        reward_fn=analysis_reward_fn,
+                        threshold=1.0,
+                        fail_count=3,
+                    )
+                    result = validator(**call_inputs)
+                else:
+                    result = predictor(**call_inputs)
+
+            if validation_error:
+                raise ValueError(validation_error[0])
 
             if span and hasattr(span, "set_outputs"):
                 try:
@@ -185,6 +222,7 @@ def _run_analysis_tasks(
     log: Callable[[str, Verbosity], None] | None = None,
     iteration: int | None = None,
     level: Verbosity = Verbosity.DETAILED,
+    available_predictor_names: list[str] | None = None,
 ) -> dict[Mode, list[Prediction]]:
     if not tasks:
         return {"failure": [], "success": []}
@@ -205,6 +243,7 @@ def _run_analysis_tasks(
             max_metric=max_metric,
             format_execution_flow=format_execution_flow,
             iteration=iteration,
+            available_predictor_names=available_predictor_names,
         )
 
     analyses = runtime.parallel_execute(
@@ -310,6 +349,7 @@ def analyze_examples(
     format_execution_flow: Callable[[list[ExecutionFlowEntry]], str],
     log: Callable[[str, Verbosity], None] | None = None,
     iteration: int | None = None,
+    available_predictor_names: list[str] | None = None,
 ) -> list[Prediction]:
     if not records:
         return []
@@ -329,6 +369,7 @@ def analyze_examples(
         log=log,
         iteration=iteration,
         level=Verbosity.DETAILED,
+        available_predictor_names=available_predictor_names,
     )
     return results[mode]
 
@@ -347,6 +388,7 @@ def analyze_successes(
     format_execution_flow: Callable[[list[ExecutionFlowEntry]], str],
     log: Callable[[str, Verbosity], None] | None = None,
     iteration: int | None = None,
+    available_predictor_names: list[str] | None = None,
 ) -> list[Prediction]:
     if not success_records or failure_count == 0:
         return []
@@ -365,6 +407,7 @@ def analyze_successes(
         log=log,
         iteration=iteration,
         level=Verbosity.DETAILED,
+        available_predictor_names=available_predictor_names,
     )
     return results["success"]
 
@@ -384,6 +427,7 @@ def analyze_record(
     log: Callable[[str, Verbosity], None] | None = None,
     iteration: int | None = None,
     example_index: int = 0,
+    available_predictor_names: list[str] | None = None,
 ) -> Prediction | None:
     return _analyze_single_example(
         record,
@@ -398,6 +442,7 @@ def analyze_record(
         max_metric=max_metric,
         format_execution_flow=format_execution_flow,
         iteration=iteration,
+        available_predictor_names=available_predictor_names,
     )
 
 
@@ -415,6 +460,7 @@ def analyze_failures_and_successes(
     format_execution_flow: Callable[[list[ExecutionFlowEntry]], str],
     log: Callable[[str, Verbosity], None] | None = None,
     iteration: int | None = None,
+    available_predictor_names: list[str] | None = None,
 ) -> tuple[list[Prediction], list[Prediction]]:
     if not failure_records:
         return [], []
@@ -442,6 +488,7 @@ def analyze_failures_and_successes(
         format_execution_flow=format_execution_flow,
         log=log,
         iteration=iteration,
+        available_predictor_names=available_predictor_names,
     )
 
     success_summaries = results["success"] if include_success else []

@@ -469,6 +469,7 @@ class APEX(Teleprompter):
                     baseline_for_analysis = state.current_program.deepcopy()
 
                     snapshot = snapshot_program(baseline_for_analysis)
+                    available_predictor_names = list(snapshot.prompts.keys()) if snapshot.prompts else []
 
                     indexed_train = list(enumerate(sampled_train))
 
@@ -477,6 +478,7 @@ class APEX(Teleprompter):
                         *,
                         baseline_program: Module = baseline_for_analysis,
                         current_iteration: int = iteration,
+                        predictor_names: list[str] = available_predictor_names,
                     ) -> tuple[TrainExampleRecord, Prediction | None, Prediction | None]:
                         example_idx, example = item
                         record = self.evaluator.run_train_example(
@@ -500,6 +502,7 @@ class APEX(Teleprompter):
                                 log=self._log,
                                 iteration=current_iteration,
                                 example_index=example_idx,
+                                available_predictor_names=predictor_names,
                             )
                             return record, None, success_summary
 
@@ -517,6 +520,7 @@ class APEX(Teleprompter):
                             log=self._log,
                             iteration=current_iteration,
                             example_index=example_idx,
+                            available_predictor_names=predictor_names,
                         )
                         return record, failure_summary, None
 
