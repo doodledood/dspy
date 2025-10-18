@@ -3,7 +3,8 @@ from __future__ import annotations
 import random
 from collections import Counter
 from contextlib import nullcontext
-from typing import Callable, Sequence
+from dataclasses import dataclass
+from typing import Callable, Literal, Sequence
 
 import dspy
 from dspy.adapters import Adapter
@@ -32,6 +33,161 @@ from .types import Verbosity
 
 def _normalize_whitespace(text: str) -> str:
     return " ".join(text.split())
+
+
+Mode = Literal["failure", "success"]
+
+
+@dataclass(frozen=True)
+class _AnalysisTask:
+    mode: Mode
+    index: int
+    record: TrainExampleRecord
+
+
+def _log_analysis_results(
+    mode: Mode, analyses: Sequence[Prediction], log_fn: Callable[[str, Verbosity], None], runtime: RuntimeTools
+) -> None:
+    if not analyses or not runtime.is_enabled(Verbosity.DETAILED):
+        return
+
+    for index, analysis in enumerate(analyses, start=1):
+        categories = getattr(analysis, "categories", [])
+        if len(categories) > 1:
+            category_str = f"{categories[0]}+{len(categories) - 1}"
+        else:
+            category_str = categories[0] if categories else "unknown"
+
+        if mode == "failure":
+            root_causes = getattr(analysis, "potential_root_causes", [])
+            cause_str = root_causes[0] if root_causes else "unknown cause"
+            if len(root_causes) > 1:
+                cause_str += f" (+{len(root_causes) - 1} alt)"
+            log_fn(
+                f"APEX: failure analysis #{index} ({category_str}) → {cause_str}",
+                level=Verbosity.DETAILED,
+            )
+        else:
+            patterns = getattr(analysis, "potential_success_patterns", [])
+            pattern_str = patterns[0] if patterns else "unknown pattern"
+            if len(patterns) > 1:
+                pattern_str += f" (+{len(patterns) - 1} alt)"
+            log_fn(
+                f"APEX: success analysis #{index} ({category_str}) → {pattern_str}",
+                level=Verbosity.DETAILED,
+            )
+
+
+def _run_analysis_tasks(
+    tasks: Sequence[_AnalysisTask],
+    *,
+    description: str,
+    analysis_lm: LM,
+    analysis_adapter: Adapter,
+    runtime: RuntimeTools,
+    tracker: ExperimentTracker,
+    success_threshold: float,
+    min_metric: float,
+    max_metric: float,
+    format_execution_flow: Callable[[list[ExecutionFlowEntry]], str],
+    log: Callable[[str, Verbosity], None] | None = None,
+    iteration: int | None = None,
+) -> dict[Mode, list[Prediction]]:
+    if not tasks:
+        return {"failure": [], "success": []}
+
+    log_fn = log or (lambda message, level=Verbosity.NORMAL: runtime.log(message, level))
+
+    def process(task: _AnalysisTask) -> Prediction:
+        signature_class = FailureAnalysisSignature if task.mode == "failure" else SuccessAnalysisSignature
+        record = task.record
+        idx = task.index
+
+        predictor = dspy.Predict(signature_class)
+        prompt_text = getattr(predictor.signature, "instructions", "")
+
+        example_inputs = record.example.inputs().toDict()
+        example_labels = record.example.labels().toDict()
+        execution_flow_str = format_execution_flow(record.execution_flow)
+
+        call_inputs = {
+            "problem": str(example_inputs),
+            "prediction": str(record.prediction) if record.prediction else "",
+            "expected": str(example_labels),
+            "execution_flow": execution_flow_str,
+            "metric_score": record.metric_score,
+            "metric_feedback": record.metric_feedback or "N/A",
+            "success_threshold": success_threshold,
+            "min_metric": min_metric,
+            "max_metric": max_metric,
+        }
+
+        if task.mode == "failure":
+            call_inputs["error"] = record.error or ""
+
+        span_inputs = {
+            "inputs": example_inputs,
+            "labels": example_labels,
+            "metric_score": record.metric_score,
+            "metric_feedback": record.metric_feedback,
+            "prompt": prompt_text,
+            "analysis_payload": to_serializable(call_inputs),
+        }
+
+        attributes = {
+            "analysis_mode": task.mode,
+            "iteration": iteration if iteration is not None else -1,
+            "example_index": idx,
+        }
+
+        with tracker.span(f"apex.analysis.{task.mode}", inputs=span_inputs, attributes=attributes) as span:
+            try:
+                with dspy.context(lm=analysis_lm, adapter=analysis_adapter):
+                    result = predictor(**call_inputs)
+
+                if span and hasattr(span, "set_outputs"):
+                    try:
+                        payload = {
+                            "prompt": prompt_text,
+                            "analysis": to_serializable(result),
+                        }
+                        if task.mode == "failure":
+                            payload["potential_root_causes"] = getattr(result, "potential_root_causes", [])
+                        else:
+                            payload["potential_success_patterns"] = getattr(result, "potential_success_patterns", [])
+                        span.set_outputs(payload)
+                    except Exception:  # pragma: no cover - defensive
+                        pass
+
+                return result
+            except Exception as exc:
+                if span and hasattr(span, "set_attribute"):
+                    try:
+                        span.set_attribute("error", str(exc)[:200])
+                    except Exception:  # pragma: no cover - defensive
+                        pass
+                raise
+
+    analyses = runtime.parallel_execute(
+        tasks,
+        process,
+        description=description,
+        level=Verbosity.DETAILED,
+    )
+
+    failure_results: list[Prediction] = []
+    success_results: list[Prediction] = []
+
+    for task, analysis in zip(tasks, analyses, strict=False):
+        if task.mode == "failure":
+            failure_results.append(analysis)
+        else:
+            success_results.append(analysis)
+
+    _log_analysis_results("failure", failure_results, log_fn, runtime)
+    _log_analysis_results("success", success_results, log_fn, runtime)
+
+    return {"failure": failure_results, "success": success_results}
 
 
 def build_hypothesis_history_text(*, include_history: bool, candidate_history: Sequence[CandidateRecord] | None) -> str:
@@ -115,121 +271,22 @@ def analyze_examples(
     if not records:
         return []
 
-    signature_class = FailureAnalysisSignature if mode == "failure" else SuccessAnalysisSignature
-    log_fn = log or (lambda message, level=Verbosity.NORMAL: runtime.log(message, level))
-
-    indexed_records = list(enumerate(records))
-
-    def process(item: tuple[int, TrainExampleRecord]) -> Prediction:
-        idx, record = item
-
-        predictor = dspy.Predict(signature_class)
-        prompt_text = getattr(predictor.signature, "instructions", "")
-
-        example_inputs = record.example.inputs().toDict()
-        example_labels = record.example.labels().toDict()
-        execution_flow_str = format_execution_flow(record.execution_flow)
-
-        call_inputs = {
-            "problem": str(example_inputs),
-            "prediction": str(record.prediction) if record.prediction else "",
-            "expected": str(example_labels),
-            "execution_flow": execution_flow_str,
-            "metric_score": record.metric_score,
-            "metric_feedback": record.metric_feedback or "N/A",
-            "success_threshold": success_threshold,
-            "min_metric": min_metric,
-            "max_metric": max_metric,
-        }
-
-        if mode == "failure":
-            call_inputs["error"] = record.error or ""
-
-        span_inputs = {
-            "inputs": example_inputs,
-            "labels": example_labels,
-            "metric_score": record.metric_score,
-            "metric_feedback": record.metric_feedback,
-            "prompt": prompt_text,
-            "analysis_payload": to_serializable(call_inputs),
-        }
-
-        attributes = {
-            "analysis_mode": mode,
-            "iteration": iteration if iteration is not None else -1,
-            "example_index": idx,
-        }
-
-        with tracker.span(f"apex.analysis.{mode}", inputs=span_inputs, attributes=attributes) as span:
-            try:
-                with dspy.context(lm=analysis_lm, adapter=analysis_adapter):
-                    result = predictor(**call_inputs)
-
-                if span and hasattr(span, "set_outputs"):
-                    try:
-                        payload = {
-                            "prompt": prompt_text,
-                            "analysis": to_serializable(result),
-                        }
-                        if mode == "failure":
-                            payload["potential_root_causes"] = getattr(result, "potential_root_causes", [])
-                        else:
-                            payload["potential_success_patterns"] = getattr(result, "potential_success_patterns", [])
-                        span.set_outputs(payload)
-                    except Exception:  # pragma: no cover - defensive
-                        pass
-
-                return result
-            except Exception as exc:
-                if span and hasattr(span, "set_attribute"):
-                    try:
-                        span.set_attribute("error", str(exc)[:200])
-                    except Exception:  # pragma: no cover - defensive
-                        pass
-                raise
-
-    analyses = runtime.parallel_execute(
-        indexed_records,
-        process,
+    tasks = [_AnalysisTask(mode=mode, index=idx, record=record) for idx, record in enumerate(records)]
+    results = _run_analysis_tasks(
+        tasks,
         description=f"APEX: analyzing {mode}s",
-        level=Verbosity.DETAILED,
+        analysis_lm=analysis_lm,
+        analysis_adapter=analysis_adapter,
+        runtime=runtime,
+        tracker=tracker,
+        success_threshold=success_threshold,
+        min_metric=min_metric,
+        max_metric=max_metric,
+        format_execution_flow=format_execution_flow,
+        log=log,
+        iteration=iteration,
     )
-
-    if runtime.is_enabled(Verbosity.DETAILED):
-        for index, analysis in enumerate(analyses, start=1):
-            if mode == "failure":
-                categories = getattr(analysis, "categories", [])
-                if len(categories) > 1:
-                    category_str = f"{categories[0]}+{len(categories) - 1}"
-                else:
-                    category_str = categories[0] if categories else "unknown"
-
-                root_causes = getattr(analysis, "potential_root_causes", [])
-                cause_str = root_causes[0] if root_causes else "unknown cause"
-                if len(root_causes) > 1:
-                    cause_str += f" (+{len(root_causes) - 1} alt)"
-
-                log_fn(
-                    f"APEX: failure analysis #{index} ({category_str}) → {cause_str}",
-                    level=Verbosity.DETAILED,
-                )
-            else:
-                categories = getattr(analysis, "categories", [])
-                if len(categories) > 1:
-                    category_str = f"{categories[0]}+{len(categories) - 1}"
-                else:
-                    category_str = categories[0] if categories else "unknown"
-
-                patterns = getattr(analysis, "potential_success_patterns", [])
-                pattern_str = patterns[0] if patterns else "unknown pattern"
-                if len(patterns) > 1:
-                    pattern_str += f" (+{len(patterns) - 1} alt)"
-
-                log_fn(
-                    f"APEX: success analysis #{index} ({category_str}) → {pattern_str}",
-                    level=Verbosity.DETAILED,
-                )
-    return analyses
+    return results[mode]  # type: ignore[index]
 
 
 def analyze_successes(
@@ -249,9 +306,10 @@ def analyze_successes(
 ) -> list[Prediction]:
     if not success_records or failure_count == 0:
         return []
-    return analyze_examples(
-        success_records,
-        mode="success",
+    tasks = [_AnalysisTask(mode="success", index=idx, record=record) for idx, record in enumerate(success_records)]
+    results = _run_analysis_tasks(
+        tasks,
+        description="APEX: analyzing successes",
         analysis_lm=analysis_lm,
         analysis_adapter=analysis_adapter,
         runtime=runtime,
@@ -263,6 +321,54 @@ def analyze_successes(
         log=log,
         iteration=iteration,
     )
+    return results["success"]
+
+
+def analyze_failures_and_successes(
+    *,
+    failure_records: list[TrainExampleRecord],
+    success_records: list[TrainExampleRecord],
+    analysis_lm: LM,
+    analysis_adapter: Adapter,
+    runtime: RuntimeTools,
+    tracker: ExperimentTracker,
+    success_threshold: float,
+    min_metric: float,
+    max_metric: float,
+    format_execution_flow: Callable[[list[ExecutionFlowEntry]], str],
+    log: Callable[[str, Verbosity], None] | None = None,
+    iteration: int | None = None,
+) -> tuple[list[Prediction], list[Prediction]]:
+    if not failure_records:
+        return [], []
+
+    tasks: list[_AnalysisTask] = [
+        _AnalysisTask(mode="failure", index=idx, record=record) for idx, record in enumerate(failure_records)
+    ]
+
+    include_success = bool(success_records)
+    if include_success:
+        tasks.extend(
+            _AnalysisTask(mode="success", index=idx, record=record) for idx, record in enumerate(success_records)
+        )
+
+    results = _run_analysis_tasks(
+        tasks,
+        description="APEX: analyzing failures/successes",
+        analysis_lm=analysis_lm,
+        analysis_adapter=analysis_adapter,
+        runtime=runtime,
+        tracker=tracker,
+        success_threshold=success_threshold,
+        min_metric=min_metric,
+        max_metric=max_metric,
+        format_execution_flow=format_execution_flow,
+        log=log,
+        iteration=iteration,
+    )
+
+    success_summaries = results["success"] if include_success else []
+    return results["failure"], success_summaries
 
 
 def generate_hypotheses(

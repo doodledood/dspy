@@ -14,8 +14,7 @@ from dspy.teleprompt.teleprompt import Teleprompter
 
 from . import tracking_utils
 from .analysis import (
-    analyze_examples,
-    analyze_successes,
+    analyze_failures_and_successes,
     build_hypothesis_history_text,
     generate_hypotheses,
 )
@@ -523,23 +522,9 @@ class APEX(Teleprompter):
                         )
                         continue
 
-                    failure_summaries = analyze_examples(
-                        failures,
-                        mode="failure",
-                        analysis_lm=self.analysis_lm,
-                        analysis_adapter=self.analysis_adapter,
-                        runtime=self.runtime,
-                        tracker=self.tracker,
-                        success_threshold=self.success_threshold,
-                        min_metric=self.min_metric,
-                        max_metric=self.max_metric,
-                        format_execution_flow=format_execution_flow_with_details,
-                        log=self._log,
-                        iteration=iteration,
-                    )
-                    success_summaries = analyze_successes(
+                    failure_summaries, success_summaries = analyze_failures_and_successes(
+                        failure_records=failures,
                         success_records=successes,
-                        failure_count=len(failure_summaries),
                         analysis_lm=self.analysis_lm,
                         analysis_adapter=self.analysis_adapter,
                         runtime=self.runtime,
