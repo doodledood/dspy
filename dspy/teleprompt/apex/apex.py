@@ -13,7 +13,7 @@ from dspy.primitives import Example, Module, Prediction
 from dspy.teleprompt.teleprompt import Teleprompter
 
 from . import tracking_utils
-from .analysis import analyze_examples, analyze_record, build_hypothesis_history_text, generate_hypotheses
+from .analysis import _log_analysis_results, analyze_record, build_hypothesis_history_text, generate_hypotheses
 from .checkpoint_manager import CheckpointManager
 from .evaluation import EvaluationEngine
 from .execution_flow import (
@@ -477,7 +477,7 @@ class APEX(Teleprompter):
                         *,
                         baseline_program: Module = baseline_for_analysis,
                         current_iteration: int = iteration,
-                    ) -> tuple[TrainExampleRecord, Prediction | None]:
+                    ) -> tuple[TrainExampleRecord, Prediction | None, Prediction | None]:
                         example_idx, example = item
                         record = self.evaluator.run_train_example(
                             baseline_program,
@@ -485,10 +485,10 @@ class APEX(Teleprompter):
                             iteration=current_iteration,
                             example_idx=example_idx,
                         )
-                        if not record.is_success:
-                            failure_summary = analyze_record(
+                        if record.is_success:
+                            success_summary = analyze_record(
                                 record,
-                                mode="failure",
+                                mode="success",
                                 analysis_lm=self.analysis_lm,
                                 analysis_adapter=self.analysis_adapter,
                                 runtime=self.runtime,
@@ -499,9 +499,26 @@ class APEX(Teleprompter):
                                 format_execution_flow=format_execution_flow_with_details,
                                 log=self._log,
                                 iteration=current_iteration,
+                                example_index=example_idx,
                             )
-                            return record, failure_summary
-                        return record, None
+                            return record, None, success_summary
+
+                        failure_summary = analyze_record(
+                            record,
+                            mode="failure",
+                            analysis_lm=self.analysis_lm,
+                            analysis_adapter=self.analysis_adapter,
+                            runtime=self.runtime,
+                            tracker=self.tracker,
+                            success_threshold=self.success_threshold,
+                            min_metric=self.min_metric,
+                            max_metric=self.max_metric,
+                            format_execution_flow=format_execution_flow_with_details,
+                            log=self._log,
+                            iteration=current_iteration,
+                            example_index=example_idx,
+                        )
+                        return record, failure_summary, None
 
                     evaluated_records = self.runtime.parallel_execute(
                         indexed_train,
@@ -513,34 +530,27 @@ class APEX(Teleprompter):
                     failures: list[TrainExampleRecord] = []
                     successes: list[TrainExampleRecord] = []
                     failure_summaries: list[Prediction] = []
-
-                    for record, failure_summary in evaluated_records:
-                        if record.is_success:
-                            successes.append(record)
-                        else:
-                            failures.append(record)
-                            if failure_summary is not None:
-                                failure_summaries.append(failure_summary)
-
                     success_summaries: list[Prediction] = []
 
-                    if failures:
-                        success_summaries = analyze_examples(
-                            successes,
-                            mode="success",
-                            analysis_lm=self.analysis_lm,
-                            analysis_adapter=self.analysis_adapter,
-                            runtime=self.runtime,
-                            tracker=self.tracker,
-                            success_threshold=self.success_threshold,
-                            min_metric=self.min_metric,
-                            max_metric=self.max_metric,
-                            format_execution_flow=format_execution_flow_with_details,
-                            log=self._log,
-                            iteration=iteration,
-                        )
-                    else:
+                    for outcome in evaluated_records:
+                        if isinstance(outcome, Exception):
+                            raise outcome
+                        record, failure_summary, success_summary = outcome
+                        if record.is_success:
+                            successes.append(record)
+                            if success_summary is not None:
+                                success_summaries.append(success_summary)
+                            continue
+
+                        failures.append(record)
+                        if failure_summary is not None:
+                            failure_summaries.append(failure_summary)
+
+                    if not failure_summaries:
                         success_summaries = []
+
+                    _log_analysis_results("failure", failure_summaries, self._log, self.runtime)
+                    _log_analysis_results("success", success_summaries, self._log, self.runtime)
 
                     self._log(
                         f"APEX: Train evaluation complete - {len(failures)} failures, {len(successes)} successes",
@@ -583,9 +593,6 @@ class APEX(Teleprompter):
                             config=self._build_checkpoint_config(),
                         )
                         continue
-
-                    if not failure_summaries:
-                        success_summaries = []
 
                     if self._is_enabled(Verbosity.DETAILED):
                         self._log(

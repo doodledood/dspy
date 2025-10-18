@@ -29,6 +29,7 @@ from .signatures import (
 )
 from .tracker import ExperimentTracker
 from .types import Verbosity
+from dspy.utils.exceptions import AdapterParseError
 
 
 def _normalize_whitespace(text: str) -> str:
@@ -43,6 +44,97 @@ class _AnalysisTask:
     mode: Mode
     index: int
     record: TrainExampleRecord
+
+
+def _analyze_single_example(
+    record: TrainExampleRecord,
+    *,
+    index: int,
+    mode: Mode,
+    analysis_lm: LM,
+    analysis_adapter: Adapter,
+    runtime: RuntimeTools,
+    tracker: ExperimentTracker,
+    success_threshold: float,
+    min_metric: float,
+    max_metric: float,
+    format_execution_flow: Callable[[list[ExecutionFlowEntry]], str],
+    iteration: int | None,
+) -> Prediction | None:
+    signature_class = FailureAnalysisSignature if mode == "failure" else SuccessAnalysisSignature
+    predictor = dspy.Predict(signature_class)
+    prompt_text = getattr(predictor.signature, "instructions", "")
+
+    example_inputs = record.example.inputs().toDict()
+    example_labels = record.example.labels().toDict()
+    execution_flow_str = format_execution_flow(record.execution_flow)
+
+    call_inputs: dict[str, object] = {
+        "problem": str(example_inputs),
+        "prediction": str(record.prediction) if record.prediction else "",
+        "expected": str(example_labels),
+        "execution_flow": execution_flow_str,
+        "metric_score": record.metric_score,
+        "metric_feedback": record.metric_feedback or "N/A",
+        "success_threshold": success_threshold,
+        "min_metric": min_metric,
+        "max_metric": max_metric,
+    }
+
+    if mode == "failure":
+        call_inputs["error"] = record.error or ""
+
+    span_inputs = {
+        "inputs": example_inputs,
+        "labels": example_labels,
+        "metric_score": record.metric_score,
+        "metric_feedback": record.metric_feedback,
+        "prompt": prompt_text,
+        "analysis_payload": to_serializable(call_inputs),
+    }
+
+    attributes = {
+        "analysis_mode": mode,
+        "iteration": iteration if iteration is not None else -1,
+        "example_index": index,
+    }
+
+    with tracker.span(f"apex.analysis.{mode}", inputs=span_inputs, attributes=attributes) as span:
+        try:
+            with dspy.context(lm=analysis_lm, adapter=analysis_adapter):
+                result = predictor(**call_inputs)
+
+            if span and hasattr(span, "set_outputs"):
+                try:
+                    payload = {
+                        "prompt": prompt_text,
+                        "analysis": to_serializable(result),
+                    }
+                    if mode == "failure":
+                        payload["potential_root_causes"] = getattr(result, "potential_root_causes", [])
+                    else:
+                        payload["potential_success_patterns"] = getattr(result, "potential_success_patterns", [])
+                    span.set_outputs(payload)
+                except Exception:  # pragma: no cover - defensive
+                    pass
+
+            return result
+        except AdapterParseError as exc:
+            if span and hasattr(span, "set_attribute"):
+                try:
+                    span.set_attribute("error", str(exc)[:200])
+                except Exception:  # pragma: no cover - defensive
+                    pass
+            if mode == "success":
+                return None
+            raise
+        except Exception as exc:
+            if span and hasattr(span, "set_attribute"):
+                try:
+                    span.set_attribute("error", str(exc)[:200])
+                except Exception:  # pragma: no cover - defensive
+                    pass
+            raise
 
 
 def _log_analysis_results(
@@ -92,6 +184,7 @@ def _run_analysis_tasks(
     format_execution_flow: Callable[[list[ExecutionFlowEntry]], str],
     log: Callable[[str, Verbosity], None] | None = None,
     iteration: int | None = None,
+    level: Verbosity = Verbosity.DETAILED,
 ) -> dict[Mode, list[Prediction]]:
     if not tasks:
         return {"failure": [], "success": []}
@@ -99,86 +192,36 @@ def _run_analysis_tasks(
     log_fn = log or (lambda message, level=Verbosity.NORMAL: runtime.log(message, level))
 
     def process(task: _AnalysisTask) -> Prediction:
-        signature_class = FailureAnalysisSignature if task.mode == "failure" else SuccessAnalysisSignature
-        record = task.record
-        idx = task.index
-
-        predictor = dspy.Predict(signature_class)
-        prompt_text = getattr(predictor.signature, "instructions", "")
-
-        example_inputs = record.example.inputs().toDict()
-        example_labels = record.example.labels().toDict()
-        execution_flow_str = format_execution_flow(record.execution_flow)
-
-        call_inputs = {
-            "problem": str(example_inputs),
-            "prediction": str(record.prediction) if record.prediction else "",
-            "expected": str(example_labels),
-            "execution_flow": execution_flow_str,
-            "metric_score": record.metric_score,
-            "metric_feedback": record.metric_feedback or "N/A",
-            "success_threshold": success_threshold,
-            "min_metric": min_metric,
-            "max_metric": max_metric,
-        }
-
-        if task.mode == "failure":
-            call_inputs["error"] = record.error or ""
-
-        span_inputs = {
-            "inputs": example_inputs,
-            "labels": example_labels,
-            "metric_score": record.metric_score,
-            "metric_feedback": record.metric_feedback,
-            "prompt": prompt_text,
-            "analysis_payload": to_serializable(call_inputs),
-        }
-
-        attributes = {
-            "analysis_mode": task.mode,
-            "iteration": iteration if iteration is not None else -1,
-            "example_index": idx,
-        }
-
-        with tracker.span(f"apex.analysis.{task.mode}", inputs=span_inputs, attributes=attributes) as span:
-            try:
-                with dspy.context(lm=analysis_lm, adapter=analysis_adapter):
-                    result = predictor(**call_inputs)
-
-                if span and hasattr(span, "set_outputs"):
-                    try:
-                        payload = {
-                            "prompt": prompt_text,
-                            "analysis": to_serializable(result),
-                        }
-                        if task.mode == "failure":
-                            payload["potential_root_causes"] = getattr(result, "potential_root_causes", [])
-                        else:
-                            payload["potential_success_patterns"] = getattr(result, "potential_success_patterns", [])
-                        span.set_outputs(payload)
-                    except Exception:  # pragma: no cover - defensive
-                        pass
-
-                return result
-            except Exception as exc:
-                if span and hasattr(span, "set_attribute"):
-                    try:
-                        span.set_attribute("error", str(exc)[:200])
-                    except Exception:  # pragma: no cover - defensive
-                        pass
-                raise
+        return _analyze_single_example(
+            task.record,
+            index=task.index,
+            mode=task.mode,
+            analysis_lm=analysis_lm,
+            analysis_adapter=analysis_adapter,
+            runtime=runtime,
+            tracker=tracker,
+            success_threshold=success_threshold,
+            min_metric=min_metric,
+            max_metric=max_metric,
+            format_execution_flow=format_execution_flow,
+            iteration=iteration,
+        )
 
     analyses = runtime.parallel_execute(
         tasks,
         process,
         description=description,
-        level=Verbosity.DETAILED,
+        level=level,
     )
 
     failure_results: list[Prediction] = []
     success_results: list[Prediction] = []
 
     for task, analysis in zip(tasks, analyses, strict=False):
+        if isinstance(analysis, Exception):
+            raise analysis
+        if analysis is None:
+            continue
         if task.mode == "failure":
             failure_results.append(analysis)
         else:
@@ -285,6 +328,7 @@ def analyze_examples(
         format_execution_flow=format_execution_flow,
         log=log,
         iteration=iteration,
+        level=Verbosity.DETAILED,
     )
     return results[mode]
 
@@ -320,6 +364,7 @@ def analyze_successes(
         format_execution_flow=format_execution_flow,
         log=log,
         iteration=iteration,
+        level=Verbosity.DETAILED,
     )
     return results["success"]
 
@@ -338,11 +383,12 @@ def analyze_record(
     format_execution_flow: Callable[[list[ExecutionFlowEntry]], str],
     log: Callable[[str, Verbosity], None] | None = None,
     iteration: int | None = None,
+    example_index: int = 0,
 ) -> Prediction | None:
-    tasks = [_AnalysisTask(mode=mode, index=0, record=record)]
-    results = _run_analysis_tasks(
-        tasks,
-        description=f"APEX: analyzing {mode}",
+    return _analyze_single_example(
+        record,
+        index=example_index,
+        mode=mode,
         analysis_lm=analysis_lm,
         analysis_adapter=analysis_adapter,
         runtime=runtime,
@@ -351,11 +397,8 @@ def analyze_record(
         min_metric=min_metric,
         max_metric=max_metric,
         format_execution_flow=format_execution_flow,
-        log=log,
         iteration=iteration,
     )
-    predictions = results[mode]
-    return predictions[0] if predictions else None
 
 
 def analyze_failures_and_successes(
