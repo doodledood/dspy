@@ -102,26 +102,30 @@ def _analyze_single_example(
 
     validation_error: list[str] = []
 
-    def validate_analysis(prediction: Prediction | None) -> str | None:
-        """Validate that predictor names in analysis are valid."""
-        if prediction is None or available_predictor_names is None:
-            return None
+    def analysis_reward_fn(_, prediction: Prediction | None) -> float:
+        """Validate analysis predictor names - all logic embedded for dspy.Refine."""
+        # Capture context variables needed for validation
+        known_predictor_names = available_predictor_names
+        analysis_mode = mode
 
-        predictor_field = "involved_predictors" if mode == "failure" else "contributing_predictors"
+        if prediction is None or known_predictor_names is None:
+            validation_error[:] = []
+            return 1.0
+
+        predictor_field = "involved_predictors" if analysis_mode == "failure" else "contributing_predictors"
         predictors = getattr(prediction, predictor_field, []) or []
 
-        invalid_predictors = [p for p in predictors if p and p not in available_predictor_names]
+        invalid_predictors = [p for p in predictors if p and p not in known_predictor_names]
         if invalid_predictors:
-            return (
+            error_message = (
                 f"Analysis returned unknown predictor(s) {invalid_predictors}. "
-                f"Valid predictors: {sorted(available_predictor_names)}"
+                f"Valid predictors: {sorted(known_predictor_names)}"
             )
-        return None
+            validation_error[:] = [error_message]
+            return 0.0
 
-    def analysis_reward_fn(_, prediction: Prediction | None) -> float:
-        error_message = validate_analysis(prediction)
-        validation_error[:] = [error_message] if error_message else []
-        return 0.0 if error_message else 1.0
+        validation_error[:] = []
+        return 1.0
 
     with tracker.span(f"apex.analysis.{mode}", inputs=span_inputs, attributes=attributes) as span:
         try:
@@ -629,32 +633,84 @@ def generate_hypotheses(
 
     validation_error: list[str] = []
 
-    def validate_prediction(prediction: Prediction | None) -> str | None:
-        """Return an error message when validation fails, otherwise ``None``."""
+    def hypothesis_reward_fn(_, prediction: Prediction | None) -> float:
+        """Validate hypothesis generation - all logic embedded for dspy.Refine."""
+        # Capture context variables needed for validation
+        max_hypotheses = num_hypotheses
+        known_prompts = available_prompts
 
         if prediction is None:
-            return "APEX hypothesis generation failed: no prediction returned for validation"
+            error_message = "APEX hypothesis generation failed: no prediction returned for validation"
+            validation_error[:] = [error_message]
+            return 0.0
 
         hypotheses = getattr(prediction, "hypotheses", None) or []
-        invalid_predictors: set[str] = set()
-        for spec in hypotheses:
-            prompt_changes = getattr(spec, "prompt_changes", {}) or {}
-            invalid_predictors.update({name for name in prompt_changes if name not in available_prompts})
+        num_hypotheses_generated = len(hypotheses)
 
-        if invalid_predictors:
-            missing = sorted(invalid_predictors)
-            known_predictors = sorted(available_prompts.keys())
-            return (
-                "APEX hypothesis generation aborted: unknown predictor(s) "
-                f"{missing}. Known predictors: {known_predictors}"
+        # Must have 1-N hypotheses (never 0, never > N)
+        if num_hypotheses_generated == 0:
+            error_message = (
+                "APEX hypothesis generation failed: must generate at least 1 hypothesis. "
+                "Even if all issues are non-fixable via prompts, generate 1 hypothesis documenting the non-fixable issues "
+                "with empty prompt_changes."
             )
+            validation_error[:] = [error_message]
+            return 0.0
 
-        return None
+        if num_hypotheses_generated > max_hypotheses:
+            error_message = (
+                f"APEX hypothesis generation failed: generated {num_hypotheses_generated} hypotheses "
+                f"but maximum is {max_hypotheses}. Return at most {max_hypotheses} hypotheses."
+            )
+            validation_error[:] = [error_message]
+            return 0.0
 
-    def hypothesis_reward_fn(_, prediction: Prediction | None) -> float:
-        error_message = validate_prediction(prediction)
-        validation_error[:] = [error_message] if error_message else []
-        return 0.0 if error_message else 1.0
+        # Validate each hypothesis
+        for idx, spec in enumerate(hypotheses, start=1):
+            fixable = getattr(spec, "fixable_root_causes", []) or []
+            non_fixable = getattr(spec, "non_fixable_root_causes", []) or []
+            prompt_changes = getattr(spec, "prompt_changes", {}) or {}
+
+            # Rule 1: Must have at least one root cause (fixable OR non-fixable)
+            if not fixable and not non_fixable:
+                error_message = (
+                    f"APEX hypothesis #{idx} validation failed: must have at least 1 root cause. "
+                    "Either fixable_root_causes or non_fixable_root_causes (or both) must be non-empty."
+                )
+                validation_error[:] = [error_message]
+                return 0.0
+
+            # Rule 2: Empty prompt_changes ONLY allowed when no fixable causes and some non-fixable causes
+            if not prompt_changes:
+                if fixable:
+                    error_message = (
+                        f"APEX hypothesis #{idx} validation failed: prompt_changes is empty but fixable_root_causes is not empty. "
+                        f"If there are fixable issues ({len(fixable)} found), prompt_changes must contain at least one change."
+                    )
+                    validation_error[:] = [error_message]
+                    return 0.0
+                if not non_fixable:
+                    error_message = (
+                        f"APEX hypothesis #{idx} validation failed: prompt_changes is empty but non_fixable_root_causes is also empty. "
+                        "Empty prompt_changes is only valid when documenting non-fixable issues (non_fixable_root_causes must be non-empty)."
+                    )
+                    validation_error[:] = [error_message]
+                    return 0.0
+
+            # Validate predictor names in prompt_changes
+            invalid_predictors = [name for name in prompt_changes if name not in known_prompts]
+            if invalid_predictors:
+                known_predictor_names = sorted(known_prompts.keys())
+                error_message = (
+                    f"APEX hypothesis #{idx} validation failed: unknown predictor(s) "
+                    f"{sorted(invalid_predictors)}. Known predictors: {known_predictor_names}"
+                )
+                validation_error[:] = [error_message]
+                return 0.0
+
+        # All validations passed
+        validation_error[:] = []
+        return 1.0
 
     program_flow = build_program_flow_text()
     history_text = build_hypothesis_history_text(

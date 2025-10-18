@@ -976,17 +976,27 @@ class HypothesisGenerationSignature(Signature):
     - Need different program flow
     - Data quality issues
 
-    ## When to Return Empty List
+    ## CRITICAL: Always Generate At Least 1 Hypothesis
 
-    Return [] if:
+    You MUST return 1 to num_hypotheses hypotheses. Never return an empty list.
 
-    - No clear patterns in failures (just random errors across sample)
-    - All issues need architecture changes
-    - Fixes would likely break successful patterns
-    - Very low confidence in proposed changes
-    - Errors appear sample-specific rather than generalizable
+    **When ALL issues are non-fixable via prompts**:
+    - Generate 1 hypothesis documenting the non-fixable root causes
+    - Set fixable_root_causes to empty list []
+    - Set non_fixable_root_causes to list of identified issues
+    - Set prompt_changes to empty dict {}
+    - This documents why no prompt changes can help
 
-    Better to return [] than low-quality hypotheses that won’t survive validation.
+    **When there are fixable issues** (even if mixed with non-fixable):
+    - Generate 1-N hypotheses addressing fixable issues
+    - Each hypothesis MUST have non-empty prompt_changes
+    - Include specific prompt modifications for fixable root causes
+
+    **Rules enforced by validation**:
+    - Each hypothesis must have at least 1 root cause (fixable OR non-fixable)
+    - Empty prompt_changes {} is ONLY valid when:
+      - fixable_root_causes is empty [] AND
+      - non_fixable_root_causes is non-empty (has at least 1 issue)
 
 
     ## Example Hypothesis (Handling Uncertainty)
@@ -1051,12 +1061,15 @@ class HypothesisGenerationSignature(Signature):
         desc="History of previously tested hypotheses with validation scores and change notes; 'N/A' if unavailable",
         default="N/A",
     )
-    num_hypotheses: int = InputField(desc="Maximum number of hypotheses to generate (ordered by impact)")
+    num_hypotheses: int = InputField(
+        desc="Maximum number of hypotheses to generate. MUST return 1 to num_hypotheses hypotheses (never 0). "
+        "When all issues are non-fixable, return 1 hypothesis with empty prompt_changes documenting the issues."
+    )
 
     hypotheses: list[HypothesisSpec] = OutputField(
-        desc="List of improvement hypotheses ordered by impact_score (highest first). "
-        "Each may address different numbers of issues based on impact/generalizability tradeoffs. "
-        "May be empty if no actionable improvements found. Limited to num_hypotheses."
+        desc="List of 1 to num_hypotheses hypotheses ordered by impact_score (highest first). MUST contain at least 1 hypothesis. "
+        "Each hypothesis must have ≥1 root cause (fixable or non-fixable). "
+        "Empty prompt_changes only valid when fixable_root_causes=[] AND non_fixable_root_causes has ≥1 item."
     )
 
 
