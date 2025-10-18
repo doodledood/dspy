@@ -256,7 +256,7 @@ def build_hypothesis_history_text(*, include_history: bool, candidate_history: S
 def analyze_examples(
     records: list[TrainExampleRecord],
     *,
-    mode: str,
+    mode: Mode,
     analysis_lm: LM,
     analysis_adapter: Adapter,
     runtime: RuntimeTools,
@@ -286,7 +286,7 @@ def analyze_examples(
         log=log,
         iteration=iteration,
     )
-    return results[mode]  # type: ignore[index]
+    return results[mode]
 
 
 def analyze_successes(
@@ -322,6 +322,40 @@ def analyze_successes(
         iteration=iteration,
     )
     return results["success"]
+
+
+def analyze_record(
+    record: TrainExampleRecord,
+    *,
+    mode: Mode,
+    analysis_lm: LM,
+    analysis_adapter: Adapter,
+    runtime: RuntimeTools,
+    tracker: ExperimentTracker,
+    success_threshold: float,
+    min_metric: float,
+    max_metric: float,
+    format_execution_flow: Callable[[list[ExecutionFlowEntry]], str],
+    log: Callable[[str, Verbosity], None] | None = None,
+    iteration: int | None = None,
+) -> Prediction | None:
+    tasks = [_AnalysisTask(mode=mode, index=0, record=record)]
+    results = _run_analysis_tasks(
+        tasks,
+        description=f"APEX: analyzing {mode}",
+        analysis_lm=analysis_lm,
+        analysis_adapter=analysis_adapter,
+        runtime=runtime,
+        tracker=tracker,
+        success_threshold=success_threshold,
+        min_metric=min_metric,
+        max_metric=max_metric,
+        format_execution_flow=format_execution_flow,
+        log=log,
+        iteration=iteration,
+    )
+    predictions = results[mode]
+    return predictions[0] if predictions else None
 
 
 def analyze_failures_and_successes(
@@ -586,10 +620,10 @@ def generate_hypotheses(
 
             validator = dspy.Refine(
                 module=predictor_module,
-                N=1,
+                N=3,
                 reward_fn=hypothesis_reward_fn,
                 threshold=1.0,
-                fail_count=1,
+                fail_count=3,
             )
 
             try:
@@ -602,7 +636,15 @@ def generate_hypotheses(
         if validation_error:
             raise ValueError(validation_error[0])
 
-        validated_specs = result.hypotheses if result.hypotheses else []
+        validated_specs: list[HypothesisSpec]
+        if result is None:
+            validated_specs = []
+        else:
+            hypotheses = getattr(result, "hypotheses", None)
+            if hypotheses:
+                validated_specs = list(hypotheses)
+            else:
+                validated_specs = []
         validated_specs.sort(key=lambda h: (h.impact_score, h.generalizability_score), reverse=True)
         validated_specs = validated_specs[:num_hypotheses]
 

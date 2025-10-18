@@ -839,6 +839,68 @@ def test_apex_handles_fewer_successes_than_failures():
     assert optimized.apex_result.best_candidate.overall_score >= 1.0
 
 
+def test_apex_skips_success_analysis_without_failures():
+    analysis_lm = DummyLM([], adapter=dspy.JSONAdapter())
+    hypothesis_lm = DummyLM([], adapter=dspy.JSONAdapter())
+
+    optimizer = APEX(
+        metric=metric,
+        analysis_lm=analysis_lm,
+        hypothesis_lm=hypothesis_lm,
+        max_iterations=1,
+        num_hypotheses=0,
+        convergence_patience=1,
+        seed=11,
+        verbosity="silent",
+    )
+
+    student = PromptDrivenModule(initial_prompt="good")
+    trainset = [make_train_example("already_good")]
+    optimizer.compile(student, trainset=trainset, valset=trainset)
+
+    assert len(analysis_lm.history) == 0
+
+
+def test_apex_runs_success_analysis_after_failures_present():
+    def mixed_metric(example: Example, prediction: dspy.Prediction, trace) -> float:
+        if example.input == "success_first":
+            return 1.0
+        return 1.0 if prediction.output == "good" else 0.0
+
+    analysis_lm = DummyLM(
+        [
+            make_analysis_response("failure discovered"),
+            make_success_response("early success preserved"),
+        ],
+        adapter=dspy.JSONAdapter(),
+    )
+    hypothesis_lm = DummyLM([make_hypothesis_response()], adapter=dspy.JSONAdapter())
+
+    optimizer = APEX(
+        metric=mixed_metric,
+        analysis_lm=analysis_lm,
+        hypothesis_lm=hypothesis_lm,
+        max_iterations=1,
+        num_hypotheses=1,
+        convergence_patience=1,
+        seed=21,
+        verbosity="silent",
+    )
+
+    student = PromptDrivenModule(initial_prompt="bad")
+    trainset = [
+        Example(input="success_first", output="good").with_inputs("input"),
+        make_train_example("needs_fix"),
+    ]
+    optimizer.compile(student, trainset=trainset, valset=trainset)
+
+    assert len(analysis_lm.history) == 2
+    first_output = analysis_lm.history[0]["outputs"][0]
+    second_output = analysis_lm.history[1]["outputs"][0]
+    assert "potential_root_causes" in first_output
+    assert "potential_success_patterns" in second_output
+
+
 def test_apex_end_to_end_fake_data():
     trainset = [
         Example(input="sample_success", output="baseline").with_inputs("input"),

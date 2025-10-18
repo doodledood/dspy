@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+from collections import defaultdict
 from dataclasses import dataclass
 from statistics import median
 from typing import Any, Callable, Iterable, Sequence
@@ -96,7 +97,7 @@ class EvaluationEngine:
 
         def process(item: tuple[int, Example]) -> TrainExampleRecord:
             idx, example = item
-            return self._run_single_example(program, example, iteration=iteration, example_idx=idx)
+            return self.run_train_example(program, example, iteration=iteration, example_idx=idx)
 
         records = self.runtime.parallel_execute(
             indexed_examples,
@@ -117,6 +118,16 @@ class EvaluationEngine:
 
         return failures, successes
 
+    def run_train_example(
+        self,
+        program: Module,
+        example: Example,
+        *,
+        iteration: int | None = None,
+        example_idx: int = 0,
+    ) -> TrainExampleRecord:
+        return self._run_single_example(program, example, iteration=iteration, example_idx=example_idx)
+
     def evaluate_candidates(
         self,
         *,
@@ -130,6 +141,9 @@ class EvaluationEngine:
 
         candidates: list[CandidateRecord] = []
 
+        candidate_specs: list[tuple[int, str, Module, Module, HypothesisSpec | None]] = []
+        spec_counter = 0
+
         if cached_baseline is not None:
             baseline_record = CandidateRecord(
                 program=baseline,
@@ -138,41 +152,184 @@ class EvaluationEngine:
                 iteration=iteration,
                 hypothesis=None,
             )
-        else:
-            baseline_record = self.evaluate_candidate(
-                program=baseline.deepcopy(),
-                calset=list(calset),
-                iteration=iteration,
-                hypothesis=None,
-            )
-
-        candidates.append(baseline_record)
-        self.log(
-            f"APEX: iteration {iteration} baseline score={baseline_record.overall_score:.4f}",
-            Verbosity.NORMAL,
-            "info",
-        )
-
-        for hypothesis in hypotheses:
-            candidate_program = self.apply_hypothesis(baseline, hypothesis)
-            record = self.evaluate_candidate(
-                program=candidate_program,
-                calset=list(calset),
-                iteration=iteration,
-                hypothesis=hypothesis,
-            )
-            candidates.append(record)
+            candidates.append(baseline_record)
             self.log(
-                f"APEX: iteration {iteration} hypothesis score={record.overall_score:.4f}",
+                f"APEX: iteration {iteration} baseline score={baseline_record.overall_score:.4f}",
                 Verbosity.NORMAL,
                 "info",
             )
-            if self.is_enabled(Verbosity.DETAILED):
+        else:
+            candidate_specs.append((spec_counter, "baseline", baseline, baseline.deepcopy(), None))
+            spec_counter += 1
+
+        for hypothesis in hypotheses:
+            candidate_program = self.apply_hypothesis(baseline, hypothesis)
+            candidate_specs.append(
+                (spec_counter, "hypothesis", candidate_program, candidate_program.deepcopy(), hypothesis)
+            )
+            spec_counter += 1
+
+        if not candidate_specs:
+            return candidates
+
+        indexed_calset = list(enumerate(calset))
+        tasks = [
+            (spec_id, label, eval_program, hypothesis, example_idx, example)
+            for spec_id, label, _record_program, eval_program, hypothesis in candidate_specs
+            for example_idx, example in indexed_calset
+        ]
+
+        def process(
+            task: tuple[
+                int,
+                str,
+                Module,
+                HypothesisSpec | None,
+                int,
+                Example,
+            ],
+        ) -> tuple[int, int, float | None]:
+            (
+                spec_id,
+                label,
+                eval_program,
+                hypothesis,
+                example_idx,
+                example,
+            ) = task
+
+            example_inputs = example.inputs().toDict()
+            labels_dict = example.labels().toDict()
+
+            prompts_map = {
+                name: getattr(predictor.signature, "instructions", "")
+                for name, predictor in eval_program.named_predictors()
+            }
+
+            span_inputs: dict[str, Any] = {
+                "inputs": example_inputs,
+                "labels": labels_dict,
+                "prompts": prompts_map,
+            }
+            if hypothesis is not None:
+                span_inputs["hypothesis"] = to_serializable(hypothesis)
+
+            attributes = {
+                "stage": label,
+                "iteration": iteration,
+                "example_index": example_idx,
+            }
+
+            with self.tracker.span(
+                f"apex.{label}_example",
+                inputs=span_inputs,
+                attributes=attributes,
+            ) as span:
+                try:
+                    per_runs: list[float] = []
+                    run_details: list[dict[str, Any]] = []
+                    for run_index in range(self.num_eval_runs):
+                        with dspy.settings.context(trace=[]):
+                            prediction = eval_program(**example_inputs)
+                            trace_entries = list(dspy.settings.trace or [])
+
+                        score, feedback = self._evaluate_metric(example, prediction, trace_entries)
+                        clipped_score = max(self.min_metric, min(self.max_metric, score))
+                        per_runs.append(clipped_score)
+
+                        trace_payload = _serialize_trace_entries(trace_entries)
+
+                        run_details.append(
+                            {
+                                "run_index": run_index,
+                                "raw_score": score,
+                                "clipped_score": clipped_score,
+                                "feedback": feedback,
+                                "prediction": to_serializable(prediction),
+                                "trace": trace_payload,
+                            }
+                        )
+
+                        if span and hasattr(span, "set_attribute"):
+                            try:
+                                span.set_attribute(f"run_{run_index}_score", clipped_score)
+                            except Exception:  # pragma: no cover - defensive
+                                pass
+
+                    median_score = median(per_runs) if per_runs else self.min_metric
+                    if span and hasattr(span, "set_outputs"):
+                        try:
+                            span.set_outputs({"median_score": median_score, "runs": run_details})
+                        except Exception:  # pragma: no cover - defensive
+                            pass
+                    return spec_id, example_idx, median_score
+                except Exception as exc:  # pragma: no cover - defensive
+                    self.log(
+                        f"APEX: Error evaluating example: {str(exc)[:200]}",
+                        Verbosity.NORMAL,
+                        "warning",
+                    )
+                    if span and hasattr(span, "set_attribute"):
+                        try:
+                            span.set_attribute("error", str(exc)[:200])
+                        except Exception:
+                            pass
+                    return spec_id, example_idx, None
+
+        results = self.runtime.parallel_execute(
+            tasks,
+            process,
+            description="APEX: evaluating candidates",
+            level=Verbosity.NORMAL,
+        )
+
+        scores_by_candidate: dict[int, list[tuple[int, float]]] = defaultdict(list)
+        for spec_id, example_idx, score in results:
+            if score is None:
+                continue
+            scores_by_candidate[spec_id].append((example_idx, score))
+
+        for spec_id, label, record_program, _, hypothesis in candidate_specs:
+            scored_examples = sorted(scores_by_candidate.get(spec_id, []), key=lambda item: item[0])
+            per_example_scores = [score for _, score in scored_examples]
+            if not per_example_scores:
                 self.log(
-                    f"APEX: hypothesis details → {hypothesis.model_dump()}",
-                    Verbosity.DETAILED,
+                    f"APEX: Warning - no valid scores obtained for {label}",
+                    Verbosity.NORMAL,
+                    "warning",
+                )
+                per_example_scores = [self.min_metric]
+
+            overall_score = sum(per_example_scores) / len(per_example_scores)
+
+            record = CandidateRecord(
+                program=record_program,
+                overall_score=overall_score,
+                per_example_scores=per_example_scores,
+                iteration=iteration,
+                hypothesis=hypothesis,
+            )
+
+            if label == "baseline":
+                candidates.insert(0, record)
+                self.log(
+                    f"APEX: iteration {iteration} baseline score={record.overall_score:.4f}",
+                    Verbosity.NORMAL,
                     "info",
                 )
+            else:
+                candidates.append(record)
+                self.log(
+                    f"APEX: iteration {iteration} hypothesis score={record.overall_score:.4f}",
+                    Verbosity.NORMAL,
+                    "info",
+                )
+                if self.is_enabled(Verbosity.DETAILED) and hypothesis is not None:
+                    self.log(
+                        f"APEX: hypothesis details → {hypothesis.model_dump()}",
+                        Verbosity.DETAILED,
+                        "info",
+                    )
 
         return candidates
 
