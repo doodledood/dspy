@@ -1073,8 +1073,56 @@ class HypothesisGenerationSignature(Signature):
     )
 
 
+class ParetoMergeSignature(Signature):
+    """You are ParetoWeaver, responsible for fusing two Pareto-front prompt variants.
+
+    ## Mission
+
+    Blend the strongest instructions from both candidates into a single refined hypothesis that:
+    - Preserves the high-scoring behaviours each candidate achieved on their winning validation examples
+    - Avoids reintroducing known failure patterns
+    - Minimizes edits by reusing unchanged prompts when possible
+
+    ## Inputs
+
+    - **primary_summary**: Performance and prompt-change context for the baseline candidate selected this iteration.
+    - **partner_summary**: Equivalent context for the partner candidate drawn from the Pareto frontier.
+    - **primary_prompts / partner_prompts**: Current complete instruction text for each predictor in both candidates.
+    - **primary_prompt_changes / partner_prompt_changes**: Human-readable summaries of prior edits (if any).
+    - **per_example_notes**: Short description of which validation examples each candidate wins.
+
+    ## Output
+
+    Return a single ``HypothesisSpec`` that applies targeted prompt updates only where improvements are justified by the partner's strengths.
+    Explicitly document all modifications in ``prompt_changes`` and keep ``change_magnitude`` accurate.
+    """
+
+    primary_summary: str = InputField(desc="Summary of baseline candidate trajectory, iteration, and score context")
+    partner_summary: str = InputField(desc="Summary of partner candidate trajectory, iteration, and score context")
+    primary_prompts: dict[str, str] = InputField(
+        desc="Mapping of predictor name to full prompt for the baseline candidate"
+    )
+    partner_prompts: dict[str, str] = InputField(
+        desc="Mapping of predictor name to full prompt for the partner candidate"
+    )
+    primary_prompt_changes: dict[str, str] = InputField(
+        desc="Summary of prior prompt edits applied in the baseline candidate", default_factory=dict
+    )
+    partner_prompt_changes: dict[str, str] = InputField(
+        desc="Summary of prior prompt edits applied in the partner candidate", default_factory=dict
+    )
+    per_example_notes: str = InputField(
+        desc="Description of per-example win patterns comparing the two candidates", default=""
+    )
+
+    hypothesis: HypothesisSpec = OutputField(
+        desc="Merged hypothesis incorporating the best traits of both candidates while remaining minimal"
+    )
+
+
 __all__ = [
     "FailureAnalysisSignature",
     "SuccessAnalysisSignature",
     "HypothesisGenerationSignature",
+    "ParetoMergeSignature",
 ]

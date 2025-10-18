@@ -175,6 +175,8 @@ class CheckpointConfig(BaseModel):
     max_metric: float
     convergence_patience: int | None
     seed: int
+    candidate_selection: str = "best_on_val"
+    pareto_merge_probability: float = 0.0
 
 
 class ApexCheckpoint(BaseModel):

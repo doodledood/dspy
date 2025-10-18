@@ -23,10 +23,16 @@ from dspy.teleprompt.apex import (
     PromptChange,
     Verbosity,
 )
-from dspy.teleprompt.apex.analysis import generate_hypotheses
+from dspy.teleprompt.apex.analysis import build_hypothesis_history_text, generate_hypotheses
+from dspy.teleprompt.apex.candidate_selection import (
+    compute_win_weights,
+    non_dominated_candidates,
+    select_baseline_candidate,
+)
 from dspy.teleprompt.apex.evaluation import EvaluationEngine
-from dspy.teleprompt.apex.models import ProgramSnapshot
+from dspy.teleprompt.apex.models import ApexIterationLog, ProgramSnapshot
 from dspy.teleprompt.apex.serialization import to_serializable
+from dspy.teleprompt.apex.summary import generate_optimization_summary
 from dspy.utils.dummies import DummyLM
 
 
@@ -68,6 +74,27 @@ def make_hypothesis_response(prompt_value: str = "good") -> dict:
                 },
             }
         ]
+    }
+
+
+def make_merge_response(prompt_value: str = "blend") -> dict:
+    return {
+        "hypothesis": HypothesisSpec(
+            observation="Combine complementary prompt behaviors",
+            fixable_root_causes=["Unify strengths across Pareto candidates"],
+            non_fixable_root_causes=[],
+            impact_score=0.6,
+            generalizability_score=0.5,
+            strategy="Pareto merge refinement",
+            expected_impact="Cover both success regions",
+            prompt_changes={
+                "predictor": PromptChange(
+                    new_prompt=prompt_value,
+                    change_summary="Blend the baseline and partner instructions",
+                    change_magnitude=ChangeMagnitude.MODERATE,
+                )
+            },
+        )
     }
 
 
@@ -221,6 +248,151 @@ def configure_mock_mlflow(mock_mlflow: MagicMock, *, run_id: str = "test-run-id"
     return mock_run
 
 
+def _make_candidate(prompt: str, scores: list[float], iteration: int) -> CandidateRecord:
+    module = PromptDrivenModule(initial_prompt=prompt)
+    overall = sum(scores) / len(scores)
+    return CandidateRecord(
+        program=module,
+        overall_score=overall,
+        per_example_scores=scores,
+        iteration=iteration,
+        hypothesis=None,
+    )
+
+
+def test_non_dominated_candidates_filters_dominated() -> None:
+    dominant = _make_candidate("dominant", [0.9, 0.2, 0.2], iteration=0)
+    tradeoff = _make_candidate("tradeoff", [0.8, 0.8, 0.8], iteration=1)
+    dominated = _make_candidate("dominated", [0.7, 0.7, 0.7], iteration=2)
+
+    frontier = non_dominated_candidates([dominant, tradeoff, dominated])
+
+    assert frontier == [dominant, tradeoff]
+
+
+def test_select_baseline_candidate_pareto_weighted_sampling() -> None:
+    primary = _make_candidate("primary", [1.0, 0.1, 0.1], iteration=0)
+    partner = _make_candidate("partner", [0.9, 0.9, 0.9], iteration=1)
+
+    rng = random.Random(0)
+    result = select_baseline_candidate(candidates=[primary, partner], strategy="pareto", rng=rng)
+
+    assert result.baseline is partner
+    assert result.frontier == [primary, partner]
+    assert result.weights == compute_win_weights(result.frontier)
+    assert result.weights == [1.0, 2.0]
+
+
+@pytest.mark.parametrize("probability", [-0.1, 1.5])
+def test_apex_rejects_invalid_pareto_merge_probability(probability: float) -> None:
+    analysis_lm = DummyLM([], adapter=dspy.JSONAdapter())
+
+    with pytest.raises(ValueError, match="pareto_merge_probability"):
+        APEX(
+            metric=metric,
+            analysis_lm=analysis_lm,
+            hypothesis_lm=analysis_lm,
+            max_iterations=1,
+            convergence_patience=1,
+            candidate_selection="best_on_val",
+            pareto_merge_probability=probability,
+        )
+
+
+def test_apex_rejects_unknown_candidate_selection() -> None:
+    analysis_lm = DummyLM([], adapter=dspy.JSONAdapter())
+
+    with pytest.raises(ValueError, match="candidate_selection"):
+        APEX(
+            metric=metric,
+            analysis_lm=analysis_lm,
+            hypothesis_lm=analysis_lm,
+            max_iterations=1,
+            convergence_patience=1,
+            candidate_selection="unknown",
+        )
+
+
+def test_pareto_merge_probability_triggers_merge_hypothesis() -> None:
+    trainset = [
+        Example(input="needs_bad", output="bad").with_inputs("input"),
+        Example(input="needs_good", output="good").with_inputs("input"),
+    ]
+    valset = list(trainset)
+
+    analysis_lm = make_routed_analysis_lm(
+        failures=[make_analysis_response() for _ in range(10)],
+        successes=[make_success_response() for _ in range(10)],
+    )
+    hypothesis_lm = DummyLM(
+        [
+            make_hypothesis_response("good"),
+            make_hypothesis_response("bad"),
+            make_merge_response("blend"),
+        ],
+        adapter=dspy.JSONAdapter(),
+    )
+
+    optimizer = APEX(
+        metric=metric,
+        analysis_lm=analysis_lm,
+        hypothesis_lm=hypothesis_lm,
+        max_iterations=2,
+        num_hypotheses=1,
+        convergence_patience=3,
+        seed=0,
+        verbosity="silent",
+        candidate_selection="pareto",
+        pareto_merge_probability=1.0,
+    )
+
+    student = PromptDrivenModule(initial_prompt="bad")
+    optimized = optimizer.compile(student, trainset=trainset, valset=valset)
+
+    assert len(optimized.apex_result.iterations) >= 2
+    second_iter = optimized.apex_result.iterations[1]
+    assert len(second_iter.hypotheses) == 2
+    assert any(h.strategy == "Pareto merge refinement" for h in second_iter.hypotheses)
+
+
+def test_best_on_val_ignores_merge_probability() -> None:
+    trainset = [
+        Example(input="needs_bad", output="bad").with_inputs("input"),
+        Example(input="needs_good", output="good").with_inputs("input"),
+    ]
+    valset = list(trainset)
+
+    analysis_lm = make_routed_analysis_lm(
+        failures=[make_analysis_response() for _ in range(6)],
+        successes=[make_success_response() for _ in range(6)],
+    )
+    hypothesis_lm = DummyLM(
+        [make_hypothesis_response("good"), make_hypothesis_response("bad")],
+        adapter=dspy.JSONAdapter(),
+    )
+
+    optimizer = APEX(
+        metric=metric,
+        analysis_lm=analysis_lm,
+        hypothesis_lm=hypothesis_lm,
+        max_iterations=2,
+        num_hypotheses=1,
+        convergence_patience=3,
+        seed=0,
+        verbosity="silent",
+        candidate_selection="best_on_val",
+        pareto_merge_probability=1.0,
+    )
+
+    student = PromptDrivenModule(initial_prompt="bad")
+    optimized = optimizer.compile(student, trainset=trainset, valset=valset)
+
+    iterations = optimized.apex_result.iterations
+    assert iterations, "Expected at least one iteration to run"
+    all_strategies = [hyp.strategy for it in iterations for hyp in it.hypotheses]
+    assert "Pareto merge refinement" not in all_strategies
+
+
 def test_evaluate_candidate_logs_traces_without_mutating_predictors():
     tracker = RecordingTracker()
     runtime = runtime_module.RuntimeTools(verbosity=Verbosity.DETAILED, num_threads=1)
@@ -329,6 +501,63 @@ def test_generate_hypotheses_traces_include_full_context():
     assert outputs["failure_category_counts"] == {"format_ambiguity": 1}
     assert outputs["success_category_counts"] == {"clear_format_compliance": 1}
     assert outputs["success_rate_percentage"] == pytest.approx(50.0)
+
+
+def test_generate_optimization_summary_lists_each_candidate():
+    change = PromptChange(
+        new_prompt="better",
+        change_summary="Clean whitespace",
+        change_magnitude=ChangeMagnitude.MINIMAL,
+    )
+    hypothesis_spec = HypothesisSpec(
+        observation="obs",
+        fixable_root_causes=["missing token"],
+        non_fixable_root_causes=[],
+        impact_score=0.7,
+        generalizability_score=0.5,
+        strategy="Improve prompt",
+        expected_impact="better outputs",
+        prompt_changes={"predictor": change},
+    )
+
+    baseline_candidate = CandidateRecord(
+        program=PromptDrivenModule(initial_prompt="baseline"),
+        overall_score=0.6,
+        per_example_scores=[0.6],
+        iteration=1,
+        hypothesis=None,
+    )
+    improved_candidate = CandidateRecord(
+        program=PromptDrivenModule(initial_prompt="better"),
+        overall_score=0.8,
+        per_example_scores=[0.8],
+        iteration=1,
+        hypothesis=hypothesis_spec,
+    )
+
+    iteration_log = ApexIterationLog(
+        iteration=1,
+        sampled_train_size=2,
+        num_failures=1,
+        num_successes=1,
+        hypotheses=[hypothesis_spec],
+        candidates=[baseline_candidate, improved_candidate],
+    )
+
+    summary = generate_optimization_summary(
+        [iteration_log],
+        best_candidate=improved_candidate,
+        initial_score=0.5,
+    )
+
+    assert "baseline" in summary
+    assert "Train F/S: 1/1" in summary
+    assert "hyp #1" in summary
+    assert "Improve prompt" in summary
+    assert "predictor: Clean" in summary
+    assert "whitespace" in summary
+
+
 @pytest.mark.parametrize(
     "kwargs, error_match",
     [
@@ -376,16 +605,6 @@ def test_apex_requires_non_empty_train_and_valset():
 
 
 def test_apex_builds_history_text_when_enabled():
-    analysis_lm = DummyLM([], adapter=dspy.JSONAdapter())
-    optimizer = APEX(
-        metric=metric,
-        analysis_lm=analysis_lm,
-        hypothesis_lm=analysis_lm,
-        max_iterations=1,
-        convergence_patience=1,
-        verbosity="silent",
-    )
-
     hypothesis = HypothesisSpec(
         observation="obs",
         fixable_root_causes=["missing token"],
@@ -419,7 +638,10 @@ def test_apex_builds_history_text_when_enabled():
         hypothesis=hypothesis,
     )
 
-    history_text = optimizer._build_hypothesis_history_text([baseline, candidate])
+    history_text = build_hypothesis_history_text(
+        candidate_history=[baseline, candidate],
+        selection_strategy="best_on_val",
+    )
 
     assert "Iteration 0 baseline score=0.6000 (best so far)" in history_text
     assert "Iteration 3" in history_text
@@ -428,27 +650,44 @@ def test_apex_builds_history_text_when_enabled():
     assert "Clean whitespace" in history_text
 
 
-def test_apex_history_disabled_returns_na():
-    analysis_lm = DummyLM([], adapter=dspy.JSONAdapter())
-    optimizer = APEX(
-        metric=metric,
-        analysis_lm=analysis_lm,
-        hypothesis_lm=analysis_lm,
-        max_iterations=1,
-        convergence_patience=1,
-        verbosity="silent",
-        include_hypothesis_history=False,
+def test_generate_hypotheses_history_disabled_uses_na():
+    tracker = RecordingTracker()
+    runtime = runtime_module.RuntimeTools(verbosity=Verbosity.DETAILED, num_threads=1)
+    rng = random.Random(0)
+
+    snapshot = ProgramSnapshot(
+        structure="predictor",
+        flow_description="predictor(input) -> output",
+        prompts={"predictor": "Do the thing."},
+        predictor_name_by_id={},
     )
 
-    candidate = CandidateRecord(
-        program=PromptDrivenModule(initial_prompt="bad"),
-        overall_score=1.0,
-        per_example_scores=[1.0],
+    failure_summary = dspy.Prediction(**make_analysis_response())
+    success_summary = dspy.Prediction(**make_success_response())
+
+    hypothesis_lm = DummyLM([make_hypothesis_response()], adapter=dspy.JSONAdapter())
+
+    generate_hypotheses(
+        failure_summaries=[failure_summary],
+        success_summaries=[success_summary],
+        snapshot=snapshot,
+        candidate_history=[],
+        best_val_score=0.42,
+        runtime=runtime,
+        hypothesis_lm=hypothesis_lm,
+        hypothesis_adapter=dspy.JSONAdapter(),
+        num_hypotheses=1,
+        include_history=False,
+        rng=rng,
+        log=None,
         iteration=1,
-        hypothesis=None,
+        tracker=tracker,
+        selection_strategy="best_on_val",
     )
 
-    assert optimizer._build_hypothesis_history_text([candidate]) == "N/A"
+    assert tracker.spans, "Expected generate_hypotheses to record a tracker span"
+    payload = tracker.spans[-1]["inputs"]["generation_payload"]
+    assert payload["hypothesis_history"] == "N/A"
 
 
 def test_apex_sample_callable_must_return_list():

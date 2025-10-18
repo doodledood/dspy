@@ -12,6 +12,8 @@ def generate_optimization_summary(
     iterations: list[ApexIterationLog],
     best_candidate: CandidateRecord,
     initial_score: float,
+    selection_strategy: str = "best_on_val",
+    pareto_merge_probability: float | None = None,
 ) -> str:
     """Generate a formatted summary table of the optimization process."""
 
@@ -32,6 +34,9 @@ def generate_optimization_summary(
     lines.append(f"║ Total Iterations: {total_iterations:<47} ║")
     lines.append(f"║ Hypotheses Tested: {total_hypotheses:<46} ║")
     lines.append(f"║ Candidates Evaluated: {total_candidates:<43} ║")
+    lines.append(f"║ Selection Strategy: {selection_strategy:<41} ║")
+    if pareto_merge_probability is not None:
+        lines.append(f"║ Pareto Merge Probability: {pareto_merge_probability:<32.2f} ║")
     lines.append("╠═══════════════════════════════════════════════════════════════╣")
 
     # Score progress
@@ -41,83 +46,151 @@ def generate_optimization_summary(
     lines.append(f"║ Improvement: {improvement_str:<52} ║")
     lines.append("╠═══════════════════════════════════════════════════════════════╣")
 
-    # Iteration details table
-    lines.append("║ Iter │ Train F/S │ Hypotheses │ Best Score │ Δ from prev ║")
-    lines.append("╟──────┼───────────┼────────────┼────────────┼──────────────╢")
+    frame_width = len("╔═══════════════════════════════════════════════════════════════╗")
+    content_width = frame_width - 4
+    iter_width = 4
+    candidate_width = 13
+    score_width = 8
+    delta_width = 8
+    summary_width = 18
 
-    prev_best = initial_score
-    for it in iterations:
-        failures = it.num_failures
-        successes = it.num_successes
-        num_hyp = len(it.hypotheses)
+    def wrap_text(text: str, width: int) -> list[str]:
+        if not text:
+            return [""]
+        words = text.split()
+        if not words:
+            return [""]
+        wrapped: list[str] = []
+        current = ""
+        for word in words:
+            candidate = f"{current} {word}".strip() if current else word
+            if len(candidate) <= width:
+                current = candidate
+            else:
+                if current:
+                    wrapped.append(current)
+                if len(word) > width:
+                    for start in range(0, len(word), width):
+                        wrapped.append(word[start : start + width])
+                    current = ""
+                else:
+                    current = word
+        if current:
+            wrapped.append(current)
+        return wrapped or [""]
 
-        if it.candidates:
-            best_score = max(c.overall_score for c in it.candidates)
-            delta = best_score - prev_best
-            delta_str = f"{'+' if delta >= 0 else ''}{delta:.4f}"
-            prev_best = max(prev_best, best_score)
-        else:
-            best_score = prev_best
-            delta_str = "0.0000"
+    def build_row(iter_text: str, candidate_text: str, score_text: str, delta_text: str, summary_text: str) -> str:
+        summary_text = summary_text[:summary_width]
+        columns = [
+            f"{iter_text:^{iter_width}}",
+            f"{candidate_text:<{candidate_width}}",
+            f"{score_text:^{score_width}}",
+            f"{delta_text:^{delta_width}}",
+            f"{summary_text:<{summary_width}}",
+        ]
+        content = " │ ".join(columns)
+        content = content[:content_width]
+        row = f"║ {content}"
+        padding = frame_width - len(row) - 1
+        if padding < 0:
+            row = row[: frame_width - 1]
+            padding = 0
+        row += " " * padding
+        row += "║"
+        return row
 
-        lines.append(
-            f"║ {it.iteration:^4} │ {failures:>3}/{successes:<5} │ {num_hyp:^10} │ {best_score:^10.4f} │ {delta_str:^12} ║"
-        )
+    def build_separator(char: str, junction: str, left: str, right: str) -> str:
+        segments = [
+            char * (iter_width + 2),
+            char * (candidate_width + 2),
+            char * (score_width + 2),
+            char * (delta_width + 2),
+            char * (summary_width + 2),
+        ]
+        content = junction.join(segments)
+        line = f"{left}{content}"
+        padding = frame_width - len(line) - 1
+        if padding > 0:
+            line += char * padding
+        line += right
+        return line
 
-    lines.append("╚══════╧═══════════╧════════════╧════════════╧══════════════╝")
+    header = build_row("Iter", "Candidate", "Score", "Δ vs best", "Prompt Summary")
+    separator = build_separator("─", "┼", "╟", "╢")
+    footer = build_separator("═", "╧", "╚", "╝")
 
-    # Prompt evolution lineage - only show improvements that became best so far
-    lines.append("\n╔═══════════════════════════════════════════════════════════════╗")
-    lines.append("║                  Prompt Evolution Lineage                    ║")
-    lines.append("╠═══════════════════════════════════════════════════════════════╣")
+    lines.append(header)
+    lines.append(separator)
 
-    # Build lineage by tracking best score improvements
-    lineage = []
     best_so_far = initial_score
+    first_iteration = True
 
-    for it in iterations:
-        # Find the best candidate in this iteration
-        if it.candidates:
-            iteration_best = max(it.candidates, key=lambda c: c.overall_score)
+    for iteration in iterations:
+        if not iteration.candidates:
+            if not first_iteration:
+                lines.append(separator)
+            first_iteration = False
+            lines.append(
+                build_row(
+                    str(iteration.iteration),
+                    "baseline",
+                    f"{best_so_far:.4f}",
+                    "+0.0000",
+                    "No candidates evaluated",
+                )
+            )
+            continue
 
-            # Only include if it improved over previous best and has a hypothesis
-            if iteration_best.overall_score > best_so_far and iteration_best.hypothesis is not None:
-                lineage.append((iteration_best, best_so_far))
-                best_so_far = iteration_best.overall_score
+        if not first_iteration:
+            lines.append(separator)
+        first_iteration = False
 
-    if lineage:
-        for candidate, prev_score in lineage:
+        for idx, candidate in enumerate(iteration.candidates):
             score = candidate.overall_score
-            delta = score - prev_score
-            delta_str = f"{'+' if delta >= 0 else ''}{delta:.4f}"
+            delta = score - best_so_far
+            delta_text = f"{delta:+.4f}"
+            if score > best_so_far:
+                best_so_far = score
 
-            header = f"Iteration {candidate.iteration} (score={score:.4f}, Δ={delta_str})"
-            lines.append(f"║ {header:<61} ║")
+            candidate_label = "baseline" if idx == 0 else f"hyp #{idx}"
+            base_summary: list[str] = []
 
-            if candidate.hypothesis and candidate.hypothesis.prompt_changes:
-                for predictor_name, change in candidate.hypothesis.prompt_changes.items():
-                    summary = change.change_summary or "No summary provided"
-                    magnitude = change.change_magnitude.value
-                    prefix = f"  * {predictor_name} [{magnitude}]: "
+            if idx == 0:
+                base_summary.append(f"Train F/S: {iteration.num_failures}/{iteration.num_successes}")
+                base_summary.append(f"Hyp eval: {len(iteration.hypotheses)}")
+                base_summary.append("Original program")
+            else:
+                hypothesis = candidate.hypothesis
+                if hypothesis is None:
+                    base_summary.append("No hypothesis metadata")
+                else:
+                    base_summary.append(hypothesis.strategy or "Unknown strategy")
+                    if hypothesis.prompt_changes:
+                        for predictor_name, change in hypothesis.prompt_changes.items():
+                            summary = change.change_summary or "No summary provided"
+                            base_summary.append(f"{predictor_name}: {summary}")
+                    else:
+                        base_summary.append("No prompt changes")
 
-                    # Word-wrap the summary
-                    words = summary.split()
-                    current_line = prefix
+            summary_lines: list[str] = []
+            for entry in base_summary:
+                summary_lines.extend(wrap_text(entry, summary_width))
 
-                    for word in words:
-                        test_line = current_line + (" " if current_line != prefix else "") + word
-                        if len(test_line) <= 61:
-                            current_line = test_line
-                        else:
-                            lines.append(f"║ {current_line:<61} ║")
-                            current_line = "    " + word
+            if not summary_lines:
+                summary_lines = [""]
 
-                    if current_line:
-                        lines.append(f"║ {current_line:<61} ║")
-    else:
-        lines.append("║ No improvements found during optimization                     ║")
+            for line_index, summary_line in enumerate(summary_lines):
+                lines.append(
+                    build_row(
+                        str(candidate.iteration) if line_index == 0 else "",
+                        candidate_label[:candidate_width] if line_index == 0 else "",
+                        f"{score:.4f}" if line_index == 0 else "",
+                        delta_text if line_index == 0 else "",
+                        summary_line,
+                    )
+                )
 
-    lines.append("╚═══════════════════════════════════════════════════════════════╝")
+    lines.append(footer)
 
     # Best hypothesis details if available
     if best_candidate.hypothesis:

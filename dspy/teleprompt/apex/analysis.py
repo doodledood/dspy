@@ -6,7 +6,6 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Callable, Literal, Sequence
 
-import dspy
 from dspy.adapters import Adapter
 from dspy.clients.lm import LM
 from dspy.primitives import Prediction
@@ -21,13 +20,14 @@ from .models import (
     SuccessSummaryRecord,
     TrainExampleRecord,
 )
+from .modules import (
+    FailureAnalysisModule,
+    HypothesisGenerationModule,
+    ParetoMergeModule,
+    SuccessAnalysisModule,
+)
 from .runtime import RuntimeTools
 from .serialization import to_serializable
-from .signatures import (
-    FailureAnalysisSignature,
-    HypothesisGenerationSignature,
-    SuccessAnalysisSignature,
-)
 from .tracker import ExperimentTracker
 from .types import Verbosity
 
@@ -37,6 +37,67 @@ def _normalize_whitespace(text: str) -> str:
 
 
 Mode = Literal["failure", "success"]
+_SCORE_TOLERANCE = 1e-9
+
+
+def _prompt_map_from_candidate(candidate: CandidateRecord) -> dict[str, str]:
+    prompts: dict[str, str] = {}
+    for name, predictor in candidate.program.named_predictors():
+        prompts[name] = getattr(predictor.signature, "instructions", "")
+    return prompts
+
+
+def _summarize_prompt_changes(candidate: CandidateRecord) -> dict[str, str]:
+    if candidate.hypothesis is None or not candidate.hypothesis.prompt_changes:
+        return {}
+
+    summaries: dict[str, str] = {}
+    for predictor_name, change in candidate.hypothesis.prompt_changes.items():
+        summary_pieces = [
+            change.change_summary or "No summary provided",
+            f"magnitude={change.change_magnitude.value}",
+        ]
+        summaries[predictor_name] = " | ".join(summary_pieces)
+    return summaries
+
+
+def _summarize_candidate(candidate: CandidateRecord, label: str) -> str:
+    lines = [
+        f"{label}",
+        f"iteration={candidate.iteration}",
+        f"overall_score={candidate.overall_score:.4f}",
+    ]
+    if candidate.hypothesis is not None:
+        lines.append(f"strategy={candidate.hypothesis.strategy}")
+        if candidate.hypothesis.prompt_changes:
+            predictors = ", ".join(candidate.hypothesis.prompt_changes.keys())
+            lines.append(f"prompt_changes={predictors}")
+    return "\n".join(lines)
+
+
+def _format_per_example_notes(primary: CandidateRecord, partner: CandidateRecord) -> str:
+    max_len = max(len(primary.per_example_scores), len(partner.per_example_scores))
+    if max_len == 0:
+        return "No per-example scores available."
+
+    primary_wins = 0
+    partner_wins = 0
+    ties = 0
+    for idx in range(max_len):
+        primary_score = primary.per_example_scores[idx] if idx < len(primary.per_example_scores) else float("-inf")
+        partner_score = partner.per_example_scores[idx] if idx < len(partner.per_example_scores) else float("-inf")
+        if primary_score > partner_score + _SCORE_TOLERANCE:
+            primary_wins += 1
+        elif partner_score > primary_score + _SCORE_TOLERANCE:
+            partner_wins += 1
+        else:
+            ties += 1
+
+    return (
+        f"Primary wins {primary_wins} example(s); "
+        f"Partner wins {partner_wins} example(s); "
+        f"Ties {ties} example(s); Total compared {max_len}."
+    )
 
 
 @dataclass(frozen=True)
@@ -62,9 +123,12 @@ def _analyze_single_example(
     iteration: int | None,
     available_predictor_names: list[str] | None = None,
 ) -> Prediction | None:
-    signature_class = FailureAnalysisSignature if mode == "failure" else SuccessAnalysisSignature
-    predictor = dspy.Predict(signature_class)
-    prompt_text = getattr(predictor.signature, "instructions", "")
+    if mode == "failure":
+        analysis_module: FailureAnalysisModule | SuccessAnalysisModule = FailureAnalysisModule()
+        prompt_text = getattr(analysis_module.predictor.signature, "instructions", "")
+    else:
+        analysis_module = SuccessAnalysisModule()
+        prompt_text = getattr(analysis_module.predictor.signature, "instructions", "")
 
     example_inputs = record.example.inputs().toDict()
     example_labels = record.example.labels().toDict()
@@ -100,50 +164,19 @@ def _analyze_single_example(
         "example_index": index,
     }
 
-    validation_error: list[str] = []
-
-    def analysis_reward_fn(_, prediction: Prediction | None) -> float:
-        """Validate analysis predictor names - all logic embedded for dspy.Refine."""
-        # Capture context variables needed for validation
-        known_predictor_names = available_predictor_names
-        analysis_mode = mode
-
-        if prediction is None or known_predictor_names is None:
-            validation_error[:] = []
-            return 1.0
-
-        predictor_field = "involved_predictors" if analysis_mode == "failure" else "contributing_predictors"
-        predictors = getattr(prediction, predictor_field, []) or []
-
-        invalid_predictors = [p for p in predictors if p and p not in known_predictor_names]
-        if invalid_predictors:
-            error_message = (
-                f"Analysis returned unknown predictor(s) {invalid_predictors}. "
-                f"Valid predictors: {sorted(known_predictor_names)}"
-            )
-            validation_error[:] = [error_message]
-            return 0.0
-
-        validation_error[:] = []
-        return 1.0
-
     with tracker.span(f"apex.analysis.{mode}", inputs=span_inputs, attributes=attributes) as span:
         try:
-            with dspy.context(lm=analysis_lm, adapter=analysis_adapter):
-                if available_predictor_names:
-                    validator = dspy.Refine(
-                        module=predictor,
-                        N=3,
-                        reward_fn=analysis_reward_fn,
-                        threshold=1.0,
-                        fail_count=3,
-                    )
-                    result = validator(**call_inputs)
-                else:
-                    result = predictor(**call_inputs)
+            result = analysis_module(lm=analysis_lm, adapter=analysis_adapter, **call_inputs)
 
-            if validation_error:
-                raise ValueError(validation_error[0])
+            if available_predictor_names:
+                predictor_field = "involved_predictors" if mode == "failure" else "contributing_predictors"
+                predictors = getattr(result, predictor_field, []) or []
+                invalid_predictors = [p for p in predictors if p and p not in available_predictor_names]
+                if invalid_predictors:
+                    raise ValueError(
+                        "Analysis returned unknown predictor(s) %s. Valid predictors: %s"
+                        % (invalid_predictors, sorted(available_predictor_names))
+                    )
 
             if span and hasattr(span, "set_outputs"):
                 try:
@@ -276,11 +309,13 @@ def _run_analysis_tasks(
     return {"failure": failure_results, "success": success_results}
 
 
-def build_hypothesis_history_text(*, include_history: bool, candidate_history: Sequence[CandidateRecord] | None) -> str:
-    if not include_history:
-        return "N/A"
-
+def build_hypothesis_history_text(
+    *,
+    candidate_history: Sequence[CandidateRecord] | None,
+    selection_strategy: str,
+) -> str:
     lines: list[str] = ["Previous hypotheses evaluated (oldest first):"]
+    lines.append(f"Selection strategy in effect: {selection_strategy}")
 
     if not candidate_history:
         lines.append("- No hypotheses have been tried yet.")
@@ -299,7 +334,8 @@ def build_hypothesis_history_text(*, include_history: bool, candidate_history: S
     if baseline_candidate is not None:
         baseline_score = baseline_candidate.overall_score
         baseline_score_text = f"{baseline_score:.4f}" if baseline_score is not None else "N/A"
-        lines.append(f"- Iteration {baseline_candidate.iteration} baseline score={baseline_score_text} (best so far)")
+        best_label = "best so far" if selection_strategy == "best_on_val" else "pareto frontier candidate"
+        lines.append(f"- Iteration {baseline_candidate.iteration} baseline score={baseline_score_text} ({best_label})")
         best_so_far = baseline_score
 
     sorted_candidates = sorted(
@@ -515,6 +551,7 @@ def generate_hypotheses(
     log: Callable[[str, Verbosity], None] | None = None,
     iteration: int | None = None,
     tracker: ExperimentTracker | None = None,
+    selection_strategy: str = "best_on_val",
 ) -> list[HypothesisSpec]:
     if not failure_summaries or num_hypotheses == 0:
         log_fn = log or (lambda message, level=Verbosity.NORMAL: runtime.log(message, level))
@@ -628,94 +665,17 @@ def generate_hypotheses(
     total_examples = len(failure_summaries) + len(success_summaries)
     success_rate_percentage = (len(success_summaries) / total_examples * 100.0) if total_examples else 0.0
 
-    predictor_module = dspy.Predict(HypothesisGenerationSignature)
-    prompt_text = getattr(predictor_module.signature, "instructions", "")
-
-    validation_error: list[str] = []
-
-    def hypothesis_reward_fn(_, prediction: Prediction | None) -> float:
-        """Validate hypothesis generation - all logic embedded for dspy.Refine."""
-        # Capture context variables needed for validation
-        max_hypotheses = num_hypotheses
-        known_prompts = available_prompts
-
-        if prediction is None:
-            error_message = "APEX hypothesis generation failed: no prediction returned for validation"
-            validation_error[:] = [error_message]
-            return 0.0
-
-        hypotheses = getattr(prediction, "hypotheses", None) or []
-        num_hypotheses_generated = len(hypotheses)
-
-        # Must have 1-N hypotheses (never 0, never > N)
-        if num_hypotheses_generated == 0:
-            error_message = (
-                "APEX hypothesis generation failed: must generate at least 1 hypothesis. "
-                "Even if all issues are non-fixable via prompts, generate 1 hypothesis documenting the non-fixable issues "
-                "with empty prompt_changes."
-            )
-            validation_error[:] = [error_message]
-            return 0.0
-
-        if num_hypotheses_generated > max_hypotheses:
-            error_message = (
-                f"APEX hypothesis generation failed: generated {num_hypotheses_generated} hypotheses "
-                f"but maximum is {max_hypotheses}. Return at most {max_hypotheses} hypotheses."
-            )
-            validation_error[:] = [error_message]
-            return 0.0
-
-        # Validate each hypothesis
-        for idx, spec in enumerate(hypotheses, start=1):
-            fixable = getattr(spec, "fixable_root_causes", []) or []
-            non_fixable = getattr(spec, "non_fixable_root_causes", []) or []
-            prompt_changes = getattr(spec, "prompt_changes", {}) or {}
-
-            # Rule 1: Must have at least one root cause (fixable OR non-fixable)
-            if not fixable and not non_fixable:
-                error_message = (
-                    f"APEX hypothesis #{idx} validation failed: must have at least 1 root cause. "
-                    "Either fixable_root_causes or non_fixable_root_causes (or both) must be non-empty."
-                )
-                validation_error[:] = [error_message]
-                return 0.0
-
-            # Rule 2: Empty prompt_changes ONLY allowed when no fixable causes and some non-fixable causes
-            if not prompt_changes:
-                if fixable:
-                    error_message = (
-                        f"APEX hypothesis #{idx} validation failed: prompt_changes is empty but fixable_root_causes is not empty. "
-                        f"If there are fixable issues ({len(fixable)} found), prompt_changes must contain at least one change."
-                    )
-                    validation_error[:] = [error_message]
-                    return 0.0
-                if not non_fixable:
-                    error_message = (
-                        f"APEX hypothesis #{idx} validation failed: prompt_changes is empty but non_fixable_root_causes is also empty. "
-                        "Empty prompt_changes is only valid when documenting non-fixable issues (non_fixable_root_causes must be non-empty)."
-                    )
-                    validation_error[:] = [error_message]
-                    return 0.0
-
-            # Validate predictor names in prompt_changes
-            invalid_predictors = [name for name in prompt_changes if name not in known_prompts]
-            if invalid_predictors:
-                known_predictor_names = sorted(known_prompts.keys())
-                error_message = (
-                    f"APEX hypothesis #{idx} validation failed: unknown predictor(s) "
-                    f"{sorted(invalid_predictors)}. Known predictors: {known_predictor_names}"
-                )
-                validation_error[:] = [error_message]
-                return 0.0
-
-        # All validations passed
-        validation_error[:] = []
-        return 1.0
+    hypothesis_module = HypothesisGenerationModule()
+    prompt_text = hypothesis_module.instructions
 
     program_flow = build_program_flow_text()
-    history_text = build_hypothesis_history_text(
-        include_history=include_history,
-        candidate_history=candidate_history,
+    history_text = (
+        build_hypothesis_history_text(
+            candidate_history=candidate_history,
+            selection_strategy=selection_strategy,
+        )
+        if include_history
+        else "N/A"
     )
     best_val_text = f"{best_val_score:.4f}" if best_val_score is not None else "N/A"
 
@@ -744,55 +704,38 @@ def generate_hypotheses(
         else nullcontext(None)
     )
 
+    validated_specs: list[HypothesisSpec] = []
+
     with span_cm as span:
-        with dspy.context(lm=hypothesis_lm, adapter=hypothesis_adapter):
-            answers = getattr(hypothesis_lm, "answers", None)
-            if answers is not None and not hasattr(answers, "__deepcopy__"):
-
-                class _SharedIterator:
-                    def __init__(self, iterator):
-                        self._iterator = iterator
-
-                    def __iter__(self):
-                        return self
-
-                    def __next__(self):
-                        return next(self._iterator)
-
-                    def __deepcopy__(self, memo):
-                        return self
-
-                hypothesis_lm.answers = _SharedIterator(answers)
-
-            validator = dspy.Refine(
-                module=predictor_module,
-                N=3,
-                reward_fn=hypothesis_reward_fn,
-                threshold=1.0,
-                fail_count=3,
+        try:
+            validated_specs = hypothesis_module.generate(
+                payload=generation_payload,
+                lm=hypothesis_lm,
+                adapter=hypothesis_adapter,
+                num_hypotheses=num_hypotheses,
+                available_prompts=available_prompts,
             )
-
-            try:
-                result = validator(**generation_payload)
-            except Exception as exc:
-                if validation_error:
-                    raise ValueError(validation_error[0]) from exc
-                raise
-
-        if validation_error:
-            raise ValueError(validation_error[0])
-
-        validated_specs: list[HypothesisSpec]
-        if result is None:
-            validated_specs = []
+        except AdapterParseError as exc:  # pragma: no cover - defensive
+            runtime.log(
+                f"APEX: Hypothesis generation parse error: {str(exc)[:200]}",
+                Verbosity.DETAILED,
+                log_level="warning",
+            )
+            return []
+        except ValueError as exc:
+            runtime.log(
+                f"APEX: Hypothesis generation validation failed: {str(exc)[:200]}",
+                Verbosity.DETAILED,
+                log_level="warning",
+            )
+            raise
         else:
-            hypotheses = getattr(result, "hypotheses", None)
-            if hypotheses:
-                validated_specs = list(hypotheses)
-            else:
-                validated_specs = []
-        validated_specs.sort(key=lambda h: (h.impact_score, h.generalizability_score), reverse=True)
-        validated_specs = validated_specs[:num_hypotheses]
+            if not validated_specs:
+                log_fn(
+                    "APEX: Hypothesis LM returned no hypotheses; treating as no-op for this iteration",
+                    Verbosity.DETAILED,
+                )
+                return []
 
         if span and hasattr(span, "set_outputs"):
             try:
@@ -840,3 +783,83 @@ def generate_hypotheses(
                     )
 
     return validated_specs
+
+
+def generate_merge_hypothesis(
+    *,
+    baseline_candidate: CandidateRecord,
+    partner_candidate: CandidateRecord,
+    runtime: RuntimeTools,
+    hypothesis_lm: LM,
+    hypothesis_adapter: Adapter,
+    iteration: int | None,
+    tracker: ExperimentTracker | None,
+) -> HypothesisSpec | None:
+    """Generate a merged hypothesis combining two Pareto candidates."""
+
+    call_inputs = {
+        "primary_summary": _summarize_candidate(baseline_candidate, label="baseline"),
+        "partner_summary": _summarize_candidate(partner_candidate, label="partner"),
+        "primary_prompts": _prompt_map_from_candidate(baseline_candidate),
+        "partner_prompts": _prompt_map_from_candidate(partner_candidate),
+        "primary_prompt_changes": _summarize_prompt_changes(baseline_candidate),
+        "partner_prompt_changes": _summarize_prompt_changes(partner_candidate),
+        "per_example_notes": _format_per_example_notes(baseline_candidate, partner_candidate),
+    }
+
+    attributes = {
+        "iteration": iteration if iteration is not None else -1,
+        "baseline_iteration": baseline_candidate.iteration,
+        "partner_iteration": partner_candidate.iteration,
+    }
+
+    merge_inputs = to_serializable(call_inputs)
+    merge_module = ParetoMergeModule()
+
+    span_cm = (
+        tracker.span("apex.merge_hypothesis", inputs=merge_inputs, attributes=attributes)
+        if tracker is not None
+        else nullcontext(None)
+    )
+
+    with span_cm as span:
+        try:
+            hypothesis = merge_module.merge(
+                inputs=call_inputs,
+                lm=hypothesis_lm,
+                adapter=hypothesis_adapter,
+            )
+        except AdapterParseError as exc:  # pragma: no cover - defensive
+            runtime.log(
+                f"APEX: Merge hypothesis generation parse error: {str(exc)[:200]}",
+                Verbosity.DETAILED,
+                log_level="warning",
+            )
+            return None
+        except Exception as exc:  # pragma: no cover - defensive
+            runtime.log(
+                f"APEX: Merge hypothesis generation failed: {str(exc)[:200]}",
+                Verbosity.DETAILED,
+                log_level="warning",
+            )
+            return None
+
+        if hypothesis is None:
+            runtime.log(
+                "APEX: Merge hypothesis generation produced no prompt changes; skipping merge candidate.",
+                Verbosity.DETAILED,
+                log_level="warning",
+            )
+            return None
+
+        if span and hasattr(span, "set_outputs"):
+            try:
+                span.set_outputs({"hypothesis": to_serializable(hypothesis)})
+            except Exception:  # pragma: no cover - defensive
+                pass
+
+        runtime.log(
+            "APEX: Generated Pareto merge hypothesis blending baseline and partner candidates",
+            Verbosity.DETAILED,
+        )
+        return hypothesis

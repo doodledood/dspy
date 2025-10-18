@@ -13,7 +13,18 @@ from dspy.primitives import Example, Module, Prediction
 from dspy.teleprompt.teleprompt import Teleprompter
 
 from . import tracking_utils
-from .analysis import _log_analysis_results, analyze_record, build_hypothesis_history_text, generate_hypotheses
+from .analysis import (
+    _log_analysis_results,
+    analyze_record,
+    generate_hypotheses,
+    generate_merge_hypothesis,
+)
+from .candidate_selection import (
+    CandidateSelectionStrategy,
+    SelectionResult,
+    draw_weighted_candidate,
+    select_baseline_candidate,
+)
 from .checkpoint_manager import CheckpointManager
 from .evaluation import EvaluationEngine
 from .execution_flow import (
@@ -98,6 +109,13 @@ class APEX(Teleprompter):
             resume=True)``.
         include_hypothesis_history: Whether hypothesis generation prompts are
             augmented with a summary of previously tested changes.
+        candidate_selection: Strategy for choosing the iteration baseline
+            candidate.  ``"best_on_val"`` picks the highest validation score,
+            while ``"pareto"`` samples from the Pareto frontier using per-example
+            win weights.
+        pareto_merge_probability: Probability (0-1) of sampling an additional
+            Pareto merge hypothesis each iteration. Only applies when
+            ``candidate_selection="pareto"``.
         use_mlflow: Enables MLflow tracking of iterations, candidates, and
             scores via :class:`ExperimentTracker`.
         mlflow_tracking_uri: Optional MLflow tracking URI forwarded to the
@@ -127,6 +145,8 @@ class APEX(Teleprompter):
         seed: int | None = None,
         checkpoint_dir: str | Path | None = None,
         include_hypothesis_history: bool = True,
+        candidate_selection: CandidateSelectionStrategy = "best_on_val",
+        pareto_merge_probability: float = 0.0,
         use_mlflow: bool = False,
         mlflow_tracking_uri: str | None = "http://127.0.0.1:5000",
         mlflow_experiment_name: str | None = "APEX",
@@ -143,6 +163,10 @@ class APEX(Teleprompter):
             raise ValueError("num_eval_runs must be > 0.")
         if min_metric > max_metric:
             raise ValueError("min_metric cannot exceed max_metric.")
+        if candidate_selection not in {"best_on_val", "pareto"}:
+            raise ValueError("candidate_selection must be 'best_on_val' or 'pareto'.")
+        if not 0.0 <= pareto_merge_probability <= 1.0:
+            raise ValueError("pareto_merge_probability must be between 0.0 and 1.0.")
 
         self.metric = metric
         self.analysis_lm = analysis_lm
@@ -167,6 +191,8 @@ class APEX(Teleprompter):
         self.seed = seed if seed is not None else random.randint(1, 1_000_000)
         self._rng = random.Random(self.seed)
         self.include_hypothesis_history = include_hypothesis_history
+        self.candidate_selection: CandidateSelectionStrategy = candidate_selection
+        self.pareto_merge_probability = float(pareto_merge_probability)
 
         self.runtime = RuntimeTools(verbosity=self.verbosity, num_threads=self.num_threads, logger=logger)
         self.checkpoints = CheckpointManager(checkpoint_dir, runtime=self.runtime)
@@ -222,14 +248,29 @@ class APEX(Teleprompter):
     def _format_execution_flow_with_details(self, execution_flow: list[ExecutionFlowEntry]) -> str:
         return format_execution_flow_with_details(execution_flow)
 
-    def _build_hypothesis_history_text(
+    def _initialize_iteration_baseline(
         self,
-        candidate_history: Sequence[CandidateRecord] | None,
-    ) -> str:
-        return build_hypothesis_history_text(
-            include_history=self.include_hypothesis_history,
-            candidate_history=candidate_history,
+        state: OptimizationState,
+    ) -> tuple[CandidateRecord | None, SelectionResult | None]:
+        if self.candidate_selection != "pareto":
+            return None, None
+
+        selection = select_baseline_candidate(
+            candidates=state.all_candidates,
+            strategy="pareto",
+            rng=self._rng,
         )
+        baseline_record = selection.baseline
+        state.prev_iteration_best = baseline_record
+        state.current_program = baseline_record.program.deepcopy()
+        if self._is_enabled(Verbosity.DETAILED):
+            frontier_note = f", frontier_size={len(selection.frontier)}"
+            self._log(
+                "APEX: Pareto baseline selected (iteration="
+                f"{baseline_record.iteration}, score={baseline_record.overall_score:.4f}{frontier_note})",
+                Verbosity.DETAILED,
+            )
+        return baseline_record, selection
 
     def _build_checkpoint_config(self) -> CheckpointConfig:
         return CheckpointConfig(
@@ -242,6 +283,8 @@ class APEX(Teleprompter):
             max_metric=self.max_metric,
             convergence_patience=self.convergence_patience,
             seed=self.seed,
+            candidate_selection=self.candidate_selection,
+            pareto_merge_probability=self.pareto_merge_probability,
         )
 
     def _evaluate_candidates(
@@ -352,6 +395,8 @@ class APEX(Teleprompter):
                         "success_threshold": self.success_threshold,
                         "convergence_patience": self.convergence_patience,
                         "seed": self.seed,
+                        "candidate_selection": self.candidate_selection,
+                        "pareto_merge_probability": self.pareto_merge_probability,
                         "train_size": len(trainset),
                         "val_size": len(valset),
                         "verbosity": str(self.verbosity),
@@ -363,6 +408,21 @@ class APEX(Teleprompter):
 
             if checkpoint:
                 state = OptimizationState.from_checkpoint(checkpoint)
+                checkpoint_config = checkpoint.config
+                if getattr(checkpoint_config, "candidate_selection", None) is not None:
+                    if checkpoint_config.candidate_selection != self.candidate_selection:
+                        self._log(
+                            "APEX: Overriding candidate_selection with checkpoint configuration.",
+                            Verbosity.DETAILED,
+                        )
+                    self.candidate_selection = checkpoint_config.candidate_selection  # type: ignore[assignment]
+                if getattr(checkpoint_config, "pareto_merge_probability", None) is not None:
+                    if checkpoint_config.pareto_merge_probability != self.pareto_merge_probability:
+                        self._log(
+                            "APEX: Overriding pareto_merge_probability with checkpoint configuration.",
+                            Verbosity.DETAILED,
+                        )
+                    self.pareto_merge_probability = checkpoint_config.pareto_merge_probability
                 self._rng.setstate(checkpoint.rng_state)
                 self._log(
                     f"APEX: Resuming from iteration {state.iteration}",
@@ -436,6 +496,8 @@ class APEX(Teleprompter):
             sampled_train: list[Example] = []
             hypotheses = []
             iteration_candidates: list[CandidateRecord] | None = None
+            selection_result: SelectionResult | None = None
+            pareto_baseline: CandidateRecord | None = None
 
             try:
                 while True:
@@ -449,6 +511,8 @@ class APEX(Teleprompter):
                             Verbosity.NORMAL,
                         )
                         break
+
+                    pareto_baseline, selection_result = self._initialize_iteration_baseline(state)
 
                     sampler = self.train_sample if self.train_sample is not None else len(trainset)
                     sampled_train = sample_trainset(
@@ -502,7 +566,7 @@ class APEX(Teleprompter):
                                 log=self._log,
                                 iteration=current_iteration,
                                 example_index=example_idx,
-                                available_predictor_names=predictor_names,
+                                available_predictor_names=None,
                             )
                             return record, None, success_summary
 
@@ -550,8 +614,26 @@ class APEX(Teleprompter):
                         if failure_summary is not None:
                             failure_summaries.append(failure_summary)
 
-                    if not failure_summaries:
-                        success_summaries = []
+                    if not failures and successes and not success_summaries:
+                        for idx, record in enumerate(successes):
+                            summary = analyze_record(
+                                record,
+                                mode="success",
+                                analysis_lm=self.analysis_lm,
+                                analysis_adapter=self.analysis_adapter,
+                                runtime=self.runtime,
+                                tracker=self.tracker,
+                                success_threshold=self.success_threshold,
+                                min_metric=self.min_metric,
+                                max_metric=self.max_metric,
+                                format_execution_flow=format_execution_flow_with_details,
+                                log=self._log,
+                                iteration=iteration,
+                                example_index=idx,
+                                available_predictor_names=None,
+                            )
+                            if summary is not None:
+                                success_summaries.append(summary)
 
                     _log_analysis_results("failure", failure_summaries, self._log, self.runtime)
                     _log_analysis_results("success", success_summaries, self._log, self.runtime)
@@ -620,6 +702,7 @@ class APEX(Teleprompter):
                         log=self._log,
                         iteration=iteration,
                         tracker=self.tracker,
+                        selection_strategy=self.candidate_selection,
                     )
                     self._log(
                         f"APEX: Generated {len(hypotheses)} hypothesis{'es' if len(hypotheses) != 1 else ''} for iteration {iteration}",
@@ -640,6 +723,46 @@ class APEX(Teleprompter):
                             "APEX: Detailed hypothesis info follows...",
                             Verbosity.DETAILED,
                         )
+
+                    if (
+                        self.candidate_selection == "pareto"
+                        and selection_result is not None
+                        and len(selection_result.frontier) > 1
+                        and self.pareto_merge_probability > 0.0
+                    ):
+                        merge_roll = self._rng.random()
+                        if merge_roll < self.pareto_merge_probability:
+                            try:
+                                partner_candidate = draw_weighted_candidate(
+                                    selection_result.frontier,
+                                    selection_result.weights,
+                                    rng=self._rng,
+                                    exclude=[pareto_baseline] if pareto_baseline is not None else None,
+                                )
+                            except ValueError:
+                                partner_candidate = None
+
+                            if partner_candidate is not None and pareto_baseline is not None:
+                                merge_hypothesis = generate_merge_hypothesis(
+                                    baseline_candidate=pareto_baseline,
+                                    partner_candidate=partner_candidate,
+                                    runtime=self.runtime,
+                                    hypothesis_lm=self.hypothesis_lm,
+                                    hypothesis_adapter=self.hypothesis_adapter,
+                                    iteration=iteration,
+                                    tracker=self.tracker,
+                                )
+                                if merge_hypothesis is not None:
+                                    hypotheses.append(merge_hypothesis)
+                                    self._log(
+                                        "APEX: Added Pareto merge hypothesis to evaluation batch",
+                                        Verbosity.DETAILED,
+                                    )
+                            else:
+                                self._log(
+                                    "APEX: Skipped Pareto merge hypothesis (no suitable partner candidate found)",
+                                    Verbosity.DETAILED,
+                                )
 
                     iteration_candidates = self.evaluator.evaluate_candidates(
                         baseline=state.current_program,
@@ -823,6 +946,10 @@ class APEX(Teleprompter):
                 iterations=state.iteration_logs,
                 best_candidate=state.best_candidate,
                 initial_score=state.initial_baseline.overall_score,
+                selection_strategy=self.candidate_selection,
+                pareto_merge_probability=(
+                    self.pareto_merge_probability if self.candidate_selection == "pareto" else None
+                ),
             )
             print(summary_table)
 

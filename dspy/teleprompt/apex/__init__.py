@@ -1,6 +1,11 @@
 """APEX optimizer package."""
 
 from dspy.teleprompt.apex.apex import APEX
+from dspy.teleprompt.apex.candidate_selection import (
+    CandidateSelectionStrategy,
+    SelectionResult,
+    select_baseline_candidate,
+)
 from dspy.teleprompt.apex.models import (
     ApexCheckpoint,
     ApexIterationLog,
@@ -17,6 +22,7 @@ from dspy.teleprompt.apex.models import (
 from dspy.teleprompt.apex.signatures import (
     FailureAnalysisSignature,
     HypothesisGenerationSignature,
+    ParetoMergeSignature,
     SuccessAnalysisSignature,
 )
 from dspy.teleprompt.apex.tracker import ExperimentTracker
@@ -35,6 +41,7 @@ __all__ = [
     "ApexCheckpoint",
     "ApexIterationLog",
     "ApexOptimizationResult",
+    "CandidateSelectionStrategy",
     "CandidateRecord",
     "ChangeMagnitude",
     "CheckpointConfig",
@@ -42,6 +49,7 @@ __all__ = [
     "ExperimentTracker",
     "FailureAnalysisSignature",
     "HypothesisGenerationSignature",
+    "ParetoMergeSignature",
     "HypothesisSpec",
     "ItemT",
     "LogLevel",
@@ -49,6 +57,8 @@ __all__ = [
     "ProgramSnapshot",
     "PromptChange",
     "SamplerFn",
+    "SelectionResult",
+    "select_baseline_candidate",
     "SuccessAnalysisSignature",
     "TraceEntry",
     "TrainExampleRecord",
