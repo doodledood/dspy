@@ -41,7 +41,7 @@ class CheckpointManager:
         all_candidates: list[CandidateRecord],
         iteration_logs: list[ApexIterationLog],
         no_improvement_count: int,
-        baseline_candidate: CandidateRecord,
+        iteration_baseline: CandidateRecord,
         rng_state,
         config: CheckpointConfig,
     ) -> None:
@@ -55,7 +55,7 @@ class CheckpointManager:
             all_candidates=all_candidates,
             iteration_logs=iteration_logs,
             no_improvement_count=no_improvement_count,
-            baseline_candidate=baseline_candidate,
+            iteration_baseline=iteration_baseline,
             rng_state=rng_state,
             config=config,
         )

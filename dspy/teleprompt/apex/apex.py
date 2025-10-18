@@ -407,13 +407,13 @@ class APEX(Teleprompter):
                     baseline=baseline_candidate,
                 )
                 self._log(
-                    f"APEX: Initial baseline score={state.baseline_candidate.overall_score:.4f}",
+                    f"APEX: Initial baseline score={state.iteration_baseline.overall_score:.4f}",
                     Verbosity.NORMAL,
                 )
 
                 if self.tracker.is_active():
                     baseline_metrics = tracking_utils.format_baseline_metrics(
-                        baseline_score=state.baseline_candidate.overall_score,
+                        baseline_score=state.iteration_baseline.overall_score,
                         num_train=len(trainset),
                         num_val=len(valset),
                     )
@@ -426,7 +426,7 @@ class APEX(Teleprompter):
                     all_candidates=state.all_candidates,
                     iteration_logs=state.iteration_logs,
                     no_improvement_count=state.no_improvement_count,
-                    baseline_candidate=state.baseline_candidate,
+                    iteration_baseline=state.iteration_baseline,
                     rng_state=self._rng.getstate(),
                     config=self._build_checkpoint_config(),
                 )
@@ -588,7 +588,7 @@ class APEX(Teleprompter):
                             all_candidates=state.all_candidates,
                             iteration_logs=state.iteration_logs,
                             no_improvement_count=state.no_improvement_count,
-                            baseline_candidate=state.baseline_candidate,
+                            iteration_baseline=state.iteration_baseline,
                             rng_state=self._rng.getstate(),
                             config=self._build_checkpoint_config(),
                         )
@@ -642,7 +642,7 @@ class APEX(Teleprompter):
                         hypotheses=hypotheses,
                         calset=valset,
                         iteration=iteration,
-                        cached_baseline=state.current_baseline_candidate,
+                        cached_baseline=state.prev_iteration_best,
                     )
 
                     best_candidate_for_iteration = self.evaluator.select_best_candidate(iteration_candidates)
@@ -703,7 +703,7 @@ class APEX(Teleprompter):
                                     )
                                     self._log(preview, Verbosity.DETAILED)
 
-                    state.baseline_candidate = iteration_candidates[0]
+                    state.iteration_baseline = iteration_candidates[0]
                     self._log(
                         f"APEX: Iteration {iteration} best score: {best_candidate_for_iteration.overall_score:.4f}",
                         Verbosity.NORMAL,
@@ -711,16 +711,16 @@ class APEX(Teleprompter):
 
                     if self._is_enabled(Verbosity.DETAILED):
                         score_improvements = [
-                            candidate.overall_score - state.baseline_candidate.overall_score
+                            candidate.overall_score - state.iteration_baseline.overall_score
                             for candidate in iteration_candidates[1:]
                         ]
                         if score_improvements:
                             self._log(
-                                f"APEX: Score improvements from baseline: {score_improvements}",
+                                f"APEX: Score improvements from iteration baseline: {score_improvements}",
                                 Verbosity.DETAILED,
                             )
 
-                    if best_candidate_for_iteration is state.baseline_candidate:
+                    if best_candidate_for_iteration is state.iteration_baseline:
                         state.no_improvement_count += 1
                         if self.convergence_patience is not None:
                             self._log(
@@ -748,7 +748,7 @@ class APEX(Teleprompter):
                             Verbosity.DETAILED,
                         )
 
-                    state.current_baseline_candidate = best_candidate_for_iteration
+                    state.prev_iteration_best = best_candidate_for_iteration
 
                     self.checkpoints.save(
                         iteration=iteration,
@@ -757,7 +757,7 @@ class APEX(Teleprompter):
                         all_candidates=state.all_candidates,
                         iteration_logs=state.iteration_logs,
                         no_improvement_count=state.no_improvement_count,
-                        baseline_candidate=state.baseline_candidate,
+                        iteration_baseline=state.iteration_baseline,
                         rng_state=self._rng.getstate(),
                         config=self._build_checkpoint_config(),
                     )
@@ -782,7 +782,7 @@ class APEX(Teleprompter):
                     )
 
                 if self.checkpoints.enabled:
-                    baseline_for_checkpoint = state.baseline_candidate or state.best_candidate
+                    baseline_for_checkpoint = state.iteration_baseline or state.best_candidate
                     self.checkpoints.save(
                         iteration=state.iteration,
                         current_program=state.current_program,
@@ -790,7 +790,7 @@ class APEX(Teleprompter):
                         all_candidates=state.all_candidates,
                         iteration_logs=state.iteration_logs,
                         no_improvement_count=state.no_improvement_count,
-                        baseline_candidate=baseline_for_checkpoint,
+                        iteration_baseline=baseline_for_checkpoint,
                         rng_state=self._rng.getstate(),
                         config=self._build_checkpoint_config(),
                     )

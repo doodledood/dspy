@@ -19,13 +19,13 @@ class OptimizationState:
 
     iteration: int
     current_program: Module
-    baseline_candidate: CandidateRecord
-    current_baseline_candidate: CandidateRecord
-    best_candidate: CandidateRecord
+    iteration_baseline: CandidateRecord  # First candidate (unmodified program) from current iteration
+    prev_iteration_best: CandidateRecord  # Best candidate from previous iteration (for evaluation caching)
+    best_candidate: CandidateRecord  # Global best candidate across all iterations
     all_candidates: list[CandidateRecord]
     iteration_logs: list[ApexIterationLog]
     no_improvement_count: int
-    initial_baseline: CandidateRecord
+    initial_baseline: CandidateRecord  # Very first evaluation (iteration 0)
     stop_reason: str = ""
 
     @classmethod
@@ -33,8 +33,8 @@ class OptimizationState:
         return cls(
             iteration=0,
             current_program=program,
-            baseline_candidate=baseline,
-            current_baseline_candidate=baseline,
+            iteration_baseline=baseline,
+            prev_iteration_best=baseline,
             best_candidate=baseline,
             all_candidates=[baseline],
             iteration_logs=[],
@@ -44,12 +44,12 @@ class OptimizationState:
 
     @classmethod
     def from_checkpoint(cls, checkpoint: ApexCheckpoint) -> OptimizationState:
-        initial = checkpoint.all_candidates[0] if checkpoint.all_candidates else checkpoint.baseline_candidate
+        initial = checkpoint.all_candidates[0] if checkpoint.all_candidates else checkpoint.iteration_baseline
         return cls(
             iteration=checkpoint.iteration,
             current_program=checkpoint.current_program,
-            baseline_candidate=checkpoint.baseline_candidate,
-            current_baseline_candidate=checkpoint.baseline_candidate,
+            iteration_baseline=checkpoint.iteration_baseline,
+            prev_iteration_best=checkpoint.iteration_baseline,
             best_candidate=checkpoint.best_candidate,
             all_candidates=list(checkpoint.all_candidates),
             iteration_logs=list(checkpoint.iteration_logs),

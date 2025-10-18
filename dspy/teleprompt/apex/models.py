@@ -186,7 +186,7 @@ class ApexCheckpoint(BaseModel):
     all_candidates: list[CandidateRecord]
     iteration_logs: list[ApexIterationLog]
     no_improvement_count: int
-    baseline_candidate: CandidateRecord
+    iteration_baseline: CandidateRecord  # First candidate (unmodified program) from current iteration
     rng_state: Any
     config: CheckpointConfig
 

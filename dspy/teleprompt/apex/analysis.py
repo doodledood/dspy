@@ -10,6 +10,7 @@ import dspy
 from dspy.adapters import Adapter
 from dspy.clients.lm import LM
 from dspy.primitives import Prediction
+from dspy.utils.exceptions import AdapterParseError
 
 from .models import (
     CandidateRecord,
@@ -29,7 +30,6 @@ from .signatures import (
 )
 from .tracker import ExperimentTracker
 from .types import Verbosity
-from dspy.utils.exceptions import AdapterParseError
 
 
 def _normalize_whitespace(text: str) -> str:
