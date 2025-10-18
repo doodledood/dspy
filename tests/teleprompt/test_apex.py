@@ -1,5 +1,6 @@
 import random
 import warnings
+from collections import deque
 from contextlib import contextmanager
 from typing import Any
 from unittest.mock import MagicMock, call, patch
@@ -10,6 +11,9 @@ from litellm.types.utils import Choices, Delta, Message, ModelResponseStream, St
 import dspy
 import dspy.teleprompt.apex.runtime as runtime_module
 from dspy import Example
+from dspy.adapters import JSONAdapter
+from dspy.adapters.chat_adapter import FieldInfoWithName
+from dspy.signatures.field import OutputField
 from dspy.teleprompt.apex import (
     APEX,
     CandidateRecord,
@@ -65,6 +69,47 @@ def make_hypothesis_response(prompt_value: str = "good") -> dict:
             }
         ]
     }
+
+
+class RoutedAnalysisLM(DummyLM):
+    def __init__(self, *, failures: list[dict[str, Any]], successes: list[dict[str, Any]]):
+        super().__init__(answers=[], adapter=JSONAdapter())
+        self._failures = deque(failures or [make_analysis_response("default failure")])
+        self._successes = deque(successes or [make_success_response("default success")])
+
+    def _format(self, payload: dict[str, Any]) -> str:
+        fields_with_values = {
+            FieldInfoWithName(name=field_name, info=OutputField()): value for field_name, value in payload.items()
+        }
+        try:
+            return self.adapter.format_field_with_value(fields_with_values, role="assistant")
+        except TypeError:
+            return self.adapter.format_field_with_value(fields_with_values)
+
+    def __call__(self, prompt=None, messages=None, **kwargs):  # type: ignore[override]
+        messages = messages or [{"role": "user", "content": prompt}]
+        kwargs = {**self.kwargs, **kwargs}
+        content = messages[-1]["content"].lower()
+        is_failure = "error" in content
+        if is_failure:
+            payload = self._failures.popleft() if self._failures else make_analysis_response("default failure")
+        else:
+            payload = self._successes.popleft() if self._successes else make_success_response("default success")
+
+        formatted = self._format(payload)
+        entry = {"prompt": prompt, "messages": messages, "kwargs": kwargs, "outputs": [formatted], "usage": 0, "cost": 0}
+        self.update_history(entry)
+        return [formatted]
+
+
+def make_routed_analysis_lm(*, failures: list[dict[str, Any]] | None = None, successes: list[dict[str, Any]] | None = None) -> RoutedAnalysisLM:
+    return RoutedAnalysisLM(failures=failures or [], successes=successes or [])
+
+
+def make_routed_analysis_lm_from_sequence(responses: list[dict[str, Any]]) -> RoutedAnalysisLM:
+    failures = [resp for resp in responses if "potential_root_causes" in resp]
+    successes = [resp for resp in responses if "potential_success_patterns" in resp]
+    return make_routed_analysis_lm(failures=failures, successes=successes)
 
 
 def test_apex_serialization_suppresses_pydantic_warnings():
@@ -296,7 +341,7 @@ def test_generate_hypotheses_traces_include_full_context():
     ],
 )
 def test_apex_constructor_validation(kwargs, error_match):
-    analysis_lm = DummyLM([], adapter=dspy.JSONAdapter())
+    analysis_lm = make_routed_analysis_lm(successes=[make_success_response("only_success")])
 
     with pytest.raises(ValueError, match=error_match):
         params = {
@@ -812,12 +857,10 @@ def test_apex_handles_fewer_successes_than_failures():
     ]
     calset = trainset
 
-    analysis_payloads = [
-        make_analysis_response("mixed failure 1"),
-        make_analysis_response("mixed failure 2"),
-        make_success_response("success pattern"),
-    ]
-    analysis_lm = DummyLM(analysis_payloads, adapter=dspy.JSONAdapter())
+    analysis_lm = make_routed_analysis_lm(
+        failures=[make_analysis_response("mixed failure 1"), make_analysis_response("mixed failure 2")],
+        successes=[make_success_response("success pattern")],
+    )
     hypothesis_lm = DummyLM([make_hypothesis_response()], adapter=dspy.JSONAdapter())
 
     optimizer = APEX(
@@ -834,13 +877,49 @@ def test_apex_handles_fewer_successes_than_failures():
     student = PromptDrivenModule(initial_prompt="bad")
     optimized = optimizer.compile(student, trainset=trainset, valset=calset)
 
-    # Ensures we analyzed all failures plus the single available success (no duplication).
-    assert len(analysis_lm.history) == len(analysis_payloads)
+    iteration_count = len(optimized.apex_result.iterations)
+    # Each iteration should analyze every training example exactly once.
+    assert len(analysis_lm.history) == len(trainset) * iteration_count
     assert optimized.apex_result.best_candidate.overall_score >= 1.0
 
 
-def test_apex_skips_success_analysis_without_failures():
-    analysis_lm = DummyLM([], adapter=dspy.JSONAdapter())
+def test_apex_first_iteration_hypothesis_beats_baseline():
+    analysis_lm = make_routed_analysis_lm(failures=[make_analysis_response("baseline mismatch")])
+    hypothesis_lm = DummyLM([make_hypothesis_response("good")], adapter=dspy.JSONAdapter())
+
+    optimizer = APEX(
+        metric=metric,
+        analysis_lm=analysis_lm,
+        hypothesis_lm=hypothesis_lm,
+        max_iterations=1,
+        num_hypotheses=1,
+        convergence_patience=1,
+        seed=5,
+        verbosity="silent",
+    )
+
+    student = PromptDrivenModule(initial_prompt="bad")
+    trainset = [make_train_example("needs_fix")]
+    optimized = optimizer.compile(student, trainset=trainset, valset=trainset)
+
+    iteration = optimized.apex_result.iterations[0]
+    assert len(iteration.candidates) == 2
+
+    baseline_candidate, hypothesis_candidate = iteration.candidates
+    assert baseline_candidate.hypothesis is None
+    assert hypothesis_candidate.hypothesis is iteration.hypotheses[0]
+
+    assert pytest.approx(baseline_candidate.overall_score, rel=0.0, abs=1e-9) == 0.0
+    assert pytest.approx(hypothesis_candidate.overall_score, rel=0.0, abs=1e-9) == 1.0
+
+    assert baseline_candidate.program is not hypothesis_candidate.program
+    change = iteration.hypotheses[0].prompt_changes["predictor"]
+    assert change.new_prompt == "good"
+    assert optimized.apex_result.best_candidate.overall_score == pytest.approx(1.0, rel=0.0, abs=1e-9)
+
+
+def test_apex_analyzes_success_without_failures():
+    analysis_lm = make_routed_analysis_lm(successes=[make_success_response("solo success pattern")])
     hypothesis_lm = DummyLM([], adapter=dspy.JSONAdapter())
 
     optimizer = APEX(
@@ -858,7 +937,8 @@ def test_apex_skips_success_analysis_without_failures():
     trainset = [make_train_example("already_good")]
     optimizer.compile(student, trainset=trainset, valset=trainset)
 
-    assert len(analysis_lm.history) == 0
+    assert len(analysis_lm.history) == len(trainset)
+    assert "potential_success_patterns" in analysis_lm.history[0]["outputs"][0]
 
 
 def test_apex_runs_success_analysis_after_failures_present():
@@ -867,12 +947,9 @@ def test_apex_runs_success_analysis_after_failures_present():
             return 1.0
         return 1.0 if prediction.output == "good" else 0.0
 
-    analysis_lm = DummyLM(
-        [
-            make_analysis_response("failure discovered"),
-            make_success_response("early success preserved"),
-        ],
-        adapter=dspy.JSONAdapter(),
+    analysis_lm = make_routed_analysis_lm(
+        failures=[make_analysis_response("failure discovered")],
+        successes=[make_success_response("early success preserved")],
     )
     hypothesis_lm = DummyLM([make_hypothesis_response()], adapter=dspy.JSONAdapter())
 
@@ -894,11 +971,10 @@ def test_apex_runs_success_analysis_after_failures_present():
     ]
     optimizer.compile(student, trainset=trainset, valset=trainset)
 
-    assert len(analysis_lm.history) == 2
-    first_output = analysis_lm.history[0]["outputs"][0]
-    second_output = analysis_lm.history[1]["outputs"][0]
-    assert "potential_root_causes" in first_output
-    assert "potential_success_patterns" in second_output
+    outputs = [entry["outputs"][0] for entry in analysis_lm.history]
+    assert len(outputs) == len(trainset)
+    assert sum("potential_root_causes" in output for output in outputs) == 1
+    assert sum("potential_success_patterns" in output for output in outputs) == 1
 
 
 def test_apex_end_to_end_fake_data():
@@ -914,14 +990,14 @@ def test_apex_end_to_end_fake_data():
     ]
 
     analysis_responses = [
+        make_success_response("baseline prompt handles sample_success"),
         make_analysis_response("fix format for fix_a"),
         make_analysis_response("fix format for fix_b"),
-        make_success_response("baseline prompt handles sample_success"),
         make_analysis_response("baseline prompt now mismatched"),
         make_success_response("good prompt stable"),
         make_success_response("good prompt handles remaining cases"),
     ]
-    analysis_lm = DummyLM(analysis_responses, adapter=dspy.JSONAdapter())
+    analysis_lm = make_routed_analysis_lm_from_sequence(analysis_responses)
     hypothesis_lm = DummyLM(
         [
             make_hypothesis_response("good"),
