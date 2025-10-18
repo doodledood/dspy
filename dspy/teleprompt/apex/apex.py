@@ -599,7 +599,7 @@ class APEX(Teleprompter):
                         hypotheses=hypotheses,
                         calset=valset,
                         iteration=iteration,
-                        cached_baseline=state.current_baseline_candidate if iteration > 1 else None,
+                        cached_baseline=state.current_baseline_candidate,
                     )
 
                     best_candidate_for_iteration = self.evaluator.select_best_candidate(iteration_candidates)
