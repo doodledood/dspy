@@ -795,7 +795,7 @@ def generate_merge_hypothesis(
     iteration: int | None,
     tracker: ExperimentTracker | None,
 ) -> HypothesisSpec | None:
-    """Generate a merged hypothesis combining two Pareto candidates."""
+    """Generate a merged hypothesis combining two Pareto candidates from the frontier."""
 
     call_inputs = {
         "primary_summary": _summarize_candidate(baseline_candidate, label="baseline"),

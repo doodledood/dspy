@@ -156,7 +156,7 @@ class HypothesisGenerationModule(Module):
 
 
 class ParetoMergeModule(Module):
-    """Generates merge hypotheses that blend two Pareto candidates."""
+    """Generates merge hypotheses that blend two Pareto candidates from the frontier."""
 
     def __init__(self, *, attempts: int = 3) -> None:
         super().__init__()

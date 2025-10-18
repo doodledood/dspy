@@ -4,6 +4,7 @@ from dspy.teleprompt.apex.apex import APEX
 from dspy.teleprompt.apex.candidate_selection import (
     CandidateSelectionStrategy,
     SelectionResult,
+    deduplicate_candidates,
     select_baseline_candidate,
 )
 from dspy.teleprompt.apex.models import (
@@ -57,6 +58,7 @@ __all__ = [
     "ProgramSnapshot",
     "PromptChange",
     "SamplerFn",
+    "deduplicate_candidates",
     "SelectionResult",
     "select_baseline_candidate",
     "SuccessAnalysisSignature",
