@@ -785,7 +785,7 @@ def generate_hypotheses(
     return validated_specs
 
 
-def generate_merge_hypothesis(
+def generate_merge_hypotheses(
     *,
     baseline_candidate: CandidateRecord,
     partner_candidate: CandidateRecord,
@@ -794,8 +794,8 @@ def generate_merge_hypothesis(
     hypothesis_adapter: Adapter,
     iteration: int | None,
     tracker: ExperimentTracker | None,
-) -> HypothesisSpec | None:
-    """Generate a merged hypothesis combining two Pareto candidates from the frontier."""
+) -> list[HypothesisSpec]:
+    """Generate paired merged hypotheses combining two Pareto candidates from the frontier."""
 
     call_inputs = {
         "primary_summary": _summarize_candidate(baseline_candidate, label="baseline"),
@@ -824,7 +824,7 @@ def generate_merge_hypothesis(
 
     with span_cm as span:
         try:
-            hypothesis = merge_module.merge(
+            hypotheses = merge_module.merge(
                 inputs=call_inputs,
                 lm=hypothesis_lm,
                 adapter=hypothesis_adapter,
@@ -835,31 +835,34 @@ def generate_merge_hypothesis(
                 Verbosity.DETAILED,
                 log_level="warning",
             )
-            return None
+            return []
         except Exception as exc:  # pragma: no cover - defensive
             runtime.log(
                 f"APEX: Merge hypothesis generation failed: {str(exc)[:200]}",
                 Verbosity.DETAILED,
                 log_level="warning",
             )
-            return None
+            return []
 
-        if hypothesis is None:
+        if len(hypotheses) != 2:
             runtime.log(
-                "APEX: Merge hypothesis generation produced no prompt changes; skipping merge candidate.",
+                "APEX: Merge hypothesis generation produced insufficient prompt changes; skipping merge candidates.",
                 Verbosity.DETAILED,
                 log_level="warning",
             )
-            return None
+            return []
 
         if span and hasattr(span, "set_outputs"):
             try:
-                span.set_outputs({"hypothesis": to_serializable(hypothesis)})
+                span.set_outputs({
+                    "primary_hypothesis": to_serializable(hypotheses[0]),
+                    "partner_hypothesis": to_serializable(hypotheses[1]),
+                })
             except Exception:  # pragma: no cover - defensive
                 pass
 
         runtime.log(
-            "APEX: Generated Pareto merge hypothesis blending baseline and partner candidates",
+            "APEX: Generated Pareto merge hypotheses blending baseline and partner candidates",
             Verbosity.DETAILED,
         )
-        return hypothesis
+        return hypotheses

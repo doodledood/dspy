@@ -1078,10 +1078,10 @@ class ParetoMergeSignature(Signature):
 
     ## Mission
 
-    Blend the strongest instructions from both candidates into a single refined hypothesis that:
-    - Preserves the high-scoring behaviours each candidate achieved on their winning validation examples
-    - Avoids reintroducing known failure patterns
-    - Minimizes edits by reusing unchanged prompts when possible
+    Produce *two* refined hypotheses – one anchored on the primary candidate and one on the partner – that:
+    - Preserve the high-scoring behaviours each candidate achieved on their winning validation examples
+    - Avoid reintroducing known failure patterns
+    - Minimize edits by reusing unchanged prompts when possible
 
     ## Inputs
 
@@ -1091,9 +1091,9 @@ class ParetoMergeSignature(Signature):
     - **primary_prompt_changes / partner_prompt_changes**: Human-readable summaries of prior edits (if any).
     - **per_example_notes**: Short description of which validation examples each candidate wins.
 
-    ## Output
+    ## Outputs
 
-    Return a single ``HypothesisSpec`` that applies targeted prompt updates only where improvements are justified by the partner's strengths.
+    Return ``primary_hypothesis`` and ``partner_hypothesis`` – two ``HypothesisSpec`` objects that apply targeted prompt updates only where improvements are justified by the other candidate's strengths.
     Explicitly document all modifications in ``prompt_changes`` and keep ``change_magnitude`` accurate.
     """
 
@@ -1115,8 +1115,11 @@ class ParetoMergeSignature(Signature):
         desc="Description of per-example win patterns comparing the two candidates", default=""
     )
 
-    hypothesis: HypothesisSpec = OutputField(
-        desc="Merged hypothesis incorporating the best traits of both candidates while remaining minimal"
+    primary_hypothesis: HypothesisSpec = OutputField(
+        desc="Merged hypothesis anchored on the primary candidate that incorporates the partner's strengths"
+    )
+    partner_hypothesis: HypothesisSpec = OutputField(
+        desc="Merged hypothesis anchored on the partner candidate that incorporates the primary's strengths"
     )
 
 

@@ -79,23 +79,42 @@ def make_hypothesis_response(prompt_value: str = "good") -> dict:
 
 
 def make_merge_response(prompt_value: str = "blend") -> dict:
+    primary_change = PromptChange(
+        new_prompt=prompt_value,
+        change_summary="Blend the baseline and partner instructions",
+        change_magnitude=ChangeMagnitude.MODERATE,
+    )
+    partner_change = PromptChange(
+        new_prompt=f"{prompt_value}_partner",
+        change_summary="Incorporate baseline strengths into partner",
+        change_magnitude=ChangeMagnitude.MODERATE,
+    )
+
+    primary_hypothesis = HypothesisSpec(
+        observation="Combine complementary prompt behaviors",
+        fixable_root_causes=["Unify strengths across Pareto candidates"],
+        non_fixable_root_causes=[],
+        impact_score=0.6,
+        generalizability_score=0.5,
+        strategy="Pareto merge refinement",
+        expected_impact="Cover both success regions",
+        prompt_changes={"predictor": primary_change},
+    )
+
+    partner_hypothesis = HypothesisSpec(
+        observation="Combine complementary prompt behaviors",
+        fixable_root_causes=["Unify strengths across Pareto candidates"],
+        non_fixable_root_causes=[],
+        impact_score=0.6,
+        generalizability_score=0.5,
+        strategy="Pareto merge refinement",
+        expected_impact="Cover both success regions",
+        prompt_changes={"predictor": partner_change},
+    )
+
     return {
-        "hypothesis": HypothesisSpec(
-            observation="Combine complementary prompt behaviors",
-            fixable_root_causes=["Unify strengths across Pareto candidates"],
-            non_fixable_root_causes=[],
-            impact_score=0.6,
-            generalizability_score=0.5,
-            strategy="Pareto merge refinement",
-            expected_impact="Cover both success regions",
-            prompt_changes={
-                "predictor": PromptChange(
-                    new_prompt=prompt_value,
-                    change_summary="Blend the baseline and partner instructions",
-                    change_magnitude=ChangeMagnitude.MODERATE,
-                )
-            },
-        )
+        "primary_hypothesis": primary_hypothesis,
+        "partner_hypothesis": partner_hypothesis,
     }
 
 
@@ -392,8 +411,10 @@ def test_pareto_merge_probability_triggers_merge_hypothesis() -> None:
 
     assert len(optimized.apex_result.iterations) >= 2
     second_iter = optimized.apex_result.iterations[1]
-    assert len(second_iter.hypotheses) == 2
-    assert any(h.strategy == "Pareto merge refinement" for h in second_iter.hypotheses)
+    assert len(second_iter.hypotheses) == 3
+    merge_hypotheses = [h for h in second_iter.hypotheses if h.strategy == "Pareto merge refinement"]
+    assert len(merge_hypotheses) == 2
+    assert all(h.prompt_changes for h in merge_hypotheses)
 
 
 def test_best_on_val_ignores_merge_probability() -> None:

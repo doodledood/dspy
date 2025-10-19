@@ -17,7 +17,7 @@ from .analysis import (
     _log_analysis_results,
     analyze_record,
     generate_hypotheses,
-    generate_merge_hypothesis,
+    generate_merge_hypotheses,
 )
 from .candidate_selection import (
     CandidateSelectionStrategy,
@@ -705,7 +705,7 @@ class APEX(Teleprompter):
                         selection_strategy=self.candidate_selection,
                     )
 
-                    merge_hypothesis = None
+                    merge_hypotheses: list[HypothesisSpec] = []
                     if (
                         self.candidate_selection == "pareto"
                         and selection_result is not None
@@ -725,7 +725,7 @@ class APEX(Teleprompter):
                                 partner_candidate = None
 
                             if partner_candidate is not None and pareto_baseline is not None:
-                                merge_hypothesis = generate_merge_hypothesis(
+                                merge_hypotheses = generate_merge_hypotheses(
                                     baseline_candidate=pareto_baseline,
                                     partner_candidate=partner_candidate,
                                     runtime=self.runtime,
@@ -734,31 +734,39 @@ class APEX(Teleprompter):
                                     iteration=iteration,
                                     tracker=self.tracker,
                                 )
-                                if merge_hypothesis is not None:
-                                    hypotheses.append(merge_hypothesis)
+                                if merge_hypotheses:
+                                    hypotheses.extend(merge_hypotheses)
+                                    count = len(merge_hypotheses)
+                                    noun = "hypothesis" if count == 1 else "hypotheses"
                                     self._log(
-                                        "APEX: Generated Pareto merge hypothesis",
+                                        f"APEX: Generated {count} Pareto merge {noun}",
                                         Verbosity.DETAILED,
                                     )
                             else:
                                 self._log(
-                                    "APEX: Skipped Pareto merge hypothesis (no suitable partner candidate found)",
+                                    "APEX: Skipped Pareto merge hypotheses (no suitable partner candidate found)",
                                     Verbosity.DETAILED,
                                 )
 
                     total_hypotheses = len(hypotheses)
-                    merge_note = " (including 1 Pareto merge)" if merge_hypothesis is not None else ""
+                    merge_note = (
+                        f" (including {len(merge_hypotheses)} Pareto merge"
+                        f"{'s' if len(merge_hypotheses) != 1 else ''})"
+                        if merge_hypotheses
+                        else ""
+                    )
                     self._log(
                         f"APEX: Generated {total_hypotheses} hypothesis{'es' if total_hypotheses != 1 else ''}{merge_note} for iteration {iteration}",
                         Verbosity.NORMAL,
                     )
 
                     if hypotheses and self._is_enabled(Verbosity.NORMAL):
+                        merge_ids = {id(h) for h in merge_hypotheses}
                         for idx, hypothesis in enumerate(hypotheses, start=1):
                             predictors_updated = (
                                 list(hypothesis.prompt_changes.keys()) if hypothesis.prompt_changes else []
                             )
-                            is_merge = hypothesis is merge_hypothesis
+                            is_merge = id(hypothesis) in merge_ids
                             hypothesis_label = f"Hypothesis #{idx} (Pareto merge)" if is_merge else f"Hypothesis #{idx}"
                             self._log(
                                 f"  → {hypothesis_label}: {hypothesis.strategy} | Impact: {hypothesis.impact_score:.2f} | "
