@@ -26,6 +26,7 @@ from dspy.teleprompt.apex import (
 from dspy.teleprompt.apex.analysis import build_hypothesis_history_text, generate_hypotheses
 from dspy.teleprompt.apex.candidate_selection import (
     compute_win_weights,
+    deduplicate_candidates,
     non_dominated_candidates,
     select_baseline_candidate,
 )
@@ -124,12 +125,21 @@ class RoutedAnalysisLM(DummyLM):
             payload = self._successes.popleft() if self._successes else make_success_response("default success")
 
         formatted = self._format(payload)
-        entry = {"prompt": prompt, "messages": messages, "kwargs": kwargs, "outputs": [formatted], "usage": 0, "cost": 0}
+        entry = {
+            "prompt": prompt,
+            "messages": messages,
+            "kwargs": kwargs,
+            "outputs": [formatted],
+            "usage": 0,
+            "cost": 0,
+        }
         self.update_history(entry)
         return [formatted]
 
 
-def make_routed_analysis_lm(*, failures: list[dict[str, Any]] | None = None, successes: list[dict[str, Any]] | None = None) -> RoutedAnalysisLM:
+def make_routed_analysis_lm(
+    *, failures: list[dict[str, Any]] | None = None, successes: list[dict[str, Any]] | None = None
+) -> RoutedAnalysisLM:
     return RoutedAnalysisLM(failures=failures or [], successes=successes or [])
 
 
@@ -152,9 +162,9 @@ def test_apex_serialization_suppresses_pydantic_warnings():
         warnings.simplefilter("always")
         serialized = to_serializable(payload)
 
-    assert all(
-        "PydanticSerializationUnexpectedValue" not in str(warning.message) for warning in recorded
-    ), "Serialization emitted a LiteLLM Pydantic warning"
+    assert all("PydanticSerializationUnexpectedValue" not in str(warning.message) for warning in recorded), (
+        "Serialization emitted a LiteLLM Pydantic warning"
+    )
     assert serialized["chunk"]["choices"][0]["delta"]["content"] == "chunk-token"
     assert serialized["choice"]["message"]["content"] == "choice-response"
 
@@ -268,6 +278,37 @@ def test_non_dominated_candidates_filters_dominated() -> None:
     frontier = non_dominated_candidates([dominant, tradeoff, dominated])
 
     assert frontier == [dominant, tradeoff]
+
+
+def test_deduplicate_candidates_prefers_latest_iteration() -> None:
+    legacy = _make_candidate("legacy", [0.5, 0.7], iteration=0)
+    updated = _make_candidate("updated", [0.5, 0.7], iteration=3)
+    alternate = _make_candidate("alternate", [0.4, 0.9], iteration=2)
+
+    deduped = deduplicate_candidates([legacy, updated, alternate])
+
+    assert len(deduped) == 2
+    assert updated in deduped
+    assert legacy not in deduped
+    assert alternate in deduped
+
+
+def test_select_baseline_candidate_removes_duplicate_baselines() -> None:
+    baseline_old = _make_candidate("baseline", [0.5, 0.6, 0.4], iteration=0)
+    baseline_new = _make_candidate("baseline", [0.5, 0.6, 0.4], iteration=2)
+    diverse = _make_candidate("diverse", [0.4, 0.9, 0.5], iteration=1)
+
+    rng = random.Random(1)
+    result = select_baseline_candidate(
+        candidates=[baseline_old, baseline_new, diverse],
+        strategy="pareto",
+        rng=rng,
+    )
+
+    assert len(result.frontier) == 2
+    assert baseline_new in result.frontier
+    assert baseline_old not in result.frontier
+    assert diverse in result.frontier
 
 
 def test_select_baseline_candidate_pareto_weighted_sampling() -> None:
@@ -1836,3 +1877,161 @@ def test_apex_end_to_end_with_deepcopy():
     iteration = optimized.apex_result.iterations[0]
     assert len(iteration.hypotheses) == 1
     assert "predictor" in iteration.hypotheses[0].prompt_changes
+
+
+# Comprehensive Pareto Frontier and Score Alignment Tests
+
+
+def test_non_dominated_requires_aligned_score_vectors() -> None:
+    """Test that dominance comparison requires properly aligned score vectors."""
+    # All candidates must have same-length score vectors for valid comparison
+    cand_a = _make_candidate("a", [1.0, 0.0, 1.0, 0.0, 1.0], iteration=0)
+    cand_b = _make_candidate("b", [1.0, 0.0, 0.5, 1.0, 0.0], iteration=1)
+    cand_c = _make_candidate("c", [0.0, 1.0, 1.0, 0.0, 1.0], iteration=2)
+
+    frontier = non_dominated_candidates([cand_a, cand_b, cand_c])
+
+    # All three have different patterns - none strictly dominates
+    assert len(frontier) == 3
+    assert cand_a in frontier
+    assert cand_b in frontier
+    assert cand_c in frontier
+
+
+def test_non_dominated_detects_strict_dominance() -> None:
+    """Test that strictly dominating candidates correctly dominate."""
+    # Candidate A dominates B on all examples
+    cand_a = _make_candidate("a", [1.0, 1.0, 1.0, 1.0], iteration=0)
+    cand_b = _make_candidate("b", [1.0, 1.0, 1.0, 0.0], iteration=1)
+
+    frontier = non_dominated_candidates([cand_a, cand_b])
+
+    # Only A should be on frontier
+    assert len(frontier) == 1
+    assert cand_a in frontier
+    assert cand_b not in frontier
+
+
+def test_non_dominated_incomparable_candidates() -> None:
+    """Test that incomparable candidates (tradeoffs) all appear on frontier."""
+    # Each candidate wins on different examples - all incomparable
+    cand_a = _make_candidate("a", [1.0, 0.0, 0.0], iteration=0)
+    cand_b = _make_candidate("b", [0.0, 1.0, 0.0], iteration=1)
+    cand_c = _make_candidate("c", [0.0, 0.0, 1.0], iteration=2)
+
+    frontier = non_dominated_candidates([cand_a, cand_b, cand_c])
+
+    # All are incomparable - all on frontier
+    assert len(frontier) == 3
+    assert cand_a in frontier and cand_b in frontier and cand_c in frontier
+
+
+def test_non_dominated_with_identical_candidates() -> None:
+    """Test that identical candidates don't dominate each other."""
+    cand_a = _make_candidate("a", [1.0, 0.0, 1.0], iteration=0)
+    cand_b = _make_candidate("b", [1.0, 0.0, 1.0], iteration=1)
+
+    frontier = non_dominated_candidates([cand_a, cand_b])
+
+    # Both should be on frontier (neither strictly dominates)
+    assert len(frontier) == 2
+    assert cand_a in frontier
+    assert cand_b in frontier
+
+
+def test_dominance_with_mixed_scores() -> None:
+    """Test dominance with realistic score patterns."""
+    # Candidate A: good at first half
+    cand_a = _make_candidate("a", [1.0, 1.0, 1.0, 0.0, 0.0, 0.0], iteration=0)
+    # Candidate B: good at second half
+    cand_b = _make_candidate("b", [0.0, 0.0, 0.0, 1.0, 1.0, 1.0], iteration=1)
+    # Candidate C: mediocre overall but balanced
+    cand_c = _make_candidate("c", [0.5, 0.5, 0.5, 0.5, 0.5, 0.5], iteration=2)
+    # Candidate D: strictly dominated by both A and B
+    cand_d = _make_candidate("d", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0], iteration=3)
+
+    frontier = non_dominated_candidates([cand_a, cand_b, cand_c, cand_d])
+
+    # A, B, C are all incomparable (tradeoffs), D is dominated
+    assert len(frontier) == 3
+    assert cand_a in frontier
+    assert cand_b in frontier
+    assert cand_c in frontier
+    assert cand_d not in frontier
+
+
+def test_large_frontier_with_diverse_strategies() -> None:
+    """Test that diverse strategies lead to larger frontiers (expected behavior)."""
+    # Simulate 10 candidates with diverse strategies
+    candidates = []
+    for i in range(10):
+        # Each candidate excels on different examples
+        scores = [1.0 if j % 10 == i or (j + 1) % 10 == i else 0.0 for j in range(20)]
+        candidates.append(_make_candidate(f"strategy_{i}", scores, iteration=i))
+
+    frontier = non_dominated_candidates(candidates)
+
+    # With diverse patterns, most should be on frontier
+    # This is EXPECTED behavior - not a bug
+    assert len(frontier) >= 8  # Most candidates are incomparable
+
+
+def test_compute_win_weights_distributes_across_examples() -> None:
+    """Test that win weights correctly count per-example victories."""
+    cand_a = _make_candidate("a", [1.0, 0.0, 1.0, 0.0], iteration=0)
+    cand_b = _make_candidate("b", [0.0, 1.0, 0.0, 1.0], iteration=1)
+
+    weights = compute_win_weights([cand_a, cand_b])
+
+    # Each candidate wins on 2 examples
+    assert weights == [2.0, 2.0]
+
+
+def test_compute_win_weights_with_ties() -> None:
+    """Test that ties are split among candidates."""
+    cand_a = _make_candidate("a", [1.0, 1.0, 0.5], iteration=0)
+    cand_b = _make_candidate("b", [1.0, 0.0, 0.5], iteration=1)
+
+    weights = compute_win_weights([cand_a, cand_b])
+
+    # Example 0: both score 1.0 (tie) - both get a win
+    # Example 1: A scores 1.0, B scores 0.0 (A wins alone)
+    # Example 2: both score 0.5 (tie) - both get a win
+    assert weights == [3.0, 2.0]  # A: 2 ties + 1 solo = 3, B: 2 ties = 2
+
+
+def test_compute_win_weights_with_clear_winner() -> None:
+    """Test that a dominant candidate gets higher weight."""
+    cand_a = _make_candidate("a", [1.0, 1.0, 1.0, 1.0], iteration=0)
+    cand_b = _make_candidate("b", [0.0, 0.5, 0.5, 0.5], iteration=1)
+
+    weights = compute_win_weights([cand_a, cand_b])
+
+    # A wins all 4 examples
+    assert weights == [4.0, 0.0]
+
+
+def test_pareto_frontier_size_warning() -> None:
+    """Test that with hierarchical scores, frontier is smaller."""
+    # Create 50 candidates with hierarchical performance
+    # Some candidates strictly dominate others
+    candidates = []
+    for i in range(50):
+        # Create a hierarchical pattern where higher i means better overall
+        # This way, better candidates will dominate worse ones
+        base_level = i // 10  # 0, 0-9; 1, 10-19; 2, 20-29; etc.
+        scores = [0.2 * base_level + (0.1 if j % 5 == i % 5 else 0.0) for j in range(10)]
+        candidates.append(_make_candidate(f"cand_{i}", scores, iteration=i))
+
+    frontier = non_dominated_candidates(candidates)
+
+    # With hierarchical scores, higher-level candidates should dominate lower ones
+    # Expect significantly smaller frontier than with diverse strategies
+    frontier_ratio = len(frontier) / len(candidates)
+
+    # Should have much smaller frontier with hierarchical scores
+    # Approximately one candidate per base_level (5 levels) plus some variation
+    assert frontier_ratio < 0.3, (
+        f"Frontier contains {len(frontier)}/{len(candidates)} candidates ({frontier_ratio:.1%}). "
+        f"Expected smaller frontier with hierarchical scores."
+    )

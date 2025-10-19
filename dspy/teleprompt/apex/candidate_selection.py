@@ -50,11 +50,7 @@ def select_baseline_candidate(
 
     if strategy == "best_on_val":
         max_score = max(candidate.overall_score for candidate in pruned_candidates)
-        best = [
-            c
-            for c in pruned_candidates
-            if math.isclose(c.overall_score, max_score, rel_tol=_FLOAT_TOLERANCE)
-        ]
+        best = [c for c in pruned_candidates if math.isclose(c.overall_score, max_score, rel_tol=_FLOAT_TOLERANCE)]
         baseline = rng.choice(best) if len(best) > 1 else best[0]
         return SelectionResult(baseline=baseline, frontier=[baseline], weights=[1.0])
 

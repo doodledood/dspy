@@ -286,12 +286,27 @@ class EvaluationEngine:
         scores_by_candidate: dict[int, list[tuple[int, float]]] = defaultdict(list)
         for spec_id, example_idx, score in results:
             if score is None:
-                continue
+                # Use min_metric for failed examples to maintain alignment
+                score = self.min_metric
             scores_by_candidate[spec_id].append((example_idx, score))
 
+        num_calset_examples = len(calset)
         for spec_id, label, record_program, _, hypothesis in candidate_specs:
             scored_examples = sorted(scores_by_candidate.get(spec_id, []), key=lambda item: item[0])
             per_example_scores = [score for _, score in scored_examples]
+
+            # Ensure we have exactly num_calset_examples scores for alignment
+            if len(per_example_scores) != num_calset_examples:
+                self.log(
+                    f"APEX: Warning - {label} has {len(per_example_scores)} scores, expected {num_calset_examples}. "
+                    f"Filling missing examples with min_metric={self.min_metric}",
+                    Verbosity.NORMAL,
+                    "warning",
+                )
+                # Fill missing indices with min_metric
+                scored_dict = dict(scored_examples)
+                per_example_scores = [scored_dict.get(idx, self.min_metric) for idx in range(num_calset_examples)]
+
             if not per_example_scores:
                 self.log(
                     f"APEX: Warning - no valid scores obtained for {label}",
