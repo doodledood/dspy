@@ -704,26 +704,8 @@ class APEX(Teleprompter):
                         tracker=self.tracker,
                         selection_strategy=self.candidate_selection,
                     )
-                    self._log(
-                        f"APEX: Generated {len(hypotheses)} hypothesis{'es' if len(hypotheses) != 1 else ''} for iteration {iteration}",
-                        Verbosity.NORMAL,
-                    )
-                    if hypotheses and self._is_enabled(Verbosity.NORMAL):
-                        for idx, hypothesis in enumerate(hypotheses, start=1):
-                            predictors_updated = (
-                                list(hypothesis.prompt_changes.keys()) if hypothesis.prompt_changes else []
-                            )
-                            self._log(
-                                f"  → Hypothesis #{idx}: {hypothesis.strategy} | Impact: {hypothesis.impact_score:.2f} | "
-                                f"Targets: {', '.join(predictors_updated) if predictors_updated else 'none'}",
-                                Verbosity.NORMAL,
-                            )
-                    if self._is_enabled(Verbosity.DETAILED) and hypotheses:
-                        self._log(
-                            "APEX: Detailed hypothesis info follows...",
-                            Verbosity.DETAILED,
-                        )
 
+                    merge_hypothesis = None
                     if (
                         self.candidate_selection == "pareto"
                         and selection_result is not None
@@ -755,7 +737,7 @@ class APEX(Teleprompter):
                                 if merge_hypothesis is not None:
                                     hypotheses.append(merge_hypothesis)
                                     self._log(
-                                        "APEX: Added Pareto merge hypothesis to evaluation batch",
+                                        "APEX: Generated Pareto merge hypothesis",
                                         Verbosity.DETAILED,
                                     )
                             else:
@@ -763,6 +745,31 @@ class APEX(Teleprompter):
                                     "APEX: Skipped Pareto merge hypothesis (no suitable partner candidate found)",
                                     Verbosity.DETAILED,
                                 )
+
+                    total_hypotheses = len(hypotheses)
+                    merge_note = " (including 1 Pareto merge)" if merge_hypothesis is not None else ""
+                    self._log(
+                        f"APEX: Generated {total_hypotheses} hypothesis{'es' if total_hypotheses != 1 else ''}{merge_note} for iteration {iteration}",
+                        Verbosity.NORMAL,
+                    )
+
+                    if hypotheses and self._is_enabled(Verbosity.NORMAL):
+                        for idx, hypothesis in enumerate(hypotheses, start=1):
+                            predictors_updated = (
+                                list(hypothesis.prompt_changes.keys()) if hypothesis.prompt_changes else []
+                            )
+                            is_merge = hypothesis is merge_hypothesis
+                            hypothesis_label = f"Hypothesis #{idx} (Pareto merge)" if is_merge else f"Hypothesis #{idx}"
+                            self._log(
+                                f"  → {hypothesis_label}: {hypothesis.strategy} | Impact: {hypothesis.impact_score:.2f} | "
+                                f"Targets: {', '.join(predictors_updated) if predictors_updated else 'none'}",
+                                Verbosity.NORMAL,
+                            )
+                    if self._is_enabled(Verbosity.DETAILED) and hypotheses:
+                        self._log(
+                            "APEX: Detailed hypothesis info follows...",
+                            Verbosity.DETAILED,
+                        )
 
                     iteration_candidates = self.evaluator.evaluate_candidates(
                         baseline=state.current_program,
