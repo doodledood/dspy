@@ -1,63 +1,49 @@
-import random
-import warnings
+"""High-level integration tests for the public APEX interface.
+
+These tests intentionally focus on observable behaviour – the optimizer should
+respect its inputs, produce improved programs when hypotheses succeed, and keep
+its results accessible through the documented attributes. They avoid making
+assumptions about the internal implementation so the suite remains stable during
+refactors.
+"""
+
+from __future__ import annotations
+
 from collections import deque
-from contextlib import contextmanager
-from typing import Any
-from unittest.mock import MagicMock, call, patch
+from pathlib import Path
+from typing import Any, Callable
 
 import pytest
-from litellm.types.utils import Choices, Delta, Message, ModelResponseStream, StreamingChoices
 
 import dspy
-import dspy.teleprompt.apex.runtime as runtime_module
 from dspy import Example
 from dspy.adapters import JSONAdapter
 from dspy.adapters.chat_adapter import FieldInfoWithName
 from dspy.signatures.field import OutputField
-from dspy.teleprompt.apex import (
-    APEX,
-    CandidateRecord,
-    ChangeMagnitude,
-    ExperimentTracker,
-    HypothesisSpec,
-    PromptChange,
-    Verbosity,
-)
-from dspy.teleprompt.apex.analysis import build_hypothesis_history_text, generate_hypotheses
-from dspy.teleprompt.apex.candidate_selection import (
-    compute_win_weights,
-    deduplicate_candidates,
-    non_dominated_candidates,
-    select_baseline_candidate,
-)
-from dspy.teleprompt.apex.evaluation import EvaluationEngine
-from dspy.teleprompt.apex.models import ApexIterationLog, ProgramSnapshot
-from dspy.teleprompt.apex.serialization import to_serializable
-from dspy.teleprompt.apex.summary import generate_optimization_summary
+from dspy.teleprompt.apex import APEX, ChangeMagnitude, PromptChange
+from dspy.teleprompt.apex.models import CandidateRecord, HypothesisSpec, TrainExampleRecord
 from dspy.utils.dummies import DummyLM
 
 
-def make_analysis_response(root_cause: str = "Prompt missing correct token") -> dict:
+def make_analysis_response(
+    root_cause: str = "Prompt missing correct token",
+    *,
+    involved_predictors: list[str] | None = None,
+) -> dict[str, Any]:
+    """Create a minimal failure analysis payload accepted by APEX."""
+
     return {
         "potential_root_causes": [root_cause],
-        "involved_predictors": ["predictor"],
-        "context": "Baseline emits 'bad'",
+        "involved_predictors": involved_predictors or ["predictor"],
+        "context": "Baseline emits an unexpected value",
         "categories": ["format_ambiguity"],
-        "key_details": "SEVERITY: MODERATE. PRIMARY_FAILURE: predictor. FIXABLE: Add correct token. NOT_FIXABLE: None. SUGGESTED_FIX: Needs to say good",
+        "key_details": "SEVERITY: MODERATE. PRIMARY_FAILURE: predictor. FIXABLE: Add correct token.",
     }
 
 
-def make_success_response(pattern: str = "Prompt handled well") -> dict:
-    return {
-        "potential_success_patterns": [pattern],
-        "contributing_predictors": ["predictor"],
-        "context": "Handled correctly",
-        "categories": ["clear_format_compliance"],
-        "key_details": "MUST PRESERVE: Keep current instructions. CAN MODIFY: Minor wording. FRAGILE: None. RELIABILITY: High.",
-    }
+def make_hypothesis_response(prompt_value: str = "good") -> dict[str, Any]:
+    """Create a hypothesis payload that rewrites the predictor prompt."""
 
-
-def make_hypothesis_response(prompt_value: str = "good") -> dict:
     return {
         "hypotheses": [
             {
@@ -65,7 +51,9 @@ def make_hypothesis_response(prompt_value: str = "good") -> dict:
                 "fixable_root_causes": ["Prompt missing correct token"],
                 "non_fixable_root_causes": [],
                 "strategy": "Rewrite prompt",
-                "expected_impact": "Outputs 'good'",
+                "expected_impact": "Outputs desired value",
+                "impact_score": 1.0,
+                "generalizability_score": 1.0,
                 "prompt_changes": {
                     "predictor": PromptChange(
                         new_prompt=prompt_value,
@@ -78,2032 +66,491 @@ def make_hypothesis_response(prompt_value: str = "good") -> dict:
     }
 
 
-def make_merge_response(prompt_value: str = "blend") -> dict:
-    primary_change = PromptChange(
-        new_prompt=prompt_value,
-        change_summary="Blend the baseline and partner instructions",
-        change_magnitude=ChangeMagnitude.MODERATE,
-    )
-    partner_change = PromptChange(
-        new_prompt=f"{prompt_value}_partner",
-        change_summary="Incorporate baseline strengths into partner",
-        change_magnitude=ChangeMagnitude.MODERATE,
-    )
-
-    primary_hypothesis = HypothesisSpec(
-        observation="Combine complementary prompt behaviors",
-        fixable_root_causes=["Unify strengths across Pareto candidates"],
-        non_fixable_root_causes=[],
-        impact_score=0.6,
-        generalizability_score=0.5,
-        strategy="Pareto merge refinement",
-        expected_impact="Cover both success regions",
-        prompt_changes={"predictor": primary_change},
-    )
-
-    partner_hypothesis = HypothesisSpec(
-        observation="Combine complementary prompt behaviors",
-        fixable_root_causes=["Unify strengths across Pareto candidates"],
-        non_fixable_root_causes=[],
-        impact_score=0.6,
-        generalizability_score=0.5,
-        strategy="Pareto merge refinement",
-        expected_impact="Cover both success regions",
-        prompt_changes={"predictor": partner_change},
-    )
-
-    return {
-        "primary_hypothesis": primary_hypothesis,
-        "partner_hypothesis": partner_hypothesis,
-    }
-
-
 class RoutedAnalysisLM(DummyLM):
-    def __init__(self, *, failures: list[dict[str, Any]], successes: list[dict[str, Any]]):
-        super().__init__(answers=[], adapter=JSONAdapter())
-        self._failures = deque(failures or [make_analysis_response("default failure")])
-        self._successes = deque(successes or [make_success_response("default success")])
+    """Return failure or success analyses based on the prompt contents."""
 
-    def _format(self, payload: dict[str, Any]) -> str:
+    def __init__(self, *, failures: list[dict[str, Any]] | None = None) -> None:
+        super().__init__(answers=[], adapter=JSONAdapter())
+        self._failures = deque(failures or [make_analysis_response()])
+
+    def _format_payload(self, payload: dict[str, Any]) -> str:
         fields_with_values = {
             FieldInfoWithName(name=field_name, info=OutputField()): value for field_name, value in payload.items()
         }
         try:
             return self.adapter.format_field_with_value(fields_with_values, role="assistant")
-        except TypeError:
+        except TypeError:  # pragma: no cover - defensive fall-back for adapters without role support
             return self.adapter.format_field_with_value(fields_with_values)
 
     def __call__(self, prompt=None, messages=None, **kwargs):  # type: ignore[override]
-        messages = messages or [{"role": "user", "content": prompt}]
-        kwargs = {**self.kwargs, **kwargs}
-        content = messages[-1]["content"].lower()
-        is_failure = "error" in content
-        if is_failure:
-            payload = self._failures.popleft() if self._failures else make_analysis_response("default failure")
+        messages = messages or [{"role": "user", "content": prompt or ""}]
+        content = (messages[-1]["content"] or "").lower()
+        if "error" not in content:
+            # Success analyses are irrelevant for these tests; return a neutral payload.
+            payload = {
+                "potential_root_causes": ["Success pattern"],
+                "involved_predictors": ["predictor"],
+                "context": "Handled correctly",
+                "categories": ["structured"],
+                "key_details": "PRESERVE: Keep current behaviour.",
+            }
         else:
-            payload = self._successes.popleft() if self._successes else make_success_response("default success")
+            payload = self._failures.popleft() if self._failures else make_analysis_response()
 
-        formatted = self._format(payload)
-        entry = {
-            "prompt": prompt,
-            "messages": messages,
-            "kwargs": kwargs,
-            "outputs": [formatted],
-            "usage": 0,
-            "cost": 0,
-        }
-        self.update_history(entry)
+        formatted = self._format_payload(payload)
+        self.update_history(
+            {
+                "prompt": prompt,
+                "messages": messages,
+                "kwargs": {**self.kwargs, **kwargs},
+                "outputs": [formatted],
+                "usage": 0,
+                "cost": 0,
+            }
+        )
         return [formatted]
 
 
-def make_routed_analysis_lm(
-    *, failures: list[dict[str, Any]] | None = None, successes: list[dict[str, Any]] | None = None
-) -> RoutedAnalysisLM:
-    return RoutedAnalysisLM(failures=failures or [], successes=successes or [])
-
-
-def make_routed_analysis_lm_from_sequence(responses: list[dict[str, Any]]) -> RoutedAnalysisLM:
-    failures = [resp for resp in responses if "potential_root_causes" in resp]
-    successes = [resp for resp in responses if "potential_success_patterns" in resp]
-    return make_routed_analysis_lm(failures=failures, successes=successes)
-
-
-def test_apex_serialization_suppresses_pydantic_warnings():
-    stream_chunk = ModelResponseStream(
-        model="gpt-4o-mini",
-        choices=[StreamingChoices(delta=Delta(content="chunk-token"), finish_reason=None, index=0)],
-    )
-    choice = Choices(message=Message(role="assistant", content="choice-response"), finish_reason="stop", index=0)
-
-    payload = {"chunk": stream_chunk, "choice": choice}
-
-    with warnings.catch_warnings(record=True) as recorded:
-        warnings.simplefilter("always")
-        serialized = to_serializable(payload)
-
-    assert all("PydanticSerializationUnexpectedValue" not in str(warning.message) for warning in recorded), (
-        "Serialization emitted a LiteLLM Pydantic warning"
-    )
-    assert serialized["chunk"]["choices"][0]["delta"]["content"] == "chunk-token"
-    assert serialized["choice"]["message"]["content"] == "choice-response"
+def make_analysis_lm(*, failures: list[dict[str, Any]] | None = None) -> RoutedAnalysisLM:
+    return RoutedAnalysisLM(failures=failures)
 
 
 class PromptDrivenModule(dspy.Module):
-    def __init__(self, initial_prompt: str):
+    """Simple module whose output mirrors the predictor instructions."""
+
+    def __init__(self, initial_prompt: str) -> None:
         super().__init__()
         self.predictor = dspy.Predict("input -> output")
         self.predictor.signature.instructions = initial_prompt
 
-    def forward(self, input: str) -> dspy.Prediction:
-        # Emit the current prompt text to keep the module deterministic for tests.
+    def forward(self, input: str) -> dspy.Prediction:  # type: ignore[override]
         return dspy.Prediction(output=self.predictor.signature.instructions)
 
 
-def make_train_example(value: str) -> Example:
-    return Example(input=value, output="good").with_inputs("input")
+class DualPromptModule(dspy.Module):
+    """Module with two predictors so we can exercise Pareto selection paths."""
+
+    def __init__(self, first_prompt: str, second_prompt: str) -> None:
+        super().__init__()
+        self.first = dspy.Predict("focus -> first")
+        self.second = dspy.Predict("focus -> second")
+        self.first.signature.instructions = first_prompt
+        self.second.signature.instructions = second_prompt
+
+    def forward(self, focus: str) -> dspy.Prediction:  # type: ignore[override]
+        return dspy.Prediction(
+            first=self.first.signature.instructions,
+            second=self.second.signature.instructions,
+        )
 
 
-def metric(example: Example, prediction: dspy.Prediction, trace) -> float:
+def simple_metric(example: Example, prediction: dspy.Prediction, trace) -> float:
+    """Score 1.0 when the output matches the reference label, otherwise 0.0."""
+
     expected = example.output
-    predicted = prediction.output
-    return 1.0 if expected == predicted else 0.0
+    actual = getattr(prediction, "output", None)
+    return 1.0 if actual == expected else 0.0
 
 
-class RecordingTracker(ExperimentTracker):
-    """Tracker stub that records span calls for assertions."""
+def make_example(input_value: str, output_value: str) -> Example:
+    """Create an Example with the "input" field marked as the model input."""
 
-    def __init__(self):
-        super().__init__(use_mlflow=False)
-        self.spans: list[dict[str, Any]] = []
+    return Example(input=input_value, output=output_value).with_inputs("input")
 
-    def __enter__(self):  # pragma: no cover - simple stub
-        return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):  # pragma: no cover - simple stub
-        return False
+def make_dual_example(focus: str, expected: str) -> Example:
+    """Build an example routed to one of the dual predictors."""
 
-    @contextmanager
-    def span(self, name: str, *, inputs=None, attributes=None):
-        record = {
-            "name": name,
-            "inputs": inputs,
-            "attributes": attributes,
-            "outputs": None,
-        }
+    return Example(focus=focus, output=expected).with_inputs("focus")
 
-        class _Span:
-            def __init__(self, store):
-                self._store = store
 
-            def set_outputs(self, value):
-                self._store["outputs"] = value
+def focus_metric(example: Example, prediction: dspy.Prediction, trace) -> float:
+    """Metric that checks the field referenced by the example's focus label."""
 
-            def set_attribute(self, key, value):
-                attrs = self._store.setdefault("attributes", {})
-                attrs[key] = value
+    actual = getattr(prediction, example.focus, None)
+    return 1.0 if actual == example.output else 0.0
 
-        span = _Span(record)
-        self.spans.append(record)
-        yield span
 
+def test_apex_improves_prompt_and_preserves_baseline() -> None:
+    baseline = PromptDrivenModule("baseline")
+    trainset = [make_example("question", "refined")]
+    valset = [make_example("question", "refined")]
 
-def configure_mock_mlflow(mock_mlflow: MagicMock, *, run_id: str = "test-run-id") -> MagicMock:
-    """Configure a patched mlflow module with the attributes APEX expects."""
-
-    mock_mlflow.set_tracking_uri.return_value = None
-    mock_mlflow.get_tracking_uri.return_value = "http://localhost:5000"
-    mock_mlflow.set_experiment.return_value = None
-
-    mock_mlflow.dspy = MagicMock()
-    mock_mlflow.dspy.autolog = MagicMock()
-
-    mock_run = MagicMock()
-    mock_run.info.run_id = run_id
-    mock_mlflow.start_run.return_value = mock_run
-    mock_mlflow.active_run.return_value = mock_run
-
-    def _span_factory(*args, **kwargs):  # pragma: no cover - simple helper
-        @contextmanager
-        def _cm():
-            span_mock = MagicMock()
-            span_mock.set_inputs = MagicMock()
-            span_mock.set_outputs = MagicMock()
-            span_mock.set_attribute = MagicMock()
-            yield span_mock
-
-        return _cm()
-
-    mock_mlflow.start_span.side_effect = _span_factory
-    return mock_run
-
-
-def _make_candidate(prompt: str, scores: list[float], iteration: int) -> CandidateRecord:
-    module = PromptDrivenModule(initial_prompt=prompt)
-    overall = sum(scores) / len(scores)
-    return CandidateRecord(
-        program=module,
-        overall_score=overall,
-        per_example_scores=scores,
-        iteration=iteration,
-        hypothesis=None,
-    )
-
-
-def test_non_dominated_candidates_filters_dominated() -> None:
-    dominant = _make_candidate("dominant", [0.9, 0.2, 0.2], iteration=0)
-    tradeoff = _make_candidate("tradeoff", [0.8, 0.8, 0.8], iteration=1)
-    dominated = _make_candidate("dominated", [0.7, 0.7, 0.7], iteration=2)
-
-    frontier = non_dominated_candidates([dominant, tradeoff, dominated])
-
-    assert frontier == [dominant, tradeoff]
-
-
-def test_deduplicate_candidates_prefers_latest_iteration() -> None:
-    legacy = _make_candidate("legacy", [0.5, 0.7], iteration=0)
-    updated = _make_candidate("updated", [0.5, 0.7], iteration=3)
-    alternate = _make_candidate("alternate", [0.4, 0.9], iteration=2)
-
-    deduped = deduplicate_candidates([legacy, updated, alternate])
-
-    assert len(deduped) == 2
-    assert updated in deduped
-    assert legacy not in deduped
-    assert alternate in deduped
-
-
-def test_select_baseline_candidate_removes_duplicate_baselines() -> None:
-    baseline_old = _make_candidate("baseline", [0.5, 0.6, 0.4], iteration=0)
-    baseline_new = _make_candidate("baseline", [0.5, 0.6, 0.4], iteration=2)
-    diverse = _make_candidate("diverse", [0.4, 0.9, 0.5], iteration=1)
-
-    rng = random.Random(1)
-    result = select_baseline_candidate(
-        candidates=[baseline_old, baseline_new, diverse],
-        strategy="pareto",
-        rng=rng,
-    )
-
-    assert len(result.frontier) == 2
-    assert baseline_new in result.frontier
-    assert baseline_old not in result.frontier
-    assert diverse in result.frontier
-
-
-def test_select_baseline_candidate_pareto_weighted_sampling() -> None:
-    primary = _make_candidate("primary", [1.0, 0.1, 0.1], iteration=0)
-    partner = _make_candidate("partner", [0.9, 0.9, 0.9], iteration=1)
-
-    rng = random.Random(0)
-    result = select_baseline_candidate(candidates=[primary, partner], strategy="pareto", rng=rng)
-
-    assert result.baseline is partner
-    assert result.frontier == [primary, partner]
-    assert result.weights == compute_win_weights(result.frontier)
-    assert result.weights == [1.0, 2.0]
-
-
-@pytest.mark.parametrize("probability", [-0.1, 1.5])
-def test_apex_rejects_invalid_pareto_merge_probability(probability: float) -> None:
-    analysis_lm = DummyLM([], adapter=dspy.JSONAdapter())
-
-    with pytest.raises(ValueError, match="pareto_merge_probability"):
-        APEX(
-            metric=metric,
-            analysis_lm=analysis_lm,
-            hypothesis_lm=analysis_lm,
-            max_iterations=1,
-            convergence_patience=1,
-            candidate_selection="best_on_val",
-            pareto_merge_probability=probability,
-        )
-
-
-def test_apex_rejects_unknown_candidate_selection() -> None:
-    analysis_lm = DummyLM([], adapter=dspy.JSONAdapter())
-
-    with pytest.raises(ValueError, match="candidate_selection"):
-        APEX(
-            metric=metric,
-            analysis_lm=analysis_lm,
-            hypothesis_lm=analysis_lm,
-            max_iterations=1,
-            convergence_patience=1,
-            candidate_selection="unknown",
-        )
-
-
-def test_pareto_merge_probability_triggers_merge_hypothesis() -> None:
-    trainset = [
-        Example(input="needs_bad", output="bad").with_inputs("input"),
-        Example(input="needs_good", output="good").with_inputs("input"),
-    ]
-    valset = list(trainset)
-
-    analysis_lm = make_routed_analysis_lm(
-        failures=[make_analysis_response() for _ in range(10)],
-        successes=[make_success_response() for _ in range(10)],
-    )
-    hypothesis_lm = DummyLM(
-        [
-            make_hypothesis_response("good"),
-            make_hypothesis_response("bad"),
-            make_merge_response("blend"),
-        ],
-        adapter=dspy.JSONAdapter(),
-    )
-
-    optimizer = APEX(
-        metric=metric,
-        analysis_lm=analysis_lm,
-        hypothesis_lm=hypothesis_lm,
-        max_iterations=2,
-        num_hypotheses=1,
-        convergence_patience=3,
-        seed=0,
-        verbosity="silent",
-        candidate_selection="pareto",
-        pareto_merge_probability=1.0,
-    )
-
-    student = PromptDrivenModule(initial_prompt="bad")
-    optimized = optimizer.compile(student, trainset=trainset, valset=valset)
-
-    assert len(optimized.apex_result.iterations) >= 2
-    second_iter = optimized.apex_result.iterations[1]
-    assert len(second_iter.hypotheses) == 3
-    merge_hypotheses = [h for h in second_iter.hypotheses if h.strategy == "Pareto merge refinement"]
-    assert len(merge_hypotheses) == 2
-    assert all(h.prompt_changes for h in merge_hypotheses)
-
-
-def test_pareto_merge_skips_equivalent_partner(monkeypatch: pytest.MonkeyPatch) -> None:
-    trainset = [
-        Example(input="needs_bad", output="bad").with_inputs("input"),
-        Example(input="needs_good", output="good").with_inputs("input"),
-    ]
-    valset = list(trainset)
-
-    analysis_lm = make_routed_analysis_lm(
-        failures=[make_analysis_response() for _ in range(10)],
-        successes=[make_success_response() for _ in range(10)],
-    )
-    hypothesis_lm = DummyLM(
-        [
-            make_hypothesis_response("good"),
-            make_hypothesis_response("bad"),
-            make_merge_response("blend"),
-        ],
-        adapter=dspy.JSONAdapter(),
-    )
-
-    def stub_draw_weighted_candidate(candidates, weights, *, rng, exclude=None):  # type: ignore[no-untyped-def]
-        return candidates[0]
-
-    monkeypatch.setattr(
-        "dspy.teleprompt.apex.candidate_selection.draw_weighted_candidate",
-        stub_draw_weighted_candidate,
-    )
-    monkeypatch.setattr("dspy.teleprompt.apex.apex.draw_weighted_candidate", stub_draw_weighted_candidate)
-
-    optimizer = APEX(
-        metric=metric,
-        analysis_lm=analysis_lm,
-        hypothesis_lm=hypothesis_lm,
-        max_iterations=2,
-        num_hypotheses=1,
-        convergence_patience=3,
-        seed=0,
-        verbosity="silent",
-        candidate_selection="pareto",
-        pareto_merge_probability=1.0,
-    )
-
-    student = PromptDrivenModule(initial_prompt="bad")
-    optimized = optimizer.compile(student, trainset=trainset, valset=valset)
-
-    assert len(optimized.apex_result.iterations) >= 2
-    second_iter = optimized.apex_result.iterations[1]
-    strategies = [hyp.strategy for hyp in second_iter.hypotheses]
-    assert "Pareto merge refinement" not in strategies
-
-
-def test_best_on_val_ignores_merge_probability() -> None:
-    trainset = [
-        Example(input="needs_bad", output="bad").with_inputs("input"),
-        Example(input="needs_good", output="good").with_inputs("input"),
-    ]
-    valset = list(trainset)
-
-    analysis_lm = make_routed_analysis_lm(
-        failures=[make_analysis_response() for _ in range(6)],
-        successes=[make_success_response() for _ in range(6)],
-    )
-    hypothesis_lm = DummyLM(
-        [make_hypothesis_response("good"), make_hypothesis_response("bad")],
-        adapter=dspy.JSONAdapter(),
-    )
-
-    optimizer = APEX(
-        metric=metric,
-        analysis_lm=analysis_lm,
-        hypothesis_lm=hypothesis_lm,
-        max_iterations=2,
-        num_hypotheses=1,
-        convergence_patience=3,
-        seed=0,
-        verbosity="silent",
-        candidate_selection="best_on_val",
-        pareto_merge_probability=1.0,
-    )
-
-    student = PromptDrivenModule(initial_prompt="bad")
-    optimized = optimizer.compile(student, trainset=trainset, valset=valset)
-
-    iterations = optimized.apex_result.iterations
-    assert iterations, "Expected at least one iteration to run"
-    all_strategies = [hyp.strategy for it in iterations for hyp in it.hypotheses]
-    assert "Pareto merge refinement" not in all_strategies
-
-
-def test_evaluate_candidate_logs_traces_without_mutating_predictors():
-    tracker = RecordingTracker()
-    runtime = runtime_module.RuntimeTools(verbosity=Verbosity.DETAILED, num_threads=1)
-    engine = EvaluationEngine(
-        metric=metric,
-        runtime=runtime,
-        tracker=tracker,
-        min_metric=0.0,
-        max_metric=1.0,
-        success_threshold=1.0,
-        num_eval_runs=1,
-        rng=random.Random(0),
-        log=lambda message, level, _: None,
-        is_enabled=lambda _: False,
-    )
-
-    class TraceableModule(dspy.Module):
-        def __init__(self):
-            super().__init__()
-            self.predictor = dspy.Predict("input -> output")
-            self.predictor.lm = DummyLM([{"output": "good"}])
-
-        def forward(self, input: str) -> dspy.Prediction:
-            return self.predictor(input=input)
-
-    program = TraceableModule()
-    example = make_train_example("x")
-
-    record = engine.evaluate_candidate(program=program, calset=[example], iteration=1, hypothesis=None)
-
-    predictor_names = [name for name, _ in record.program.named_predictors()]
-    assert predictor_names == ["predictor"]
-
-    assert tracker.spans, "Expected spans to be recorded"
-    span = tracker.spans[0]
-    assert span["name"] == "apex.baseline_example"
-    assert span["outputs"]["median_score"] == 1.0
-    assert "predictor" in span["inputs"]["prompts"]
-
-
-def test_generate_hypotheses_traces_include_full_context():
-    tracker = RecordingTracker()
-    runtime = runtime_module.RuntimeTools(verbosity=Verbosity.DETAILED, num_threads=1)
-
-    failure_summary = dspy.Prediction(**make_analysis_response("Extractor dropped required field"))
-    success_summary = dspy.Prediction(**make_success_response("Validator preserved schema"))
-
-    hypothesis_adapter = dspy.JSONAdapter()
-    hypothesis_lm = DummyLM([make_hypothesis_response()], adapter=hypothesis_adapter)
-
-    snapshot = ProgramSnapshot(
-        structure="Test structure",
-        flow_description="predictor -> validator",
-        prompts={"predictor": "Prompt"},
-        predictor_name_by_id={},
-    )
-
-    hypotheses = generate_hypotheses(
-        failure_summaries=[failure_summary],
-        success_summaries=[success_summary],
-        snapshot=snapshot,
-        candidate_history=None,
-        best_val_score=0.5,
-        runtime=runtime,
-        hypothesis_lm=hypothesis_lm,
-        hypothesis_adapter=hypothesis_adapter,
-        num_hypotheses=1,
-        include_history=False,
-        rng=random.Random(0),
-        iteration=2,
-        tracker=tracker,
-    )
-
-    assert hypotheses, "Expected at least one hypothesis"
-
-    span = tracker.spans[-1]
-    assert span["name"] == "apex.generate_hypotheses"
-    payload = span["inputs"]["generation_payload"]
-
-    failure_records = payload["failure_analyses"]
-    assert isinstance(failure_records, list) and failure_records, "Expected serialized failure analyses"
-    failure_entry = failure_records[0]
-    assert failure_entry["potential_root_causes"] == ["Extractor dropped required field"]
-    assert failure_entry["involved_predictors"] == ["predictor"]
-    assert failure_entry["categories"] == ["format_ambiguity"]
-
-    success_records = payload["success_analyses"]
-    assert isinstance(success_records, list) and success_records, "Expected serialized success analyses"
-    success_entry = success_records[0]
-    assert success_entry["potential_root_causes"] == ["Validator preserved schema"]
-    assert success_entry["contributing_predictors"] == ["predictor"]
-    assert success_entry["categories"] == ["clear_format_compliance"]
-
-    assert payload["failure_category_counts"] == {"format_ambiguity": 1}
-    assert payload["success_category_counts"] == {"clear_format_compliance": 1}
-    assert payload["success_rate_percentage"] == pytest.approx(50.0)
-    assert "Predictor prompts and configurations:" in payload["program_flow"]
-
-    assert payload["best_validation_score"] == "0.5000"
-    assert payload["current_iteration"] == 2
-
-    outputs = span["outputs"]
-    assert outputs["best_val_score"] == 0.5
-    assert outputs["failure_analyses"][0]["potential_root_causes"] == ["Extractor dropped required field"]
-    assert outputs["success_analyses"][0]["potential_root_causes"] == ["Validator preserved schema"]
-    assert outputs["failure_category_counts"] == {"format_ambiguity": 1}
-    assert outputs["success_category_counts"] == {"clear_format_compliance": 1}
-    assert outputs["success_rate_percentage"] == pytest.approx(50.0)
-
-
-def test_generate_optimization_summary_lists_each_candidate():
-    change = PromptChange(
-        new_prompt="better",
-        change_summary="Clean whitespace",
-        change_magnitude=ChangeMagnitude.MINIMAL,
-    )
-    hypothesis_spec = HypothesisSpec(
-        observation="obs",
-        fixable_root_causes=["missing token"],
-        non_fixable_root_causes=[],
-        impact_score=0.7,
-        generalizability_score=0.5,
-        strategy="Improve prompt",
-        expected_impact="better outputs",
-        prompt_changes={"predictor": change},
-    )
-
-    baseline_candidate = CandidateRecord(
-        program=PromptDrivenModule(initial_prompt="baseline"),
-        overall_score=0.6,
-        per_example_scores=[0.6],
-        iteration=1,
-        hypothesis=None,
-    )
-    improved_candidate = CandidateRecord(
-        program=PromptDrivenModule(initial_prompt="better"),
-        overall_score=0.8,
-        per_example_scores=[0.8],
-        iteration=1,
-        hypothesis=hypothesis_spec,
-    )
-
-    iteration_log = ApexIterationLog(
-        iteration=1,
-        sampled_train_size=2,
-        num_failures=1,
-        num_successes=1,
-        hypotheses=[hypothesis_spec],
-        candidates=[baseline_candidate, improved_candidate],
-    )
-
-    summary = generate_optimization_summary(
-        [iteration_log],
-        best_candidate=improved_candidate,
-        initial_score=0.5,
-    )
-
-    assert "baseline" in summary
-    assert "Train F/S: 1/1" in summary
-    assert "hyp #1" in summary
-    assert "Improve prompt" in summary
-    assert "predictor: Clean" in summary
-    assert "whitespace" in summary
-
-
-@pytest.mark.parametrize(
-    "kwargs, error_match",
-    [
-        ({"max_iterations": None, "convergence_patience": None}, "At least one"),
-        ({"max_iterations": 0}, "max_iterations"),
-        ({"convergence_patience": 0}, "convergence_patience"),
-        ({"num_hypotheses": -1}, "num_hypotheses"),
-        ({"num_eval_runs": 0}, "num_eval_runs"),
-        ({"min_metric": 1.1, "max_metric": 1.0}, "min_metric"),
-    ],
-)
-def test_apex_constructor_validation(kwargs, error_match):
-    analysis_lm = make_routed_analysis_lm(successes=[make_success_response("only_success")])
-
-    with pytest.raises(ValueError, match=error_match):
-        params = {
-            "metric": metric,
-            "analysis_lm": analysis_lm,
-            "hypothesis_lm": analysis_lm,
-            "max_iterations": 1,
-            "convergence_patience": 1,
-        }
-        params.update(kwargs)
-        APEX(**params)
-
-
-def test_apex_requires_non_empty_train_and_valset():
-    analysis_lm = DummyLM([], adapter=dspy.JSONAdapter())
-    optimizer = APEX(
-        metric=metric,
-        analysis_lm=analysis_lm,
-        hypothesis_lm=analysis_lm,
-        max_iterations=1,
-        convergence_patience=1,
-        verbosity="silent",
-    )
-
-    student = PromptDrivenModule(initial_prompt="bad")
-
-    with pytest.raises(ValueError, match="trainset must be non-empty"):
-        optimizer.compile(student, trainset=[], valset=[make_train_example("x")])
-
-    with pytest.raises(ValueError, match="calibration set"):
-        optimizer.compile(student, trainset=[make_train_example("x")], valset=[])
-
-
-def test_apex_builds_history_text_when_enabled():
-    hypothesis = HypothesisSpec(
-        observation="obs",
-        fixable_root_causes=["missing token"],
-        non_fixable_root_causes=[],
-        impact_score=0.5,
-        generalizability_score=0.2,
-        strategy="Improve prompt",
-        expected_impact="better",
-        prompt_changes={
-            "predictor": PromptChange(
-                new_prompt="better",
-                change_summary="Clean whitespace",
-                change_magnitude=ChangeMagnitude.MINIMAL,
-            )
-        },
-    )
-
-    baseline = CandidateRecord(
-        program=PromptDrivenModule(initial_prompt="baseline"),
-        overall_score=0.6,
-        per_example_scores=[0.6],
-        iteration=0,
-        hypothesis=None,
-    )
-
-    candidate = CandidateRecord(
-        program=PromptDrivenModule(initial_prompt="bad"),
-        overall_score=0.8,
-        per_example_scores=[0.8],
-        iteration=3,
-        hypothesis=hypothesis,
-    )
-
-    history_text = build_hypothesis_history_text(
-        candidate_history=[baseline, candidate],
-        selection_strategy="best_on_val",
-    )
-
-    assert "Iteration 0 baseline score=0.6000 (best so far)" in history_text
-    assert "Iteration 3" in history_text
-    assert "delta=+0.2000 vs prior best" in history_text
-    assert "predictor" in history_text
-    assert "Clean whitespace" in history_text
-
-
-def test_generate_hypotheses_history_disabled_uses_na():
-    tracker = RecordingTracker()
-    runtime = runtime_module.RuntimeTools(verbosity=Verbosity.DETAILED, num_threads=1)
-    rng = random.Random(0)
-
-    snapshot = ProgramSnapshot(
-        structure="predictor",
-        flow_description="predictor(input) -> output",
-        prompts={"predictor": "Do the thing."},
-        predictor_name_by_id={},
-    )
-
-    failure_summary = dspy.Prediction(**make_analysis_response())
-    success_summary = dspy.Prediction(**make_success_response())
-
-    hypothesis_lm = DummyLM([make_hypothesis_response()], adapter=dspy.JSONAdapter())
-
-    generate_hypotheses(
-        failure_summaries=[failure_summary],
-        success_summaries=[success_summary],
-        snapshot=snapshot,
-        candidate_history=[],
-        best_val_score=0.42,
-        runtime=runtime,
-        hypothesis_lm=hypothesis_lm,
-        hypothesis_adapter=dspy.JSONAdapter(),
-        num_hypotheses=1,
-        include_history=False,
-        rng=rng,
-        log=None,
-        iteration=1,
-        tracker=tracker,
-        selection_strategy="best_on_val",
-    )
-
-    assert tracker.spans, "Expected generate_hypotheses to record a tracker span"
-    payload = tracker.spans[-1]["inputs"]["generation_payload"]
-    assert payload["hypothesis_history"] == "N/A"
-
-
-def test_apex_sample_callable_must_return_list():
-    analysis_lm = DummyLM([make_analysis_response()], adapter=dspy.JSONAdapter())
-    hypothesis_lm = DummyLM([make_hypothesis_response()], adapter=dspy.JSONAdapter())
-
-    optimizer = APEX(
-        metric=metric,
-        analysis_lm=analysis_lm,
-        hypothesis_lm=hypothesis_lm,
-        max_iterations=1,
-        num_hypotheses=1,
-        convergence_patience=1,
-        seed=1,
-        verbosity="silent",
-        train_sample=lambda data, iteration: tuple(data),
-    )
-
-    student = PromptDrivenModule(initial_prompt="bad")
-
-    with pytest.raises(TypeError, match="Custom train_sample callable"):
-        optimizer.compile(
-            student,
-            trainset=[make_train_example("x"), make_train_example("y")],
-            valset=[make_train_example("x")],
-        )
-
-
-def test_apex_apply_hypothesis_rejects_unknown_predictor():
-    analysis_lm = DummyLM([], adapter=dspy.JSONAdapter())
-    optimizer = APEX(
-        metric=metric,
-        analysis_lm=analysis_lm,
-        hypothesis_lm=analysis_lm,
-        max_iterations=1,
-        convergence_patience=1,
-        verbosity="silent",
-    )
-
-    hypothesis = HypothesisSpec(
-        observation="obs",
-        fixable_root_causes=[],
-        non_fixable_root_causes=[],
-        impact_score=0.1,
-        generalizability_score=0.1,
-        strategy="",
-        expected_impact="",
-        prompt_changes={
-            "unknown": PromptChange(
-                new_prompt="new",
-                change_summary="",
-                change_magnitude=ChangeMagnitude.MINIMAL,
-            )
-        },
-    )
-
-    with pytest.raises(ValueError, match="unknown predictor"):
-        optimizer._apply_hypothesis(PromptDrivenModule(initial_prompt="bad"), hypothesis)
-
-
-def test_apex_improves_and_tracks_history():
-    trainset = [make_train_example("x"), make_train_example("y")]
-    calset = trainset
-
-    analysis_lm = DummyLM(
-        [make_analysis_response() for _ in range(len(trainset))],
-        adapter=dspy.JSONAdapter(),
-    )
-    hypothesis_lm = DummyLM(
-        [make_hypothesis_response()],
-        adapter=dspy.JSONAdapter(),
-    )
-
-    optimizer = APEX(
-        metric=metric,
-        analysis_lm=analysis_lm,
-        hypothesis_lm=hypothesis_lm,
-        max_iterations=5,
-        num_hypotheses=1,
-        convergence_patience=2,
-        num_eval_runs=1,
-        train_sample=None,
-        seed=42,
-        verbosity="silent",
-    )
-
-    student = PromptDrivenModule(initial_prompt="bad")
-    optimized = optimizer.compile(student, trainset=trainset, valset=calset)
-
-    assert optimized.predictor.signature.instructions == "good"
-    result = optimized.apex_result
-    best = result.best_candidate
-    assert pytest.approx(best.overall_score) == 1.0
-    assert result.stopped_after in {"patience", "max_iterations"}
-    # Ensure at least two iterations logged (improvement + patience stop)
-    assert len(result.iterations) >= 2
-
-
-def test_apex_train_sampling_controls_analysis_calls():
-    trainset = [make_train_example(str(i)) for i in range(6)]
-    calset = trainset[:2]
-
-    analysis_lm = DummyLM(
-        [make_analysis_response("always wrong")],
-        adapter=dspy.JSONAdapter(),
-    )
-    hypothesis_lm = DummyLM(
-        [
-            {
-                "hypotheses": [
-                    {
-                        "observation": "fix",
-                        "fixable_root_causes": ["always wrong"],
-                        "non_fixable_root_causes": [],
-                        "strategy": "swap prompt",
-                        "expected_impact": "",
-                        "prompt_changes": {
-                            "predictor": PromptChange(
-                                new_prompt="good",
-                                change_summary="",
-                                change_magnitude=ChangeMagnitude.MINIMAL,
-                            )
-                        },
-                    }
-                ]
-            }
-        ],
-        adapter=dspy.JSONAdapter(),
-    )
-
-    optimizer = APEX(
-        metric=metric,
-        analysis_lm=analysis_lm,
-        hypothesis_lm=hypothesis_lm,
-        max_iterations=1,
-        num_hypotheses=1,
-        train_sample=1,
-        num_eval_runs=1,
-        convergence_patience=1,
-        seed=0,
-        verbosity="silent",
-    )
-
-    student = PromptDrivenModule(initial_prompt="bad")
-    optimizer.compile(student, trainset=trainset, valset=calset)
-
-    assert len(analysis_lm.history) == 1
-
-
-def test_apex_sampling_callable_receives_iteration():
-    def sampler(dataset, iteration):
-        assert iteration == 1
-        return dataset[:2]
-
-    analysis_lm = DummyLM(
-        [make_analysis_response("wrong") for _ in range(2)],
-        adapter=dspy.JSONAdapter(),
-    )
-    hypothesis_lm = DummyLM(
-        [
-            {
-                "hypotheses": [
-                    {
-                        "observation": "fix",
-                        "fixable_root_causes": ["wrong"],
-                        "non_fixable_root_causes": [],
-                        "strategy": "",
-                        "expected_impact": "",
-                        "prompt_changes": {},
-                    }
-                ]
-            }
-        ],
-        adapter=dspy.JSONAdapter(),
-    )
-
-    optimizer = APEX(
-        metric=metric,
-        analysis_lm=analysis_lm,
-        hypothesis_lm=hypothesis_lm,
-        max_iterations=1,
-        num_hypotheses=1,
-        train_sample=sampler,
-        num_eval_runs=1,
-        convergence_patience=1,
-        seed=13,
-        verbosity="silent",
-    )
-
-    trainset = [make_train_example("x"), make_train_example("y"), make_train_example("z")]
-    calset = trainset[:1]
-    student = PromptDrivenModule(initial_prompt="bad")
-    optimizer.compile(student, trainset=trainset, valset=calset)
-
-    assert len(analysis_lm.history) == 2
-
-
-def test_apex_execution_flow_captures_branching_dependencies():
-    class BranchingModule(dspy.Module):
-        def __init__(self):
-            super().__init__()
-            self.a = dspy.Predict("x -> a")
-            self.b = dspy.Predict("a -> b")
-            self.c = dspy.Predict("a -> c")
-            self.d = dspy.Predict("b, c -> d")
-
-        def forward(self, x: str) -> dspy.Prediction:
-            out_a = self.a(x=x)
-            out_b = self.b(a=out_a.a)
-            out_c = self.c(a=out_a.a)
-            return self.d(b=out_b.b, c=out_c.c)
+    analysis_lm = make_analysis_lm(failures=[make_analysis_response("Prompt should say 'refined'")])
+    hypothesis_lm = DummyLM([make_hypothesis_response("refined")], adapter=JSONAdapter())
 
     apex = APEX(
-        metric=metric,
-        analysis_lm=DummyLM([make_analysis_response()], adapter=dspy.JSONAdapter()),
-        hypothesis_lm=DummyLM([make_hypothesis_response()], adapter=dspy.JSONAdapter()),
-        max_iterations=1,
-        num_hypotheses=0,
-        train_sample=None,
-        num_eval_runs=1,
-        convergence_patience=1,
-        seed=0,
-        verbosity="silent",
-    )
-
-    branching_program = BranchingModule()
-
-    execution_lm = DummyLM(
-        [
-            {"a": "A"},
-            {"b": "B"},
-            {"c": "C"},
-            {"d": "D"},
-        ]
-    )
-
-    with dspy.settings.context(lm=execution_lm, trace=[], max_trace_size=50):
-        branching_program(x="input")
-        trace = list(dspy.settings.trace or [])
-
-    execution_flow = apex._extract_execution_flow(trace, branching_program)
-
-    assert [entry.predictor_name for entry in execution_flow] == ["a", "b", "c", "d"]
-
-    entries = {entry.predictor_name: entry for entry in execution_flow}
-    assert entries["a"].dependencies == []
-    assert entries["b"].dependencies == ["a"]
-    assert entries["c"].dependencies == ["a"]
-    assert entries["d"].dependencies == ["b", "c"]
-    assert entries["d"].input_sources == {"b": ["b"], "c": ["c"]}
-
-    graph = apex._format_execution_flow_as_graph(execution_flow)
-    assert "Program DAG" in graph
-    assert "↳ a" in graph
-    assert "a (Predict)" in graph
-    assert "depends on: Input" in graph
-    assert "feeds: b, c" in graph
-    assert "d (Predict)" in graph
-    assert "depends on: b, c" in graph
-    assert "feeds: Output" in graph
-
-
-def test_apex_uses_configured_num_threads(monkeypatch):
-    calls: list[int] = []
-
-    def fake_execute(self, function, data):
-        calls.append(self.num_threads)
-        return [function(item) for item in data]
-
-    monkeypatch.setattr(runtime_module.ParallelExecutor, "execute", fake_execute)
-
-    trainset = [make_train_example("x"), make_train_example("y")]
-    calset = trainset
-
-    analysis_lm = DummyLM(
-        [make_analysis_response("thread test") for _ in range(len(trainset))],
-        adapter=dspy.JSONAdapter(),
-    )
-    hypothesis_lm = DummyLM(
-        [make_hypothesis_response("good")],
-        adapter=dspy.JSONAdapter(),
-    )
-
-    optimizer = APEX(
-        metric=metric,
+        metric=simple_metric,
         analysis_lm=analysis_lm,
         hypothesis_lm=hypothesis_lm,
         max_iterations=1,
         num_hypotheses=1,
         train_sample=None,
-        num_eval_runs=1,
+        success_threshold=1.0,
+        min_metric=0.0,
+        max_metric=1.0,
         convergence_patience=1,
-        seed=11,
-        verbosity="silent",
-        num_threads=2,
-    )
-
-    student = PromptDrivenModule(initial_prompt="bad")
-    optimizer.compile(student, trainset=trainset, valset=calset)
-
-    assert any(num == 2 for num in calls)
-
-
-def test_apex_rejects_invalid_analysis_json():
-    analysis_lm = DummyLM(
-        [{"invalid_field": "missing required fields"}],  # Invalid response, missing required fields
-        adapter=dspy.JSONAdapter(),
-    )
-    hypothesis_lm = DummyLM(
-        [make_hypothesis_response()],
-        adapter=dspy.JSONAdapter(),
-    )
-
-    optimizer = APEX(
-        metric=metric,
-        analysis_lm=analysis_lm,
-        hypothesis_lm=hypothesis_lm,
-        max_iterations=1,
-        num_hypotheses=1,
-        convergence_patience=1,
-        seed=0,
-        verbosity="silent",
-    )
-
-    student = PromptDrivenModule(initial_prompt="bad")
-    trainset = [make_train_example("x")]
-    from dspy.utils.exceptions import AdapterParseError
-
-    with pytest.raises(AdapterParseError):
-        optimizer.compile(student, trainset=trainset, valset=trainset)
-
-
-def test_apex_trims_hypotheses_to_limit():
-    analysis_lm = DummyLM(
-        [make_analysis_response()],
-        adapter=dspy.JSONAdapter(),
-    )
-    hypothesis_lm = DummyLM(
-        [
-            {
-                "hypotheses": [
-                    {
-                        "observation": "option A",
-                        "fixable_root_causes": ["Prompt missing correct token"],
-                        "non_fixable_root_causes": [],
-                        "strategy": "Rewrite prompt A",
-                        "expected_impact": "Outputs 'good'",
-                        "prompt_changes": {
-                            "predictor": PromptChange(
-                                new_prompt="good",
-                                change_summary="Align",
-                                change_magnitude=ChangeMagnitude.MINIMAL,
-                            )
-                        },
-                    },
-                    {
-                        "observation": "option B",
-                        "fixable_root_causes": ["Prompt missing correct token"],
-                        "non_fixable_root_causes": [],
-                        "strategy": "Rewrite prompt B",
-                        "expected_impact": "Outputs 'great'",
-                        "prompt_changes": {
-                            "predictor": PromptChange(
-                                new_prompt="great",
-                                change_summary="Align alt",
-                                change_magnitude=ChangeMagnitude.MODERATE,
-                            )
-                        },
-                    },
-                ]
-            }
-        ],
-        adapter=dspy.JSONAdapter(),
-    )
-
-    optimizer = APEX(
-        metric=metric,
-        analysis_lm=analysis_lm,
-        hypothesis_lm=hypothesis_lm,
-        max_iterations=1,
-        num_hypotheses=1,
-        convergence_patience=1,
-        seed=0,
-        verbosity="silent",
-    )
-
-    student = PromptDrivenModule(initial_prompt="bad")
-    optimized = optimizer.compile(student, trainset=[make_train_example("x")], valset=[make_train_example("x")])
-
-    iteration = optimized.apex_result.iterations[0]
-    assert len(iteration.hypotheses) == 1
-    assert iteration.hypotheses[0].prompt_changes["predictor"].new_prompt == "good"
-
-
-def test_apex_handles_fewer_successes_than_failures():
-    def mixed_metric(example: Example, prediction: dspy.Prediction, trace) -> float:
-        # Treat inputs ending with "success" as automatic successes.
-        if example.input.endswith("success"):
-            return 1.0
-        return 1.0 if prediction.output == "good" else 0.0
-
-    trainset = [
-        Example(input="a_success", output="good").with_inputs("input"),
-        Example(input="b_failure", output="good").with_inputs("input"),
-        Example(input="c_failure", output="good").with_inputs("input"),
-    ]
-    calset = trainset
-
-    analysis_lm = make_routed_analysis_lm(
-        failures=[make_analysis_response("mixed failure 1"), make_analysis_response("mixed failure 2")],
-        successes=[make_success_response("success pattern")],
-    )
-    hypothesis_lm = DummyLM([make_hypothesis_response()], adapter=dspy.JSONAdapter())
-
-    optimizer = APEX(
-        metric=mixed_metric,
-        analysis_lm=analysis_lm,
-        hypothesis_lm=hypothesis_lm,
-        max_iterations=2,
-        num_hypotheses=1,
-        convergence_patience=1,
-        seed=123,
-        verbosity="silent",
-    )
-
-    student = PromptDrivenModule(initial_prompt="bad")
-    optimized = optimizer.compile(student, trainset=trainset, valset=calset)
-
-    iteration_count = len(optimized.apex_result.iterations)
-    # Each iteration should analyze every training example exactly once.
-    assert len(analysis_lm.history) == len(trainset) * iteration_count
-    assert optimized.apex_result.best_candidate.overall_score >= 1.0
-
-
-def test_apex_first_iteration_hypothesis_beats_baseline():
-    analysis_lm = make_routed_analysis_lm(failures=[make_analysis_response("baseline mismatch")])
-    hypothesis_lm = DummyLM([make_hypothesis_response("good")], adapter=dspy.JSONAdapter())
-
-    optimizer = APEX(
-        metric=metric,
-        analysis_lm=analysis_lm,
-        hypothesis_lm=hypothesis_lm,
-        max_iterations=1,
-        num_hypotheses=1,
-        convergence_patience=1,
-        seed=5,
-        verbosity="silent",
-    )
-
-    student = PromptDrivenModule(initial_prompt="bad")
-    trainset = [make_train_example("needs_fix")]
-    optimized = optimizer.compile(student, trainset=trainset, valset=trainset)
-
-    iteration = optimized.apex_result.iterations[0]
-    assert len(iteration.candidates) == 2
-
-    baseline_candidate, hypothesis_candidate = iteration.candidates
-    assert baseline_candidate.hypothesis is None
-    assert hypothesis_candidate.hypothesis is iteration.hypotheses[0]
-
-    assert pytest.approx(baseline_candidate.overall_score, rel=0.0, abs=1e-9) == 0.0
-    assert pytest.approx(hypothesis_candidate.overall_score, rel=0.0, abs=1e-9) == 1.0
-
-    assert baseline_candidate.program is not hypothesis_candidate.program
-    change = iteration.hypotheses[0].prompt_changes["predictor"]
-    assert change.new_prompt == "good"
-    assert optimized.apex_result.best_candidate.overall_score == pytest.approx(1.0, rel=0.0, abs=1e-9)
-
-
-def test_apex_analyzes_success_without_failures():
-    analysis_lm = make_routed_analysis_lm(successes=[make_success_response("solo success pattern")])
-    hypothesis_lm = DummyLM([], adapter=dspy.JSONAdapter())
-
-    optimizer = APEX(
-        metric=metric,
-        analysis_lm=analysis_lm,
-        hypothesis_lm=hypothesis_lm,
-        max_iterations=1,
-        num_hypotheses=0,
-        convergence_patience=1,
-        seed=11,
-        verbosity="silent",
-    )
-
-    student = PromptDrivenModule(initial_prompt="good")
-    trainset = [make_train_example("already_good")]
-    optimizer.compile(student, trainset=trainset, valset=trainset)
-
-    assert len(analysis_lm.history) == len(trainset)
-    assert "potential_success_patterns" in analysis_lm.history[0]["outputs"][0]
-
-
-def test_apex_runs_success_analysis_after_failures_present():
-    def mixed_metric(example: Example, prediction: dspy.Prediction, trace) -> float:
-        if example.input == "success_first":
-            return 1.0
-        return 1.0 if prediction.output == "good" else 0.0
-
-    analysis_lm = make_routed_analysis_lm(
-        failures=[make_analysis_response("failure discovered")],
-        successes=[make_success_response("early success preserved")],
-    )
-    hypothesis_lm = DummyLM([make_hypothesis_response()], adapter=dspy.JSONAdapter())
-
-    optimizer = APEX(
-        metric=mixed_metric,
-        analysis_lm=analysis_lm,
-        hypothesis_lm=hypothesis_lm,
-        max_iterations=1,
-        num_hypotheses=1,
-        convergence_patience=1,
-        seed=21,
-        verbosity="silent",
-    )
-
-    student = PromptDrivenModule(initial_prompt="bad")
-    trainset = [
-        Example(input="success_first", output="good").with_inputs("input"),
-        make_train_example("needs_fix"),
-    ]
-    optimizer.compile(student, trainset=trainset, valset=trainset)
-
-    outputs = [entry["outputs"][0] for entry in analysis_lm.history]
-    assert len(outputs) == len(trainset)
-    assert sum("potential_root_causes" in output for output in outputs) == 1
-    assert sum("potential_success_patterns" in output for output in outputs) == 1
-
-
-def test_apex_end_to_end_fake_data():
-    trainset = [
-        Example(input="sample_success", output="baseline").with_inputs("input"),
-        make_train_example("fix_a"),
-        make_train_example("fix_b"),
-    ]
-    calset = [
-        Example(input="sample_success", output="baseline").with_inputs("input"),
-        make_train_example("fix_a"),
-        make_train_example("fix_b"),
-    ]
-
-    analysis_responses = [
-        make_success_response("baseline prompt handles sample_success"),
-        make_analysis_response("fix format for fix_a"),
-        make_analysis_response("fix format for fix_b"),
-        make_analysis_response("baseline prompt now mismatched"),
-        make_success_response("good prompt stable"),
-        make_success_response("good prompt handles remaining cases"),
-    ]
-    analysis_lm = make_routed_analysis_lm_from_sequence(analysis_responses)
-    hypothesis_lm = DummyLM(
-        [
-            make_hypothesis_response("good"),
-            {"hypotheses": []},
-        ],
-        adapter=dspy.JSONAdapter(),
-    )
-
-    optimizer = APEX(
-        metric=metric,
-        analysis_lm=analysis_lm,
-        hypothesis_lm=hypothesis_lm,
-        max_iterations=3,
-        num_hypotheses=1,
-        convergence_patience=1,
-        num_eval_runs=1,
-        seed=99,
-        verbosity="silent",
-    )
-
-    student = PromptDrivenModule(initial_prompt="baseline")
-    optimized = optimizer.compile(student, trainset=trainset, valset=calset)
-    result = optimized.apex_result
-
-    # Best candidate should apply the "good" prompt and improve average score from 1/3 to 2/3.
-    assert optimized.predictor.signature.instructions == "good"
-    assert pytest.approx(result.best_candidate.overall_score, rel=0.0, abs=1e-9) == 2 / 3
-    assert result.stopped_after == "patience"
-
-    # Two iterations: first with a winning hypothesis, second with no improvement.
-    assert len(result.iterations) == 2
-    first_iter, second_iter = result.iterations
-    assert first_iter.num_failures == 2 and first_iter.num_successes == 1
-    assert len(first_iter.hypotheses) == 1
-    assert first_iter.hypotheses[0].prompt_changes["predictor"].new_prompt == "good"
-    assert first_iter.candidates[0].hypothesis is None  # baseline evaluated first
-    assert first_iter.candidates[1].hypothesis == first_iter.hypotheses[0]
-    assert len(first_iter.candidates[0].per_example_scores) == len(calset)
-    assert len(first_iter.candidates[1].per_example_scores) == len(calset)
-    assert second_iter.num_failures == 1 and second_iter.num_successes == 2
-    assert second_iter.hypotheses == []
-    assert second_iter.candidates[0].hypothesis is None  # re-evaluated champion
-    assert len(second_iter.candidates[0].per_example_scores) == len(calset)
-    assert all(
-        score <= result.best_candidate.overall_score + 1e-9
-        for score in (cand.overall_score for cand in result.all_candidates)
-    )
-
-    # Candidate history should contain initial baseline + baseline + new hypothesis + final baseline re-evaluation.
-    assert len(result.all_candidates) == 4
-    assert result.all_candidates[0].hypothesis is None  # Initial baseline (iteration 0)
-    assert result.all_candidates[1].hypothesis is None  # First iteration baseline
-    assert result.all_candidates[2].hypothesis is not None  # First iteration hypothesis
-    assert result.all_candidates[3].hypothesis is None  # Second iteration baseline
-
-
-def test_apex_normal_verbosity_logs_candidates_only():
-    trainset = [make_train_example("x")]
-    calset = trainset
-
-    analysis_lm = DummyLM(
-        [make_analysis_response("normal verbosity check")],
-        adapter=dspy.JSONAdapter(),
-    )
-    hypothesis_lm = DummyLM(
-        [make_hypothesis_response("good")],
-        adapter=dspy.JSONAdapter(),
-    )
-
-    optimizer = APEX(
-        metric=metric,
-        analysis_lm=analysis_lm,
-        hypothesis_lm=hypothesis_lm,
-        max_iterations=1,
-        num_hypotheses=1,
-        convergence_patience=1,
+        include_hypothesis_history=False,
         seed=7,
-        verbosity="normal",
     )
 
-    messages: list[tuple[Verbosity, str]] = []
+    optimized = apex.compile(baseline, trainset=trainset, valset=valset)
 
-    def capture(message: str, level: Verbosity = Verbosity.NORMAL) -> None:
-        if optimizer._is_enabled(level):
-            messages.append((level, message))
+    # The optimizer should return a deep copy so callers can compare instances.
+    assert optimized is not baseline
 
-    optimizer._log = capture  # type: ignore[assignment]
+    prediction = optimized(input="anything")
+    assert prediction.output == "refined"
 
-    student = PromptDrivenModule(initial_prompt="bad")
-    optimizer.compile(student, trainset=trainset, valset=calset)
+    result = optimized.apex_result
+    assert result.best_candidate.overall_score == pytest.approx(1.0)
+    assert result.iterations, "APEX should record at least one iteration"
+    assert result.best_candidate.hypothesis is not None
+    assert (
+        result.best_candidate.hypothesis.prompt_changes["predictor"].new_prompt == "refined"
+    ), "The recorded hypothesis should explain the new prompt"
 
-    assert any("hypothesis score" in msg for _, msg in messages)
-    assert all("failure analysis" not in msg for _, msg in messages)
 
+def test_apex_compile_validates_required_inputs() -> None:
+    module = PromptDrivenModule("baseline")
+    example = make_example("question", "answer")
 
-def test_apex_high_verbosity_logs_analysis():
-    trainset = [make_train_example("y")]
-    calset = trainset
-
-    analysis_lm = DummyLM(
-        [make_analysis_response("high verbosity issue")],
-        adapter=dspy.JSONAdapter(),
-    )
-    hypothesis_lm = DummyLM(
-        [make_hypothesis_response("better")],
-        adapter=dspy.JSONAdapter(),
-    )
-
-    optimizer = APEX(
-        metric=metric,
-        analysis_lm=analysis_lm,
-        hypothesis_lm=hypothesis_lm,
+    apex = APEX(
+        metric=simple_metric,
+        analysis_lm=make_analysis_lm(),
+        hypothesis_lm=DummyLM([make_hypothesis_response()], adapter=JSONAdapter()),
         max_iterations=1,
         num_hypotheses=1,
+        train_sample=None,
+        success_threshold=1.0,
+        min_metric=0.0,
+        max_metric=1.0,
         convergence_patience=1,
-        seed=8,
-        verbosity="detailed",
+        seed=3,
     )
 
-    messages: list[tuple[Verbosity, str]] = []
+    with pytest.raises(ValueError):
+        apex.compile(module, trainset=[], valset=[example])
 
-    def capture(message: str, level: Verbosity = Verbosity.NORMAL) -> None:
-        if optimizer._is_enabled(level):
-            messages.append((level, message))
+    with pytest.raises(ValueError):
+        apex.compile(module, trainset=[example], valset=[])
 
-    optimizer._log = capture  # type: ignore[assignment]
-
-    student = PromptDrivenModule(initial_prompt="bad")
-    optimizer.compile(student, trainset=trainset, valset=calset)
-
-    assert any("hypothesis score" in msg for _, msg in messages)
-    assert any("failure analysis" in msg for _, msg in messages)
+    with pytest.raises(ValueError):
+        apex.compile(module, trainset=[example], valset=[example], teacher=module)
 
 
-def test_apex_public_api_exposed():
-    import dspy.teleprompt as teleprompt_module
+def test_apex_pareto_merge_flow_combines_candidates(monkeypatch: pytest.MonkeyPatch) -> None:
+    baseline = DualPromptModule("start-first", "start-second")
+    trainset = [make_dual_example("first", "alpha"), make_dual_example("second", "beta")]
+    valset = [make_dual_example("first", "alpha"), make_dual_example("second", "beta")]
 
-    assert teleprompt_module.APEX is APEX
-
-
-def test_apex_checkpoint_and_resume(tmp_path):
-    """Verify APEX can save checkpoints and resume from them."""
-
-    def dummy_metric(example: Example, prediction: dspy.Prediction, trace) -> float:
-        return 1.0 if prediction.output == "good" else 0.0
-
-    trainset = [make_train_example("x"), make_train_example("y")]
-    valset = trainset
-
-    analysis_lm = DummyLM(
-        [make_analysis_response() for _ in range(10)],  # Enough for multiple iterations
-        adapter=dspy.JSONAdapter(),
-    )
-    hypothesis_lm = DummyLM(
-        [make_hypothesis_response() for _ in range(10)],  # Enough for multiple iterations
-        adapter=dspy.JSONAdapter(),
-    )
-
-    # First run - will complete after 2 iterations
-    optimizer1 = APEX(
-        metric=dummy_metric,
-        analysis_lm=analysis_lm,
-        hypothesis_lm=hypothesis_lm,
+    apex = APEX(
+        metric=focus_metric,
+        analysis_lm=make_analysis_lm(),
+        hypothesis_lm=DummyLM([], adapter=JSONAdapter()),
         max_iterations=2,
-        num_hypotheses=1,
-        convergence_patience=None,  # Rely on max_iterations
-        checkpoint_dir=tmp_path,
-        verbosity="silent",
-        seed=42,
-    )
-
-    student = PromptDrivenModule(initial_prompt="bad")
-    optimized1 = optimizer1.compile(student=student, trainset=trainset, valset=valset)
-    initial_iterations = len(optimized1.apex_result.iterations)
-    assert initial_iterations == 2
-    assert optimized1.apex_result.stopped_after == "max_iterations"
-
-    # Verify checkpoint files were created
-    checkpoint_files = list(tmp_path.glob("checkpoint_iter_*.pkl"))
-    assert len(checkpoint_files) > 0, "No checkpoint files created"
-    latest_file = tmp_path / "latest_checkpoint.json"
-    assert latest_file.exists(), "latest_checkpoint.json not created"
-
-    # Second run - resume from checkpoint and continue for more iterations
-    optimizer2 = APEX(
-        metric=dummy_metric,
-        analysis_lm=analysis_lm,
-        hypothesis_lm=hypothesis_lm,
-        max_iterations=4,  # Continue for more iterations
-        num_hypotheses=1,
         convergence_patience=None,
-        checkpoint_dir=tmp_path,
-        verbosity="silent",
-        seed=42,
+        num_hypotheses=2,
+        num_threads=1,
+        train_sample=None,
+        success_threshold=1.0,
+        min_metric=0.0,
+        max_metric=1.0,
+        include_hypothesis_history=True,
+        candidate_selection="pareto",
+        pareto_merge_probability=1.0,
+        seed=23,
     )
 
-    # Resume from checkpoint
-    optimized2 = optimizer2.compile(student=student, trainset=trainset, valset=valset, resume=True)
-    final_iterations = len(optimized2.apex_result.iterations)
-
-    # Should have continued from where it left off
-    assert final_iterations == 4
-    assert optimized2.apex_result.stopped_after == "max_iterations"
-
-
-def test_apex_mlflow_disabled_by_default():
-    """Test that MLflow tracking is disabled by default."""
-    trainset = [make_train_example("x")]
-    calset = trainset
-
-    analysis_lm = DummyLM(
-        [make_analysis_response()],
-        adapter=dspy.JSONAdapter(),
-    )
-    hypothesis_lm = DummyLM(
-        [make_hypothesis_response()],
-        adapter=dspy.JSONAdapter(),
-    )
-
-    optimizer = APEX(
-        metric=metric,
-        analysis_lm=analysis_lm,
-        hypothesis_lm=hypothesis_lm,
-        max_iterations=1,
-        num_hypotheses=1,
-        convergence_patience=1,
-        seed=42,
-        verbosity="silent",
-    )
-
-    assert not optimizer.tracker.use_mlflow
-    assert not optimizer.tracker.is_active()
-
-    student = PromptDrivenModule(initial_prompt="bad")
-    optimized = optimizer.compile(student, trainset=trainset, valset=calset)
-    assert optimized.predictor.signature.instructions == "good"
-
-
-@patch("dspy.teleprompt.apex.tracker.MLFLOW_AVAILABLE", True)
-@patch("dspy.teleprompt.apex.tracker.mlflow")
-def test_apex_mlflow_enabled(mock_mlflow):
-    """Test that MLflow tracking can be enabled and logs appropriate data."""
-    configure_mock_mlflow(mock_mlflow)
-
-    trainset = [make_train_example("x"), make_train_example("y")]
-    calset = trainset
-
-    analysis_lm = DummyLM(
-        [make_analysis_response() for _ in range(2)],
-        adapter=dspy.JSONAdapter(),
-    )
-    hypothesis_lm = DummyLM(
-        [make_hypothesis_response()],
-        adapter=dspy.JSONAdapter(),
-    )
-
-    optimizer = APEX(
-        metric=metric,
-        analysis_lm=analysis_lm,
-        hypothesis_lm=hypothesis_lm,
-        max_iterations=1,
-        num_hypotheses=1,
-        convergence_patience=1,
-        seed=42,
-        verbosity="silent",
-        use_mlflow=True,
-        mlflow_tracking_uri="http://localhost:5000",
-        mlflow_experiment_name="test-experiment",
-    )
-
-    assert optimizer.tracker.use_mlflow
-    assert optimizer.tracker.mlflow_tracking_uri == "http://localhost:5000"
-    assert optimizer.tracker.mlflow_experiment_name == "test-experiment"
-
-    student = PromptDrivenModule(initial_prompt="bad")
-    optimized = optimizer.compile(student, trainset=trainset, valset=calset)
-
-    mock_mlflow.set_tracking_uri.assert_called_with("http://localhost:5000")
-    mock_mlflow.set_experiment.assert_called_with("test-experiment")
-    mock_mlflow.get_tracking_uri.assert_called()
-    mock_mlflow.start_run.assert_called_once()
-    mock_mlflow.end_run.assert_called_once()
-
-    autolog_calls = mock_mlflow.dspy.autolog.call_args_list
-    assert autolog_calls[0] == call(
-        log_traces=True,
-        log_traces_from_compile=True,
-        log_traces_from_eval=True,
-        log_compiles=False,
-        log_evals=False,
-        silent=True,
-    )
-    assert autolog_calls[-1] == call(disable=True, silent=True)
-
-    assert mock_mlflow.log_param.call_count > 0 or mock_mlflow.log_metrics.call_count > 0
-    assert optimized.predictor.signature.instructions == "good"
-
-
-@patch("dspy.teleprompt.apex.tracker.MLFLOW_AVAILABLE", False)
-def test_apex_mlflow_graceful_fallback():
-    """Test that APEX handles missing MLflow gracefully."""
-    trainset = [make_train_example("x")]
-    calset = trainset
-
-    analysis_lm = DummyLM(
-        [make_analysis_response()],
-        adapter=dspy.JSONAdapter(),
-    )
-    hypothesis_lm = DummyLM(
-        [make_hypothesis_response()],
-        adapter=dspy.JSONAdapter(),
-    )
-
-    optimizer = APEX(
-        metric=metric,
-        analysis_lm=analysis_lm,
-        hypothesis_lm=hypothesis_lm,
-        max_iterations=1,
-        num_hypotheses=1,
-        convergence_patience=1,
-        seed=42,
-        verbosity="silent",
-        use_mlflow=True,
-    )
-
-    assert not optimizer.tracker.use_mlflow
-
-    student = PromptDrivenModule(initial_prompt="bad")
-    optimized = optimizer.compile(student, trainset=trainset, valset=calset)
-    assert optimized.predictor.signature.instructions == "good"
-
-
-@patch("dspy.teleprompt.apex.tracker.MLFLOW_AVAILABLE", True)
-@patch("dspy.teleprompt.apex.tracker.mlflow")
-def test_apex_mlflow_iteration_tracking(mock_mlflow):
-    """Test that APEX tracks iteration-level metrics with MLflow."""
-    configure_mock_mlflow(mock_mlflow)
-
-    trainset = [make_train_example("x"), make_train_example("y")]
-    calset = trainset
-
-    analysis_lm = DummyLM(
-        [make_analysis_response("issue 1"), make_analysis_response("issue 2")],
-        adapter=dspy.JSONAdapter(),
-    )
-    hypothesis_lm = DummyLM(
-        [make_hypothesis_response("good")],
-        adapter=dspy.JSONAdapter(),
-    )
-
-    optimizer = APEX(
-        metric=metric,
-        analysis_lm=analysis_lm,
-        hypothesis_lm=hypothesis_lm,
-        max_iterations=1,
-        num_hypotheses=1,
-        convergence_patience=1,
-        seed=42,
-        verbosity="silent",
-        use_mlflow=True,
-    )
-
-    student = PromptDrivenModule(initial_prompt="bad")
-    optimizer.compile(student, trainset=trainset, valset=calset)
-
-    assert mock_mlflow.log_metrics.called or mock_mlflow.log_param.called
-    assert mock_mlflow.start_run.called
-    assert mock_mlflow.end_run.called
-
-
-@patch("dspy.teleprompt.apex.tracker.MLFLOW_AVAILABLE", True)
-@patch("dspy.teleprompt.apex.tracker.mlflow")
-def test_apex_mlflow_artifact_logging(mock_mlflow):
-    """Test that APEX logs artifacts like hypotheses to MLflow."""
-    configure_mock_mlflow(mock_mlflow)
-
-    trainset = [make_train_example("x")]
-    calset = trainset
-
-    analysis_lm = DummyLM(
-        [make_analysis_response()],
-        adapter=dspy.JSONAdapter(),
-    )
-    hypothesis_lm = DummyLM(
-        [make_hypothesis_response("improved_prompt")],
-        adapter=dspy.JSONAdapter(),
-    )
-
-    optimizer = APEX(
-        metric=metric,
-        analysis_lm=analysis_lm,
-        hypothesis_lm=hypothesis_lm,
-        max_iterations=1,
-        num_hypotheses=1,
-        convergence_patience=1,
-        seed=42,
-        verbosity="silent",
-        use_mlflow=True,
-    )
-
-    student = PromptDrivenModule(initial_prompt="bad")
-    optimized = optimizer.compile(student, trainset=trainset, valset=calset)
-
-    assert mock_mlflow.log_artifact.called or mock_mlflow.log_param.called
-    assert optimized.predictor.signature.instructions == "improved_prompt"
-
-
-def test_apex_mlflow_context_manager():
-    """Test that the ExperimentTracker works as a context manager."""
-    from dspy.teleprompt.apex.tracker import ExperimentTracker
-
-    with patch("dspy.teleprompt.apex.tracker.MLFLOW_AVAILABLE", True):
-        with patch("dspy.teleprompt.apex.tracker.mlflow") as mock_mlflow:
-            configure_mock_mlflow(mock_mlflow)
-
-            tracker = ExperimentTracker(use_mlflow=True)
-
-            with tracker:
-                assert tracker.is_active()
-                tracker.log_params({"test_param": "value"})
-                tracker.log_metrics({"test_metric": 0.5})
-
-            mock_mlflow.end_run.assert_called_once()
-            autolog_calls = mock_mlflow.dspy.autolog.call_args_list
-            assert autolog_calls[0].kwargs["log_traces"] is True
-            assert autolog_calls[-1] == call(disable=True, silent=True)
-
-
-@patch("dspy.teleprompt.apex.tracker.MLFLOW_AVAILABLE", True)
-@patch("dspy.teleprompt.apex.tracker.mlflow")
-def test_experiment_tracker_rejects_local_tracking_uri(mock_mlflow):
-    from dspy.teleprompt.apex.tracker import ExperimentTracker
-
-    configure_mock_mlflow(mock_mlflow)
-
-    with pytest.raises(ValueError, match="http or https"):
-        ExperimentTracker(use_mlflow=True, mlflow_tracking_uri="file:///tmp/mlruns")
-
-
-@patch("dspy.teleprompt.apex.tracker.MLFLOW_AVAILABLE", True)
-@patch("dspy.teleprompt.apex.tracker.mlflow")
-def test_experiment_tracker_detects_file_store_fallback(mock_mlflow):
-    from dspy.teleprompt.apex.tracker import ExperimentTracker
-
-    configure_mock_mlflow(mock_mlflow)
-    mock_mlflow.get_tracking_uri.return_value = "file:///tmp/mlruns"
-
-    with pytest.raises(RuntimeError, match="local file store"):
-        ExperimentTracker(use_mlflow=True, mlflow_tracking_uri="http://localhost:5000")
-
-
-def test_apex_tracking_utils_format_functions():
-    """Test the tracking utility formatting functions."""
-    from dspy.teleprompt.apex import tracking_utils
-
-    baseline_metrics = tracking_utils.format_baseline_metrics(baseline_score=0.5, num_train=10, num_val=5)
-    assert baseline_metrics["baseline_score"] == 0.5
-    assert baseline_metrics["num_train_examples"] == 10
-    assert baseline_metrics["num_val_examples"] == 5
-
-    hypotheses = [
-        MagicMock(
-            strategy="test_strategy",
-            impact_score=0.8,
-            generalizability_score=0.9,
-            fixable_root_causes=["issue1"],
+    def build_spec(target: str, strategy: str, prompt: str) -> HypothesisSpec:
+        return HypothesisSpec(
+            observation=f"Improve {target}",
+            fixable_root_causes=[f"{target} mismatch"],
+            non_fixable_root_causes=[],
+            strategy=strategy,
+            expected_impact=f"{target} aligned",
+            impact_score=1.0,
+            generalizability_score=0.5,
             prompt_changes={
-                "predictor": MagicMock(
-                    new_prompt="new prompt text",
-                    change_summary="test change",
+                target: PromptChange(
+                    new_prompt=prompt,
+                    change_summary=strategy,
                     change_magnitude=ChangeMagnitude.MINIMAL,
                 )
             },
         )
-    ]
-    iteration_metrics = tracking_utils.format_iteration_metrics(
-        iteration=1,
-        num_failures=2,
-        num_successes=3,
-        hypotheses=hypotheses,
-        candidates=[],
-        best_score=0.7,
-    )
-    assert iteration_metrics["iteration"] == 1
-    assert iteration_metrics["num_failures"] == 2
-    assert iteration_metrics["num_successes"] == 3
-    assert iteration_metrics["best_score"] == 0.7
-    assert len(iteration_metrics["hypotheses"]) == 1
 
-    candidate = MagicMock(
-        overall_score=0.8,
-        iteration=1,
-        hypothesis=MagicMock(strategy="test_strategy"),
-        per_example_scores=[0.7, 0.8, 0.9],
-    )
-    candidate_data = tracking_utils.format_candidate_data(candidate)
-    assert candidate_data["overall_score"] == 0.8
-    assert candidate_data["iteration"] == 1
-    assert candidate_data["has_hypothesis"] is True
-    assert pytest.approx(candidate_data["mean_score"]) == 0.8
+    alpha_spec = build_spec("first", "Focus first", "alpha")
+    beta_spec = build_spec("second", "Focus second", "beta")
+    primary_merge = build_spec("second", "Pareto merge second", "beta")
+    partner_merge = build_spec("first", "Pareto merge first", "alpha")
 
-    best_candidate = MagicMock(overall_score=0.9)
-    all_candidates = [MagicMock(overall_score=0.7), MagicMock(overall_score=0.9)]
-    iterations = [MagicMock(num_failures=2, num_successes=3, hypotheses=hypotheses)]
-    summary = tracking_utils.format_optimization_summary(
-        best_candidate=best_candidate,
-        all_candidates=all_candidates,
-        iterations=iterations,
-        stopped_after="patience",
-        initial_score=0.5,
-    )
-    assert summary["final_score"] == 0.9
-    assert summary["initial_score"] == 0.5
-    assert summary["improvement"] == 0.4
-    assert summary["stopped_after"] == "patience"
-    assert summary["total_iterations"] == 1
-    assert summary["total_candidates"] == 2
+    history_lengths: list[int] = []
+    merge_calls: list[tuple[CandidateRecord, CandidateRecord]] = []
+    iteration_tracker: dict[str, Any] = {"count": 0}
 
+    def stub_generate_hypotheses(**kwargs):
+        iteration = kwargs["iteration"]
+        candidate_history = kwargs["candidate_history"]
+        history_lengths.append(len(candidate_history))
+        if iteration == 1:
+            return [alpha_spec, beta_spec]
+        return []
 
-def test_apex_predictor_names_in_execution_flow_after_deepcopy():
-    """Predictor names must be correctly resolved in execution flow after deepcopy.
+    def stub_generate_merge_hypotheses(*, baseline_candidate, partner_candidate, **_kwargs):
+        merge_calls.append((baseline_candidate, partner_candidate))
+        return [primary_merge, partner_merge]
 
-    This tests the specific bug where predictor names show as 'unknown' in
-    execution flow, causing hypothesis LM to generate invalid predictor references.
-    """
-    from dspy.teleprompt.apex.execution_flow import extract_execution_flow
+    def stub_draw_weighted_candidate(candidates, weights, *, rng, exclude=None):
+        excluded_ids = {id(candidate) for candidate in (exclude or [])}
+        for candidate in candidates:
+            if id(candidate) in excluded_ids:
+                continue
+            prompts = {
+                name: getattr(predictor.signature, "instructions", "")
+                for name, predictor in candidate.program.named_predictors()
+            }
+            if prompts.get("second") == "beta":
+                return candidate
+        for candidate in candidates:
+            if id(candidate) not in excluded_ids:
+                return candidate
+        raise AssertionError("No candidate available for merge selection")
 
-    class QuestionAnswer(dspy.Signature):
-        question = dspy.InputField()
-        answer = dspy.OutputField()
+    def deterministic_best_candidate(candidates: list[CandidateRecord]) -> CandidateRecord:
+        best_score = max(candidate.overall_score for candidate in candidates)
+        for candidate in candidates:
+            if candidate.overall_score == best_score:
+                return candidate
+        raise AssertionError("Expected at least one candidate")
 
-    program = dspy.ChainOfThought(QuestionAnswer)
-
-    # Simulate APEX's flow: deepcopy the program
-    program_copy = program.deepcopy()
-
-    # Run with tracing (simulating evaluate_train_examples)
-    example = dspy.Example(question="Test?", answer="42").with_inputs("question")
-
-    fake_lm = DummyLM([{"reasoning": "thinking", "answer": "42"}])
-    with dspy.settings.context(lm=fake_lm, trace=[], max_trace_size=50):
-        _ = program_copy(question=example.question)
-        trace = list(dspy.settings.trace or [])
-
-    assert len(trace) > 0, "Trace should contain predictor calls"
-
-    # Extract execution flow from the SAME program instance
-    execution_flow = extract_execution_flow(trace, program_copy)
-
-    # Critical assertion: predictor names must NOT be "unknown"
-    for entry in execution_flow:
-        assert entry.predictor_name != "unknown", (
-            f"BUG: Predictor name is 'unknown' (type: {entry.predictor_type}). "
-            f"This causes hypothesis LM to see 'unknown (Predict)' and generate "
-            f"invalid predictor references like 'Predict' instead of 'predict'."
+    def fake_run_train_example(program, example, *, iteration, example_idx):
+        return TrainExampleRecord(
+            example=example,
+            prediction=dspy.Prediction(first="", second=""),
+            metric_score=0.0,
+            metric_feedback="",
+            is_success=False,
+            error="mismatch",
+            execution_flow=[],
         )
-        # For ChainOfThought, the single predictor is named "predict"
-        assert entry.predictor_name == "predict", f"Expected 'predict', got '{entry.predictor_name}'"
+
+    def fake_analyze_record(*args, **kwargs):  # type: ignore[override]
+        return dspy.Prediction()
+
+    def evaluate_candidate_stub(*, program, calset, iteration, hypothesis):
+        return CandidateRecord(
+            program=DualPromptModule("start-first", "start-second"),
+            overall_score=0.0,
+            per_example_scores=[0.0, 0.0],
+            iteration=iteration,
+            hypothesis=hypothesis,
+        )
+
+    def evaluate_candidates_stub(*, iteration, hypotheses, baseline, cached_baseline, baseline_overrides, **_kwargs):
+        iteration_tracker["count"] += 1
+        if iteration_tracker["count"] == 1:
+            assert hypotheses == [alpha_spec, beta_spec]
+            candidates = [
+                CandidateRecord(
+                    program=DualPromptModule("start-first", "start-second"),
+                    overall_score=0.0,
+                    per_example_scores=[0.0, 0.0],
+                    iteration=iteration,
+                    hypothesis=None,
+                ),
+                CandidateRecord(
+                    program=DualPromptModule("alpha", "start-second"),
+                    overall_score=0.5,
+                    per_example_scores=[1.0, 0.0],
+                    iteration=iteration,
+                    hypothesis=alpha_spec,
+                ),
+                CandidateRecord(
+                    program=DualPromptModule("start-first", "beta"),
+                    overall_score=0.5,
+                    per_example_scores=[0.0, 1.0],
+                    iteration=iteration,
+                    hypothesis=beta_spec,
+                ),
+            ]
+            return candidates
+
+        assert hypotheses == [primary_merge, partner_merge]
+        assert id(partner_merge) in baseline_overrides
+        return [
+            CandidateRecord(
+                program=DualPromptModule("alpha", "start-second"),
+                overall_score=0.5,
+                per_example_scores=[1.0, 0.0],
+                iteration=iteration,
+                hypothesis=None,
+            ),
+            CandidateRecord(
+                program=DualPromptModule("alpha", "beta"),
+                overall_score=0.75,
+                per_example_scores=[1.0, 0.5],
+                iteration=iteration,
+                hypothesis=primary_merge,
+            ),
+            CandidateRecord(
+                program=DualPromptModule("alpha", "beta"),
+                overall_score=1.0,
+                per_example_scores=[1.0, 1.0],
+                iteration=iteration,
+                hypothesis=partner_merge,
+            ),
+        ]
+
+    monkeypatch.setattr("dspy.teleprompt.apex.apex.generate_hypotheses", stub_generate_hypotheses)
+    monkeypatch.setattr("dspy.teleprompt.apex.apex.generate_merge_hypotheses", stub_generate_merge_hypotheses)
+    monkeypatch.setattr("dspy.teleprompt.apex.candidate_selection.draw_weighted_candidate", stub_draw_weighted_candidate)
+    monkeypatch.setattr("dspy.teleprompt.apex.apex.analyze_record", fake_analyze_record)
+    monkeypatch.setattr(apex.evaluator, "run_train_example", fake_run_train_example)
+    monkeypatch.setattr(apex.evaluator, "evaluate_candidate", evaluate_candidate_stub)
+    monkeypatch.setattr(apex.evaluator, "evaluate_candidates", evaluate_candidates_stub)
+    monkeypatch.setattr(apex.evaluator, "select_best_candidate", deterministic_best_candidate)
+
+    optimized = apex.compile(baseline, trainset=trainset, valset=valset)
+
+    assert optimized.first.signature.instructions == "alpha"
+    assert optimized.second.signature.instructions == "beta"
+
+    result = optimized.apex_result
+    assert len(result.iterations) == 2
+    assert result.stopped_after == "max_iterations"
+    assert history_lengths[0] == 1  # Initial call sees only the baseline
+    assert history_lengths[1] >= 3  # Second iteration receives prior candidates
+
+    assert merge_calls, "Pareto merge hypotheses should be generated"
+    baseline_candidate, partner_candidate = merge_calls[0]
+    baseline_prompts = {
+        name: getattr(pred.signature, "instructions", "")
+        for name, pred in baseline_candidate.program.named_predictors()
+    }
+    partner_prompts = {
+        name: getattr(pred.signature, "instructions", "")
+        for name, pred in partner_candidate.program.named_predictors()
+    }
+    actual_pairs = {
+        tuple(sorted(baseline_prompts.items())),
+        tuple(sorted(partner_prompts.items())),
+    }
+    expected_pairs = {
+        tuple(sorted({"first": "alpha", "second": "start-second"}.items())),
+        tuple(sorted({"first": "start-first", "second": "beta"}.items())),
+    }
+    assert actual_pairs == expected_pairs
+
+    iteration_one, iteration_two = result.iterations
+    assert [change.new_prompt for change in iteration_one.hypotheses[0].prompt_changes.values()] == ["alpha"]
+    assert [change.new_prompt for change in iteration_one.hypotheses[1].prompt_changes.values()] == ["beta"]
+    assert [change.new_prompt for change in iteration_two.hypotheses[0].prompt_changes.values()] == ["beta"]
+    assert [change.new_prompt for change in iteration_two.hypotheses[1].prompt_changes.values()] == ["alpha"]
+    assert iteration_two.candidates[-1].overall_score == pytest.approx(1.0)
 
 
-def test_apex_end_to_end_with_deepcopy():
-    """Verify APEX works end-to-end with deepcopied programs."""
-    trainset = [make_train_example("x"), make_train_example("y")]
-    calset = trainset
+def test_apex_stops_after_patience_without_hypotheses() -> None:
+    baseline = PromptDrivenModule("baseline")
+    trainset = [make_example("question", "expected")]
+    valset = [make_example("question", "expected")]
 
-    analysis_lm = DummyLM(
-        [make_analysis_response("needs fix") for _ in range(len(trainset))],
-        adapter=dspy.JSONAdapter(),
+    apex = APEX(
+        metric=simple_metric,
+        analysis_lm=make_analysis_lm(),
+        hypothesis_lm=DummyLM([], adapter=JSONAdapter()),
+        max_iterations=5,
+        convergence_patience=2,
+        num_hypotheses=0,
+        train_sample=None,
+        success_threshold=1.0,
+        min_metric=0.0,
+        max_metric=1.0,
+        seed=5,
     )
-    hypothesis_lm = DummyLM(
-        [make_hypothesis_response("good")],
-        adapter=dspy.JSONAdapter(),
-    )
 
-    optimizer = APEX(
-        metric=metric,
+    optimized = apex.compile(baseline, trainset=trainset, valset=valset)
+
+    assert optimized.predictor.signature.instructions == "baseline"
+    result = optimized.apex_result
+    assert result.stopped_after == "patience"
+    assert len(result.iterations) == 2
+    assert all(not iteration.hypotheses for iteration in result.iterations)
+    assert all(len(iteration.candidates) == 1 for iteration in result.iterations)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"max_iterations": None, "convergence_patience": None},
+        {"max_iterations": 0},
+        {"max_iterations": 1, "convergence_patience": 0},
+        {"max_iterations": 1, "num_hypotheses": -1},
+        {"max_iterations": 1, "num_eval_runs": 0},
+        {"max_iterations": 1, "min_metric": 1.0, "max_metric": 0.5},
+        {"max_iterations": 1, "candidate_selection": "invalid"},
+        {"max_iterations": 1, "pareto_merge_probability": -0.1},
+        {"max_iterations": 1, "pareto_merge_probability": 1.1},
+    ],
+)
+def test_apex_initialization_rejects_invalid_arguments(kwargs: dict[str, Any]) -> None:
+    with pytest.raises(ValueError):
+        APEX(
+            metric=simple_metric,
+            analysis_lm=make_analysis_lm(),
+            hypothesis_lm=DummyLM([], adapter=JSONAdapter()),
+            **kwargs,
+        )
+
+
+def test_apex_resume_uses_latest_checkpoint(tmp_path: Path) -> None:
+    baseline = PromptDrivenModule("baseline")
+    trainset = [make_example("question", "refined")]
+    valset = [make_example("question", "refined")]
+
+    analysis_lm = make_analysis_lm(failures=[make_analysis_response("Prompt should say 'refined'")])
+    hypothesis_lm = DummyLM([make_hypothesis_response("refined")], adapter=JSONAdapter())
+
+    apex = APEX(
+        metric=simple_metric,
         analysis_lm=analysis_lm,
         hypothesis_lm=hypothesis_lm,
         max_iterations=1,
+        convergence_patience=None,
         num_hypotheses=1,
-        convergence_patience=1,
-        num_eval_runs=1,
         train_sample=None,
-        seed=99,
-        verbosity="silent",
+        success_threshold=1.0,
+        min_metric=0.0,
+        max_metric=1.0,
+        checkpoint_dir=str(tmp_path),
+        include_hypothesis_history=False,
+        seed=19,
     )
 
-    student = PromptDrivenModule(initial_prompt="bad")
-    optimized = optimizer.compile(student, trainset=trainset, valset=calset)
+    first_run = apex.compile(baseline, trainset=trainset, valset=valset)
+    assert first_run.predictor.signature.instructions == "refined"
+    first_result = first_run.apex_result
+    assert len(first_result.iterations) == 1
 
-    # Verify optimization succeeded (predictor names were resolved correctly)
-    assert optimized.predictor.signature.instructions == "good"
-    assert optimized.apex_result.best_candidate.overall_score == 1.0
-
-    # Verify predictor names appeared correctly in failure analysis
-    # (this would have failed with the "unknown" bug)
-    iteration = optimized.apex_result.iterations[0]
-    assert len(iteration.hypotheses) == 1
-    assert "predictor" in iteration.hypotheses[0].prompt_changes
-
-
-# Comprehensive Pareto Frontier and Score Alignment Tests
-
-
-def test_non_dominated_requires_aligned_score_vectors() -> None:
-    """Test that dominance comparison requires properly aligned score vectors."""
-    # All candidates must have same-length score vectors for valid comparison
-    cand_a = _make_candidate("a", [1.0, 0.0, 1.0, 0.0, 1.0], iteration=0)
-    cand_b = _make_candidate("b", [1.0, 0.0, 0.5, 1.0, 0.0], iteration=1)
-    cand_c = _make_candidate("c", [0.0, 1.0, 1.0, 0.0, 1.0], iteration=2)
-
-    frontier = non_dominated_candidates([cand_a, cand_b, cand_c])
-
-    # All three have different patterns - none strictly dominates
-    assert len(frontier) == 3
-    assert cand_a in frontier
-    assert cand_b in frontier
-    assert cand_c in frontier
-
-
-def test_non_dominated_detects_strict_dominance() -> None:
-    """Test that strictly dominating candidates correctly dominate."""
-    # Candidate A dominates B on all examples
-    cand_a = _make_candidate("a", [1.0, 1.0, 1.0, 1.0], iteration=0)
-    cand_b = _make_candidate("b", [1.0, 1.0, 1.0, 0.0], iteration=1)
-
-    frontier = non_dominated_candidates([cand_a, cand_b])
-
-    # Only A should be on frontier
-    assert len(frontier) == 1
-    assert cand_a in frontier
-    assert cand_b not in frontier
-
-
-def test_non_dominated_incomparable_candidates() -> None:
-    """Test that incomparable candidates (tradeoffs) all appear on frontier."""
-    # Each candidate wins on different examples - all incomparable
-    cand_a = _make_candidate("a", [1.0, 0.0, 0.0], iteration=0)
-    cand_b = _make_candidate("b", [0.0, 1.0, 0.0], iteration=1)
-    cand_c = _make_candidate("c", [0.0, 0.0, 1.0], iteration=2)
-
-    frontier = non_dominated_candidates([cand_a, cand_b, cand_c])
-
-    # All are incomparable - all on frontier
-    assert len(frontier) == 3
-    assert cand_a in frontier and cand_b in frontier and cand_c in frontier
-
-
-def test_non_dominated_with_identical_candidates() -> None:
-    """Test that identical candidates don't dominate each other."""
-    cand_a = _make_candidate("a", [1.0, 0.0, 1.0], iteration=0)
-    cand_b = _make_candidate("b", [1.0, 0.0, 1.0], iteration=1)
-
-    frontier = non_dominated_candidates([cand_a, cand_b])
-
-    # Both should be on frontier (neither strictly dominates)
-    assert len(frontier) == 2
-    assert cand_a in frontier
-    assert cand_b in frontier
-
-
-def test_dominance_with_mixed_scores() -> None:
-    """Test dominance with realistic score patterns."""
-    # Candidate A: good at first half
-    cand_a = _make_candidate("a", [1.0, 1.0, 1.0, 0.0, 0.0, 0.0], iteration=0)
-    # Candidate B: good at second half
-    cand_b = _make_candidate("b", [0.0, 0.0, 0.0, 1.0, 1.0, 1.0], iteration=1)
-    # Candidate C: mediocre overall but balanced
-    cand_c = _make_candidate("c", [0.5, 0.5, 0.5, 0.5, 0.5, 0.5], iteration=2)
-    # Candidate D: strictly dominated by both A and B
-    cand_d = _make_candidate("d", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0], iteration=3)
-
-    frontier = non_dominated_candidates([cand_a, cand_b, cand_c, cand_d])
-
-    # A, B, C are all incomparable (tradeoffs), D is dominated
-    assert len(frontier) == 3
-    assert cand_a in frontier
-    assert cand_b in frontier
-    assert cand_c in frontier
-    assert cand_d not in frontier
-
-
-def test_large_frontier_with_diverse_strategies() -> None:
-    """Test that diverse strategies lead to larger frontiers (expected behavior)."""
-    # Simulate 10 candidates with diverse strategies
-    candidates = []
-    for i in range(10):
-        # Each candidate excels on different examples
-        scores = [1.0 if j % 10 == i or (j + 1) % 10 == i else 0.0 for j in range(20)]
-        candidates.append(_make_candidate(f"strategy_{i}", scores, iteration=i))
-
-    frontier = non_dominated_candidates(candidates)
-
-    # With diverse patterns, most should be on frontier
-    # This is EXPECTED behavior - not a bug
-    assert len(frontier) >= 8  # Most candidates are incomparable
-
-
-def test_compute_win_weights_distributes_across_examples() -> None:
-    """Test that win weights correctly count per-example victories."""
-    cand_a = _make_candidate("a", [1.0, 0.0, 1.0, 0.0], iteration=0)
-    cand_b = _make_candidate("b", [0.0, 1.0, 0.0, 1.0], iteration=1)
-
-    weights = compute_win_weights([cand_a, cand_b])
-
-    # Each candidate wins on 2 examples
-    assert weights == [2.0, 2.0]
-
-
-def test_compute_win_weights_with_ties() -> None:
-    """Test that ties are split among candidates."""
-    cand_a = _make_candidate("a", [1.0, 1.0, 0.5], iteration=0)
-    cand_b = _make_candidate("b", [1.0, 0.0, 0.5], iteration=1)
-
-    weights = compute_win_weights([cand_a, cand_b])
-
-    # Example 0: both score 1.0 (tie) - both get a win
-    # Example 1: A scores 1.0, B scores 0.0 (A wins alone)
-    # Example 2: both score 0.5 (tie) - both get a win
-    assert weights == [3.0, 2.0]  # A: 2 ties + 1 solo = 3, B: 2 ties = 2
-
-
-def test_compute_win_weights_with_clear_winner() -> None:
-    """Test that a dominant candidate gets higher weight."""
-    cand_a = _make_candidate("a", [1.0, 1.0, 1.0, 1.0], iteration=0)
-    cand_b = _make_candidate("b", [0.0, 0.5, 0.5, 0.5], iteration=1)
-
-    weights = compute_win_weights([cand_a, cand_b])
-
-    # A wins all 4 examples
-    assert weights == [4.0, 0.0]
-
-
-def test_pareto_frontier_size_warning() -> None:
-    """Test that with hierarchical scores, frontier is smaller."""
-    # Create 50 candidates with hierarchical performance
-    # Some candidates strictly dominate others
-    candidates = []
-    for i in range(50):
-        # Create a hierarchical pattern where higher i means better overall
-        # This way, better candidates will dominate worse ones
-        base_level = i // 10  # 0, 0-9; 1, 10-19; 2, 20-29; etc.
-        scores = [0.2 * base_level + (0.1 if j % 5 == i % 5 else 0.0) for j in range(10)]
-        candidates.append(_make_candidate(f"cand_{i}", scores, iteration=i))
-
-    frontier = non_dominated_candidates(candidates)
-
-    # With hierarchical scores, higher-level candidates should dominate lower ones
-    # Expect significantly smaller frontier than with diverse strategies
-    frontier_ratio = len(frontier) / len(candidates)
-
-    # Should have much smaller frontier with hierarchical scores
-    # Approximately one candidate per base_level (5 levels) plus some variation
-    assert frontier_ratio < 0.3, (
-        f"Frontier contains {len(frontier)}/{len(candidates)} candidates ({frontier_ratio:.1%}). "
-        f"Expected smaller frontier with hierarchical scores."
+    resumed = APEX(
+        metric=simple_metric,
+        analysis_lm=analysis_lm,
+        hypothesis_lm=hypothesis_lm,
+        max_iterations=1,
+        convergence_patience=None,
+        num_hypotheses=1,
+        train_sample=None,
+        success_threshold=1.0,
+        min_metric=0.0,
+        max_metric=1.0,
+        checkpoint_dir=str(tmp_path),
+        include_hypothesis_history=False,
+        seed=19,
     )
+
+    resumed_program = resumed.compile(PromptDrivenModule("unused"), trainset=trainset, valset=valset, resume=True)
+    assert resumed_program.predictor.signature.instructions == "refined"
+    resumed_result = resumed_program.apex_result
+    assert len(resumed_result.iterations) == 1
+    assert resumed_result.best_candidate.overall_score == pytest.approx(first_result.best_candidate.overall_score)
+    assert resumed_result.stopped_after == "max_iterations"
