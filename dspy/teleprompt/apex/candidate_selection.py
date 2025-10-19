@@ -187,6 +187,12 @@ def _candidate_identity(candidate: CandidateRecord) -> tuple[object, ...]:
     return (prompt_key, score_key)
 
 
+def candidates_are_equivalent(a: CandidateRecord, b: CandidateRecord) -> bool:
+    """Return True if two candidates represent the same underlying prompt configuration."""
+
+    return _candidate_identity(a) == _candidate_identity(b)
+
+
 __all__ = [
     "CandidateSelectionStrategy",
     "SelectionResult",
@@ -195,4 +201,5 @@ __all__ = [
     "draw_weighted_candidate",
     "non_dominated_candidates",
     "select_baseline_candidate",
+    "candidates_are_equivalent",
 ]
