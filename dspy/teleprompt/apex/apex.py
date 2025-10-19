@@ -296,6 +296,7 @@ class APEX(Teleprompter):
         calset: Sequence[Example],
         iteration: int,
         cached_baseline: CandidateRecord | None = None,
+        baseline_overrides: dict[int, Module] | None = None,
     ) -> list[CandidateRecord]:
         return self.evaluator.evaluate_candidates(
             baseline=baseline,
@@ -303,6 +304,7 @@ class APEX(Teleprompter):
             calset=calset,
             iteration=iteration,
             cached_baseline=cached_baseline,
+            baseline_overrides=baseline_overrides,
         )
 
     def _evaluate_candidate(
@@ -707,6 +709,7 @@ class APEX(Teleprompter):
                     )
 
                     merge_hypotheses: list[HypothesisSpec] = []
+                    merge_baseline_overrides: dict[int, Module] = {}
                     if (
                         self.candidate_selection == "pareto"
                         and selection_result is not None
@@ -743,6 +746,9 @@ class APEX(Teleprompter):
                                     )
                                     if merge_hypotheses:
                                         hypotheses.extend(merge_hypotheses)
+                                        if len(merge_hypotheses) > 1:
+                                            partner_hypothesis = merge_hypotheses[1]
+                                            merge_baseline_overrides[id(partner_hypothesis)] = partner_candidate.program
                                         count = len(merge_hypotheses)
                                         noun = "hypothesis" if count == 1 else "hypotheses"
                                         self._log(
@@ -792,6 +798,7 @@ class APEX(Teleprompter):
                         calset=valset,
                         iteration=iteration,
                         cached_baseline=state.prev_iteration_best,
+                        baseline_overrides=merge_baseline_overrides,
                     )
 
                     best_candidate_for_iteration = self.evaluator.select_best_candidate(iteration_candidates)

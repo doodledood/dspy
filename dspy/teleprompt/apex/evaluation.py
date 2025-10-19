@@ -6,7 +6,7 @@ import random
 from collections import defaultdict
 from dataclasses import dataclass
 from statistics import median
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import dspy
 from dspy.primitives import Example, Module, Prediction
@@ -136,6 +136,7 @@ class EvaluationEngine:
         calset: Sequence[Example],
         iteration: int,
         cached_baseline: CandidateRecord | None = None,
+        baseline_overrides: Mapping[int, Module] | None = None,
     ) -> list[CandidateRecord]:
         """Evaluate the baseline and each hypothesis on the calibration set."""
 
@@ -143,6 +144,8 @@ class EvaluationEngine:
 
         candidate_specs: list[tuple[int, str, Module, Module, HypothesisSpec | None]] = []
         spec_counter = 0
+
+        baseline_map = dict(baseline_overrides or {})
 
         if cached_baseline is not None:
             baseline_record = CandidateRecord(
@@ -163,7 +166,8 @@ class EvaluationEngine:
             spec_counter += 1
 
         for hypothesis in hypotheses:
-            candidate_program = self.apply_hypothesis(baseline, hypothesis)
+            hypothesis_baseline = baseline_map.get(id(hypothesis), baseline)
+            candidate_program = self.apply_hypothesis(hypothesis_baseline, hypothesis)
             candidate_specs.append(
                 (spec_counter, "hypothesis", candidate_program, candidate_program.deepcopy(), hypothesis)
             )
