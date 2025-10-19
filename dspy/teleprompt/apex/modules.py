@@ -156,7 +156,7 @@ class HypothesisGenerationModule(Module):
 
 
 class ParetoMergeModule(Module):
-    """Generates merge hypotheses that blend two Pareto candidates from the frontier."""
+    """Generates paired merge hypotheses that blend two Pareto candidates from the frontier."""
 
     def __init__(self, *, attempts: int = 3) -> None:
         super().__init__()
@@ -169,15 +169,22 @@ class ParetoMergeModule(Module):
         inputs: Mapping[str, Any],
         lm: LM,
         adapter: Adapter,
-    ) -> HypothesisSpec | None:
+    ) -> list[HypothesisSpec]:
         def reward_fn(_, prediction: Prediction | None) -> float:
             if prediction is None:
                 return 0.0
-            hypothesis = getattr(prediction, "hypothesis", None)
-            if hypothesis is None:
+
+            primary = getattr(prediction, "primary_hypothesis", None)
+            partner = getattr(prediction, "partner_hypothesis", None)
+            if primary is None or partner is None:
                 return 0.0
-            prompt_changes = getattr(hypothesis, "prompt_changes", {}) or {}
-            return 1.0 if prompt_changes else 0.0
+
+            primary_changes = getattr(primary, "prompt_changes", {}) or {}
+            partner_changes = getattr(partner, "prompt_changes", {}) or {}
+            if not primary_changes or not partner_changes:
+                return 0.0
+
+            return 1.0
 
         with dspy.context(lm=lm, adapter=adapter):
             validator = dspy.Refine(
@@ -190,18 +197,20 @@ class ParetoMergeModule(Module):
             result = validator(**inputs)
 
         if result is None:
-            return None
+            return []
 
-        hypothesis = getattr(result, "hypothesis", None)
-        if hypothesis is None:
-            return None
+        hypotheses: list[HypothesisSpec] = []
+        for attribute in ("primary_hypothesis", "partner_hypothesis"):
+            hypothesis = getattr(result, attribute, None)
+            if hypothesis is None:
+                return []
+            if not hypothesis.prompt_changes:
+                return []
+            if not getattr(hypothesis, "strategy", ""):
+                hypothesis.strategy = "Pareto merge refinement"
+            hypotheses.append(hypothesis)
 
-        if not hypothesis.prompt_changes:
-            return None
-
-        if not getattr(hypothesis, "strategy", ""):
-            hypothesis.strategy = "Pareto merge refinement"
-        return hypothesis
+        return hypotheses
 
 
 __all__ = [
