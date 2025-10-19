@@ -417,6 +417,57 @@ def test_pareto_merge_probability_triggers_merge_hypothesis() -> None:
     assert all(h.prompt_changes for h in merge_hypotheses)
 
 
+def test_pareto_merge_skips_equivalent_partner(monkeypatch: pytest.MonkeyPatch) -> None:
+    trainset = [
+        Example(input="needs_bad", output="bad").with_inputs("input"),
+        Example(input="needs_good", output="good").with_inputs("input"),
+    ]
+    valset = list(trainset)
+
+    analysis_lm = make_routed_analysis_lm(
+        failures=[make_analysis_response() for _ in range(10)],
+        successes=[make_success_response() for _ in range(10)],
+    )
+    hypothesis_lm = DummyLM(
+        [
+            make_hypothesis_response("good"),
+            make_hypothesis_response("bad"),
+            make_merge_response("blend"),
+        ],
+        adapter=dspy.JSONAdapter(),
+    )
+
+    def stub_draw_weighted_candidate(candidates, weights, *, rng, exclude=None):  # type: ignore[no-untyped-def]
+        return candidates[0]
+
+    monkeypatch.setattr(
+        "dspy.teleprompt.apex.candidate_selection.draw_weighted_candidate",
+        stub_draw_weighted_candidate,
+    )
+    monkeypatch.setattr("dspy.teleprompt.apex.apex.draw_weighted_candidate", stub_draw_weighted_candidate)
+
+    optimizer = APEX(
+        metric=metric,
+        analysis_lm=analysis_lm,
+        hypothesis_lm=hypothesis_lm,
+        max_iterations=2,
+        num_hypotheses=1,
+        convergence_patience=3,
+        seed=0,
+        verbosity="silent",
+        candidate_selection="pareto",
+        pareto_merge_probability=1.0,
+    )
+
+    student = PromptDrivenModule(initial_prompt="bad")
+    optimized = optimizer.compile(student, trainset=trainset, valset=valset)
+
+    assert len(optimized.apex_result.iterations) >= 2
+    second_iter = optimized.apex_result.iterations[1]
+    strategies = [hyp.strategy for hyp in second_iter.hypotheses]
+    assert "Pareto merge refinement" not in strategies
+
+
 def test_best_on_val_ignores_merge_probability() -> None:
     trainset = [
         Example(input="needs_bad", output="bad").with_inputs("input"),

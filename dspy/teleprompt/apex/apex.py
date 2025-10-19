@@ -22,6 +22,7 @@ from .analysis import (
 from .candidate_selection import (
     CandidateSelectionStrategy,
     SelectionResult,
+    candidates_are_equivalent,
     draw_weighted_candidate,
     select_baseline_candidate,
 )
@@ -725,23 +726,29 @@ class APEX(Teleprompter):
                                 partner_candidate = None
 
                             if partner_candidate is not None and pareto_baseline is not None:
-                                merge_hypotheses = generate_merge_hypotheses(
-                                    baseline_candidate=pareto_baseline,
-                                    partner_candidate=partner_candidate,
-                                    runtime=self.runtime,
-                                    hypothesis_lm=self.hypothesis_lm,
-                                    hypothesis_adapter=self.hypothesis_adapter,
-                                    iteration=iteration,
-                                    tracker=self.tracker,
-                                )
-                                if merge_hypotheses:
-                                    hypotheses.extend(merge_hypotheses)
-                                    count = len(merge_hypotheses)
-                                    noun = "hypothesis" if count == 1 else "hypotheses"
+                                if candidates_are_equivalent(partner_candidate, pareto_baseline):
                                     self._log(
-                                        f"APEX: Generated {count} Pareto merge {noun}",
+                                        "APEX: Skipped Pareto merge hypotheses (partner matches baseline)",
                                         Verbosity.DETAILED,
                                     )
+                                else:
+                                    merge_hypotheses = generate_merge_hypotheses(
+                                        baseline_candidate=pareto_baseline,
+                                        partner_candidate=partner_candidate,
+                                        runtime=self.runtime,
+                                        hypothesis_lm=self.hypothesis_lm,
+                                        hypothesis_adapter=self.hypothesis_adapter,
+                                        iteration=iteration,
+                                        tracker=self.tracker,
+                                    )
+                                    if merge_hypotheses:
+                                        hypotheses.extend(merge_hypotheses)
+                                        count = len(merge_hypotheses)
+                                        noun = "hypothesis" if count == 1 else "hypotheses"
+                                        self._log(
+                                            f"APEX: Generated {count} Pareto merge {noun}",
+                                            Verbosity.DETAILED,
+                                        )
                             else:
                                 self._log(
                                     "APEX: Skipped Pareto merge hypotheses (no suitable partner candidate found)",
