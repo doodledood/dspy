@@ -136,13 +136,24 @@ class EvaluationEngine:
         calset: Sequence[Example],
         iteration: int,
         cached_baseline: CandidateRecord | None = None,
+        hypothesis_baselines: Sequence[Module] | None = None,
     ) -> list[CandidateRecord]:
-        """Evaluate the baseline and each hypothesis on the calibration set."""
+        """Evaluate the baseline and each hypothesis on the calibration set.
+
+        When ``hypothesis_baselines`` is provided, each hypothesis is applied to the
+        corresponding module instead of the shared ``baseline``. This is useful for
+        evaluating hypotheses that were generated from different source programs
+        (e.g., Pareto partner merges).
+        """
 
         candidates: list[CandidateRecord] = []
 
         candidate_specs: list[tuple[int, str, Module, Module, HypothesisSpec | None]] = []
         spec_counter = 0
+
+        if hypothesis_baselines is not None and len(hypothesis_baselines) != len(hypotheses):
+            msg = "Length of hypothesis_baselines must match length of hypotheses"
+            raise ValueError(msg)
 
         if cached_baseline is not None:
             baseline_record = CandidateRecord(
@@ -162,8 +173,13 @@ class EvaluationEngine:
             candidate_specs.append((spec_counter, "baseline", baseline, baseline.deepcopy(), None))
             spec_counter += 1
 
-        for hypothesis in hypotheses:
-            candidate_program = self.apply_hypothesis(baseline, hypothesis)
+        for idx, hypothesis in enumerate(hypotheses):
+            baseline_program = (
+                hypothesis_baselines[idx]
+                if hypothesis_baselines is not None
+                else baseline
+            )
+            candidate_program = self.apply_hypothesis(baseline_program, hypothesis)
             candidate_specs.append(
                 (spec_counter, "hypothesis", candidate_program, candidate_program.deepcopy(), hypothesis)
             )

@@ -295,6 +295,7 @@ class APEX(Teleprompter):
         calset: Sequence[Example],
         iteration: int,
         cached_baseline: CandidateRecord | None = None,
+        hypothesis_baselines: Sequence[Module] | None = None,
     ) -> list[CandidateRecord]:
         return self.evaluator.evaluate_candidates(
             baseline=baseline,
@@ -302,6 +303,7 @@ class APEX(Teleprompter):
             calset=calset,
             iteration=iteration,
             cached_baseline=cached_baseline,
+            hypothesis_baselines=hypothesis_baselines,
         )
 
     def _evaluate_candidate(
@@ -705,6 +707,8 @@ class APEX(Teleprompter):
                         selection_strategy=self.candidate_selection,
                     )
 
+                    hypothesis_baselines: list[Module] = [state.current_program] * len(hypotheses)
+
                     merge_hypotheses: list[HypothesisSpec] = []
                     if (
                         self.candidate_selection == "pareto"
@@ -736,6 +740,13 @@ class APEX(Teleprompter):
                                 )
                                 if merge_hypotheses:
                                     hypotheses.extend(merge_hypotheses)
+                                    for merge_idx in range(len(merge_hypotheses)):
+                                        if merge_idx == 0:
+                                            # First merge hypothesis refines the current baseline program.
+                                            hypothesis_baselines.append(state.current_program)
+                                        else:
+                                            # Remaining merge hypotheses are generated from the partner candidate.
+                                            hypothesis_baselines.append(partner_candidate.program)
                                     count = len(merge_hypotheses)
                                     noun = "hypothesis" if count == 1 else "hypotheses"
                                     self._log(
@@ -785,6 +796,7 @@ class APEX(Teleprompter):
                         calset=valset,
                         iteration=iteration,
                         cached_baseline=state.prev_iteration_best,
+                        hypothesis_baselines=hypothesis_baselines,
                     )
 
                     best_candidate_for_iteration = self.evaluator.select_best_candidate(iteration_candidates)
