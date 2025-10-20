@@ -854,10 +854,12 @@ def generate_merge_hypotheses(
 
         if span and hasattr(span, "set_outputs"):
             try:
-                span.set_outputs({
-                    "primary_hypothesis": to_serializable(hypotheses[0]),
-                    "partner_hypothesis": to_serializable(hypotheses[1]),
-                })
+                span.set_outputs(
+                    {
+                        "primary_hypothesis": to_serializable(hypotheses[0]),
+                        "partner_hypothesis": to_serializable(hypotheses[1]),
+                    }
+                )
             except Exception:  # pragma: no cover - defensive
                 pass
 

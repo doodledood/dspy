@@ -172,9 +172,7 @@ def finalize_optimization(
             best_candidate=state.best_candidate,
             initial_score=state.initial_baseline.overall_score,
             selection_strategy=candidate_selection,
-            pareto_merge_probability=(
-                pareto_merge_probability if candidate_selection == "pareto" else None
-            ),
+            pareto_merge_probability=(pareto_merge_probability if candidate_selection == "pareto" else None),
         )
         print_fn(summary_table)
 
@@ -203,9 +201,7 @@ def finalize_optimization(
                 for pred_name, change in state.best_candidate.hypothesis.prompt_changes.items():
                     best_program_data["prompt_changes"][pred_name] = {
                         "new_prompt": change.new_prompt,
-                        "change_summary": (
-                            change.change_summary if hasattr(change, "change_summary") else ""
-                        ),
+                        "change_summary": (change.change_summary if hasattr(change, "change_summary") else ""),
                     }
             tracker.log_best_program(best_program_data)
 
@@ -217,9 +213,7 @@ def finalize_optimization(
             Verbosity.DETAILED,
         )
         score_trajectory = [
-            max((c.overall_score for c in log_entry.candidates), default=0.0)
-            if log_entry.candidates
-            else 0.0
+            max((c.overall_score for c in log_entry.candidates), default=0.0) if log_entry.candidates else 0.0
             for log_entry in state.iteration_logs
         ]
         log(
@@ -243,4 +237,3 @@ __all__ = [
     "initialize_new_state",
     "resume_from_checkpoint",
 ]
-

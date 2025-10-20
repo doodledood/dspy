@@ -251,8 +251,7 @@ class OptimizationLoop:
 
         total_hypotheses = len(hypotheses)
         merge_note = (
-            f" (including {len(merge_hypotheses)} Pareto merge"
-            f"{'s' if len(merge_hypotheses) != 1 else ''})"
+            f" (including {len(merge_hypotheses)} Pareto merge{'s' if len(merge_hypotheses) != 1 else ''})"
             if merge_hypotheses
             else ""
         )
@@ -406,8 +405,7 @@ class OptimizationLoop:
         state.no_improvement_count += 1
         if self.settings.convergence_patience is not None:
             self.cb.log(
-                "APEX: No improvement ("
-                f"{state.no_improvement_count}/{self.settings.convergence_patience} patience)",
+                f"APEX: No improvement ({state.no_improvement_count}/{self.settings.convergence_patience} patience)",
                 Verbosity.DETAILED,
             )
             if state.no_improvement_count >= (self.settings.convergence_patience or 0):
@@ -490,11 +488,8 @@ class OptimizationLoop:
                     success_summaries.append(summary)
 
         if self.cb.is_enabled(Verbosity.DETAILED):
-            _log_analysis_results(
-                failure_summaries=failure_summaries,
-                success_summaries=success_summaries,
-                log=self.cb.log,
-            )
+            _log_analysis_results("failure", failure_summaries, self.cb.log, self.cb.runtime)
+            _log_analysis_results("success", success_summaries, self.cb.log, self.cb.runtime)
 
         return failure_summaries, success_summaries
 
