@@ -12,23 +12,16 @@ from dspy.clients.lm import LM
 from dspy.primitives import Example, Module
 from dspy.teleprompt.teleprompt import Teleprompter
 
-from . import tracking_utils
-from .analysis import (
-    _log_analysis_results,
-    analyze_failures_and_successes,
-    generate_hypotheses,
-    generate_merge_hypotheses,
-)
 from .analysis import (
     analyze_record as _analyze_single_record,
 )
-from .candidate_selection import (
-    CandidateSelectionStrategy,
-    SelectionResult,
-    candidates_are_equivalent,
-    draw_weighted_candidate,
-    select_baseline_candidate,
+from .analysis import (
+    generate_hypotheses as _generate_hypotheses,
 )
+from .analysis import (
+    generate_merge_hypotheses as _generate_merge_hypotheses,
+)
+from .candidate_selection import CandidateSelectionStrategy
 from .checkpoint_manager import CheckpointManager
 from .evaluation import EvaluationEngine
 from .execution_flow import (
@@ -39,15 +32,13 @@ from .execution_flow import (
 from .lifecycle import finalize_optimization, initialize_new_state, resume_from_checkpoint
 from .models import (
     ApexCheckpoint,
-    ApexIterationLog,
     CandidateRecord,
     CheckpointConfig,
     ExecutionFlowEntry,
     HypothesisSpec,
 )
+from .optimization import LoopCollaborators, LoopSettings, OptimizationLoop
 from .runtime import RuntimeTools
-from .sampling import sample_trainset
-from .snapshot import snapshot_program
 from .state import OptimizationState
 from .tracker import ExperimentTracker
 from .types import LogLevel, MetricFn, SamplerFn, TraceEntry, Verbosity
@@ -58,6 +49,8 @@ logger = logging.getLogger(__name__)
 # Backward-compatible alias so downstream users (and tests) can monkeypatch
 # ``analyze_record`` directly from this module.
 analyze_record = _analyze_single_record
+generate_hypotheses = _generate_hypotheses
+generate_merge_hypotheses = _generate_merge_hypotheses
 
 
 class APEX(Teleprompter):
@@ -255,30 +248,6 @@ class APEX(Teleprompter):
     def _format_execution_flow_with_details(self, execution_flow: list[ExecutionFlowEntry]) -> str:
         return format_execution_flow_with_details(execution_flow)
 
-    def _initialize_iteration_baseline(
-        self,
-        state: OptimizationState,
-    ) -> tuple[CandidateRecord | None, SelectionResult | None]:
-        if self.candidate_selection != "pareto":
-            return None, None
-
-        selection = select_baseline_candidate(
-            candidates=state.all_candidates,
-            strategy="pareto",
-            rng=self._rng,
-        )
-        baseline_record = selection.baseline
-        state.prev_iteration_best = baseline_record
-        state.current_program = baseline_record.program.deepcopy()
-        if self._is_enabled(Verbosity.DETAILED):
-            frontier_note = f", frontier_size={len(selection.frontier)}"
-            self._log(
-                "APEX: Pareto baseline selected (iteration="
-                f"{baseline_record.iteration}, score={baseline_record.overall_score:.4f}{frontier_note})",
-                Verbosity.DETAILED,
-            )
-        return baseline_record, selection
-
     def _build_checkpoint_config(self) -> CheckpointConfig:
         return CheckpointConfig(
             max_iterations=self.max_iterations,
@@ -466,443 +435,37 @@ class APEX(Teleprompter):
         trainset: Sequence[Example],
         valset: Sequence[Example],
     ) -> OptimizationState:
-        sampled_train: list[Example] = []
-        failure_summaries = []
-        success_summaries = []
-        hypotheses: list[HypothesisSpec] = []
-        iteration_candidates: list[CandidateRecord] | None = None
-        selection_result: SelectionResult | None = None
-        pareto_baseline: CandidateRecord | None = None
+        loop = OptimizationLoop(
+            settings=LoopSettings(
+                max_iterations=self.max_iterations,
+                convergence_patience=self.convergence_patience,
+                train_sample=self.train_sample,
+                num_hypotheses=self.num_hypotheses,
+                include_hypothesis_history=self.include_hypothesis_history,
+                candidate_selection=self.candidate_selection,
+                pareto_merge_probability=self.pareto_merge_probability,
+                success_threshold=self.success_threshold,
+                min_metric=self.min_metric,
+                max_metric=self.max_metric,
+            ),
+            collaborators=LoopCollaborators(
+                runtime=self.runtime,
+                evaluator=self.evaluator,
+                tracker=self.tracker,
+                checkpoints=self.checkpoints,
+                rng=self._rng,
+                build_checkpoint_config=self._build_checkpoint_config,
+                log=self._log,
+                is_enabled=self._is_enabled,
+                analysis_lm=self.analysis_lm,
+                analysis_adapter=self.analysis_adapter,
+                hypothesis_lm=self.hypothesis_lm,
+                hypothesis_adapter=self.hypothesis_adapter,
+                analysis_fn=analyze_record,
+                format_execution_flow=self._format_execution_flow_with_details,
+                generate_hypotheses=generate_hypotheses,
+                generate_merge_hypotheses=generate_merge_hypotheses,
+            ),
+        )
 
-        try:
-            while True:
-                iteration_candidates = None
-                iteration = state.start_next_iteration()
-
-                if self.max_iterations is not None and iteration > self.max_iterations:
-                    state.stop_reason = "max_iterations"
-                    self._log(
-                        "APEX: Stopping due to max iterations reached",
-                        Verbosity.NORMAL,
-                    )
-                    break
-
-                pareto_baseline, selection_result = self._initialize_iteration_baseline(state)
-
-                sampler = self.train_sample if self.train_sample is not None else len(trainset)
-                sampled_train = sample_trainset(
-                    trainset,
-                    sampler=sampler,
-                    rng=self._rng,
-                    iteration=iteration,
-                )
-                snapshot = snapshot_program(state.current_program)
-                available_predictor_names = list(snapshot.prompts.keys()) if snapshot.prompts else []
-
-                failures, successes = self.evaluator.evaluate_train_examples(
-                    program=state.current_program,
-                    trainset=sampled_train,
-                    iteration=iteration,
-                )
-                if not failures:
-                    self._log(
-                        f"APEX: Iteration {iteration} - Perfect performance! All {len(successes)} examples succeeded",
-                        Verbosity.NORMAL,
-                    )
-                    state.iteration_logs.append(
-                        ApexIterationLog(
-                            iteration=iteration,
-                            sampled_train_size=len(sampled_train),
-                            num_failures=0,
-                            num_successes=len(successes),
-                            hypotheses=[],
-                            candidates=[],
-                        )
-                    )
-                    state.no_improvement_count += 1
-                    if self.convergence_patience is not None:
-                        self._log(
-                            "APEX: No improvement ("
-                            f"{state.no_improvement_count}/{self.convergence_patience} patience)",
-                            Verbosity.DETAILED,
-                        )
-                        if state.no_improvement_count >= self.convergence_patience:
-                            state.stop_reason = "patience"
-                            self._log(
-                                "APEX: Stopping due to convergence patience reached (all successes)",
-                                Verbosity.NORMAL,
-                            )
-                            break
-                    self.checkpoints.save(
-                        iteration=iteration,
-                        current_program=state.current_program,
-                        best_candidate=state.best_candidate,
-                        all_candidates=state.all_candidates,
-                        iteration_logs=state.iteration_logs,
-                        no_improvement_count=state.no_improvement_count,
-                        iteration_baseline=state.iteration_baseline,
-                        rng_state=self._rng.getstate(),
-                        config=self._build_checkpoint_config(),
-                    )
-                    continue
-
-                analysis_fn = analyze_record
-                if analysis_fn is _analyze_single_record:
-                    failure_summaries, success_summaries = analyze_failures_and_successes(
-                        failure_records=failures,
-                        success_records=successes,
-                        analysis_lm=self.analysis_lm,
-                        analysis_adapter=self.analysis_adapter,
-                        runtime=self.runtime,
-                        tracker=self.tracker,
-                        success_threshold=self.success_threshold,
-                        min_metric=self.min_metric,
-                        max_metric=self.max_metric,
-                        format_execution_flow=self._format_execution_flow_with_details,
-                        log=self._log,
-                        iteration=iteration,
-                        available_predictor_names=available_predictor_names,
-                    )
-                else:
-                    failure_summaries = []
-                    success_summaries = []
-                    for idx, record in enumerate(failures):
-                        summary = analysis_fn(  # type: ignore[misc]
-                            record,
-                            mode="failure",
-                            analysis_lm=self.analysis_lm,
-                            analysis_adapter=self.analysis_adapter,
-                            runtime=self.runtime,
-                            tracker=self.tracker,
-                            success_threshold=self.success_threshold,
-                            min_metric=self.min_metric,
-                            max_metric=self.max_metric,
-                            format_execution_flow=self._format_execution_flow_with_details,
-                            log=self._log,
-                            iteration=iteration,
-                            example_index=idx,
-                            available_predictor_names=available_predictor_names,
-                        )
-                        if summary is not None:
-                            failure_summaries.append(summary)
-                    for idx, record in enumerate(successes):
-                        summary = analysis_fn(  # type: ignore[misc]
-                            record,
-                            mode="success",
-                            analysis_lm=self.analysis_lm,
-                            analysis_adapter=self.analysis_adapter,
-                            runtime=self.runtime,
-                            tracker=self.tracker,
-                            success_threshold=self.success_threshold,
-                            min_metric=self.min_metric,
-                            max_metric=self.max_metric,
-                            format_execution_flow=self._format_execution_flow_with_details,
-                            log=self._log,
-                            iteration=iteration,
-                            example_index=idx,
-                            available_predictor_names=None,
-                        )
-                        if summary is not None:
-                            success_summaries.append(summary)
-                self._log(
-                    f"APEX: Train evaluation complete - {len(failures)} failures, {len(successes)} successes",
-                    Verbosity.DETAILED,
-                )
-                if self._is_enabled(Verbosity.DETAILED):
-                    _log_analysis_results(
-                        failure_summaries=failure_summaries,
-                        success_summaries=success_summaries,
-                        log=self._log,
-                    )
-
-                if not failure_summaries and not success_summaries:
-                    self._log(
-                        "APEX: No analyses generated; continuing to next iteration",
-                        Verbosity.DETAILED,
-                    )
-                    self.checkpoints.save(
-                        iteration=iteration,
-                        current_program=state.current_program,
-                        best_candidate=state.best_candidate,
-                        all_candidates=state.all_candidates,
-                        iteration_logs=state.iteration_logs,
-                        no_improvement_count=state.no_improvement_count,
-                        iteration_baseline=state.iteration_baseline,
-                        rng_state=self._rng.getstate(),
-                        config=self._build_checkpoint_config(),
-                    )
-                    continue
-
-                if self._is_enabled(Verbosity.DETAILED):
-                    self._log(
-                        "APEX: iteration "
-                        f"{iteration} analyzed {len(failure_summaries)} failure(s) and {len(success_summaries)} success(es)",
-                        Verbosity.DETAILED,
-                    )
-
-                hypotheses = generate_hypotheses(
-                    failure_summaries=failure_summaries,
-                    success_summaries=success_summaries,
-                    snapshot=snapshot,
-                    candidate_history=state.all_candidates,
-                    best_val_score=state.best_candidate.overall_score,
-                    runtime=self.runtime,
-                    hypothesis_lm=self.hypothesis_lm,
-                    hypothesis_adapter=self.hypothesis_adapter,
-                    num_hypotheses=self.num_hypotheses,
-                    include_history=self.include_hypothesis_history,
-                    rng=self._rng,
-                    log=self._log,
-                    iteration=iteration,
-                    tracker=self.tracker,
-                    selection_strategy=self.candidate_selection,
-                )
-
-                merge_hypotheses: list[HypothesisSpec] = []
-                merge_baseline_overrides: dict[int, Module] = {}
-                if (
-                    self.candidate_selection == "pareto"
-                    and selection_result is not None
-                    and len(selection_result.frontier) > 1
-                    and self.pareto_merge_probability > 0.0
-                ):
-                    merge_roll = self._rng.random()
-                    if merge_roll < self.pareto_merge_probability:
-                        try:
-                            partner_candidate = draw_weighted_candidate(
-                                selection_result.frontier,
-                                selection_result.weights,
-                                rng=self._rng,
-                                exclude=[pareto_baseline] if pareto_baseline is not None else None,
-                            )
-                        except ValueError:
-                            partner_candidate = None
-
-                        if partner_candidate is not None and pareto_baseline is not None:
-                            if candidates_are_equivalent(partner_candidate, pareto_baseline):
-                                self._log(
-                                    "APEX: Skipped Pareto merge hypotheses (partner matches baseline)",
-                                    Verbosity.DETAILED,
-                                )
-                            else:
-                                merge_hypotheses = generate_merge_hypotheses(
-                                    baseline_candidate=pareto_baseline,
-                                    partner_candidate=partner_candidate,
-                                    runtime=self.runtime,
-                                    hypothesis_lm=self.hypothesis_lm,
-                                    hypothesis_adapter=self.hypothesis_adapter,
-                                    iteration=iteration,
-                                    tracker=self.tracker,
-                                )
-                                if merge_hypotheses:
-                                    hypotheses.extend(merge_hypotheses)
-                                    if len(merge_hypotheses) > 1:
-                                        partner_hypothesis = merge_hypotheses[1]
-                                        merge_baseline_overrides[id(partner_hypothesis)] = partner_candidate.program
-                                    count = len(merge_hypotheses)
-                                    noun = "hypothesis" if count == 1 else "hypotheses"
-                                    self._log(
-                                        f"APEX: Generated {count} Pareto merge {noun}",
-                                        Verbosity.DETAILED,
-                                    )
-                        else:
-                            self._log(
-                                "APEX: Skipped Pareto merge hypotheses (no suitable partner candidate found)",
-                                Verbosity.DETAILED,
-                            )
-
-                total_hypotheses = len(hypotheses)
-                merge_note = (
-                    f" (including {len(merge_hypotheses)} Pareto merge"
-                    f"{'s' if len(merge_hypotheses) != 1 else ''})"
-                    if merge_hypotheses
-                    else ""
-                )
-                self._log(
-                    f"APEX: Generated {total_hypotheses} hypothesis{'es' if total_hypotheses != 1 else ''}{merge_note} for iteration {iteration}",
-                    Verbosity.NORMAL,
-                )
-
-                if hypotheses and self._is_enabled(Verbosity.NORMAL):
-                    merge_ids = {id(h) for h in merge_hypotheses}
-                    for idx, hypothesis in enumerate(hypotheses, start=1):
-                        predictors_updated = (
-                            list(hypothesis.prompt_changes.keys()) if hypothesis.prompt_changes else []
-                        )
-                        is_merge = id(hypothesis) in merge_ids
-                        hypothesis_label = f"Hypothesis #{idx} (Pareto merge)" if is_merge else f"Hypothesis #{idx}"
-                        self._log(
-                            f"  → {hypothesis_label}: {hypothesis.strategy} | Impact: {hypothesis.impact_score:.2f} | "
-                            f"Targets: {', '.join(predictors_updated) if predictors_updated else 'none'}",
-                            Verbosity.NORMAL,
-                        )
-                if self._is_enabled(Verbosity.DETAILED) and hypotheses:
-                    self._log(
-                        "APEX: Detailed hypothesis info follows...",
-                        Verbosity.DETAILED,
-                    )
-
-                iteration_candidates = self.evaluator.evaluate_candidates(
-                    baseline=state.current_program,
-                    hypotheses=hypotheses,
-                    calset=valset,
-                    iteration=iteration,
-                    cached_baseline=state.prev_iteration_best,
-                    baseline_overrides=merge_baseline_overrides,
-                )
-
-                best_candidate_for_iteration = self.evaluator.select_best_candidate(iteration_candidates)
-
-                state.all_candidates.extend(iteration_candidates)
-                state.iteration_logs.append(
-                    ApexIterationLog(
-                        iteration=iteration,
-                        sampled_train_size=len(sampled_train),
-                        num_failures=len(failure_summaries),
-                        num_successes=len(success_summaries),
-                        hypotheses=hypotheses,
-                        candidates=iteration_candidates,
-                    )
-                )
-
-                if self.tracker.is_active():
-                    iteration_data = tracking_utils.format_iteration_metrics(
-                        iteration=iteration,
-                        num_failures=len(failure_summaries),
-                        num_successes=len(success_summaries),
-                        hypotheses=hypotheses,
-                        candidates=iteration_candidates,
-                        best_score=best_candidate_for_iteration.overall_score,
-                    )
-                    self.tracker.log_iteration(iteration, iteration_data)
-
-                    for idx, candidate in enumerate(iteration_candidates):
-                        candidate_data = tracking_utils.format_candidate_data(candidate)
-                        self.tracker.log_candidate(candidate_data, iteration, idx)
-
-                if best_candidate_for_iteration.overall_score > state.best_candidate.overall_score:
-                    state.best_candidate = best_candidate_for_iteration
-                    self._log(
-                        f"APEX: New best candidate found with score {state.best_candidate.overall_score:.4f}",
-                        Verbosity.NORMAL,
-                    )
-                    if state.best_candidate.hypothesis and state.best_candidate.hypothesis.prompt_changes:
-                        self._log(
-                            "APEX: Improved "
-                            f"{len(state.best_candidate.hypothesis.prompt_changes)} predictor prompt(s) - "
-                            f"strategy: {state.best_candidate.hypothesis.strategy}",
-                            Verbosity.NORMAL,
-                        )
-                        if self._is_enabled(Verbosity.DETAILED):
-                            self._log(
-                                "APEX: Detailed improved prompts:",
-                                Verbosity.DETAILED,
-                            )
-                            for (
-                                predictor_name,
-                                changes,
-                            ) in state.best_candidate.hypothesis.prompt_changes.items():
-                                preview = (
-                                    f"  → {predictor_name}: {changes.new_prompt[:300]}..."
-                                    if len(changes.new_prompt) > 300
-                                    else f"  → {predictor_name}: {changes.new_prompt}"
-                                )
-                                self._log(preview, Verbosity.DETAILED)
-
-                state.iteration_baseline = iteration_candidates[0]
-                self._log(
-                    f"APEX: Iteration {iteration} best score: {best_candidate_for_iteration.overall_score:.4f}",
-                    Verbosity.NORMAL,
-                )
-
-                if self._is_enabled(Verbosity.DETAILED):
-                    score_improvements = [
-                        candidate.overall_score - state.iteration_baseline.overall_score
-                        for candidate in iteration_candidates[1:]
-                    ]
-                    if score_improvements:
-                        self._log(
-                            f"APEX: Score improvements from iteration baseline: {score_improvements}",
-                            Verbosity.DETAILED,
-                        )
-
-                if best_candidate_for_iteration is state.iteration_baseline:
-                    state.no_improvement_count += 1
-                    if self.convergence_patience is not None:
-                        self._log(
-                            "APEX: No improvement ("
-                            f"{state.no_improvement_count}/{self.convergence_patience} patience)",
-                            Verbosity.DETAILED,
-                        )
-                        if state.no_improvement_count >= self.convergence_patience:
-                            state.stop_reason = "patience"
-                            self._log(
-                                "APEX: Stopping due to convergence patience reached",
-                                Verbosity.NORMAL,
-                            )
-                            break
-                    else:
-                        self._log(
-                            f"APEX: No improvement in iteration {iteration} (patience disabled)",
-                            Verbosity.DETAILED,
-                        )
-                else:
-                    state.no_improvement_count = 0
-                    state.current_program = best_candidate_for_iteration.program
-                    self._log(
-                        "APEX: Updating program with hypothesis improvements",
-                        Verbosity.DETAILED,
-                    )
-
-                state.prev_iteration_best = best_candidate_for_iteration
-
-                self.checkpoints.save(
-                    iteration=iteration,
-                    current_program=state.current_program,
-                    best_candidate=state.best_candidate,
-                    all_candidates=state.all_candidates,
-                    iteration_logs=state.iteration_logs,
-                    no_improvement_count=state.no_improvement_count,
-                    iteration_baseline=state.iteration_baseline,
-                    rng_state=self._rng.getstate(),
-                    config=self._build_checkpoint_config(),
-                )
-
-        except KeyboardInterrupt:
-            state.stop_reason = "interrupted"
-            self._log(
-                "APEX: Optimization interrupted by user (Ctrl+C)",
-                Verbosity.NORMAL,
-            )
-
-            if iteration_candidates:
-                state.iteration_logs.append(
-                    ApexIterationLog(
-                        iteration=state.iteration,
-                        sampled_train_size=len(sampled_train),
-                        num_failures=len(failure_summaries),
-                        num_successes=len(success_summaries),
-                        hypotheses=hypotheses,
-                        candidates=iteration_candidates,
-                    )
-                )
-
-            if self.checkpoints.enabled:
-                baseline_for_checkpoint = state.iteration_baseline or state.best_candidate
-                self.checkpoints.save(
-                    iteration=state.iteration,
-                    current_program=state.current_program,
-                    best_candidate=state.best_candidate,
-                    all_candidates=state.all_candidates,
-                    iteration_logs=state.iteration_logs,
-                    no_improvement_count=state.no_improvement_count,
-                    iteration_baseline=baseline_for_checkpoint,
-                    rng_state=self._rng.getstate(),
-                    config=self._build_checkpoint_config(),
-                )
-                self._log(
-                    f"APEX: Checkpoint saved at iteration {state.iteration} - resume with resume=True",
-                    Verbosity.NORMAL,
-                )
-
-        return state
+        return loop.run(state=state, trainset=trainset, valset=valset)
