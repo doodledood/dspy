@@ -7,6 +7,13 @@ This section focuses on DSPy's powerful optimization capabilities, demonstrating
 ### [Math Reasoning](../math/index.ipynb)
 Learn how to optimize DSPy programs for mathematical reasoning tasks. This tutorial demonstrates how optimizers can dramatically improve performance on complex math problems by finding better prompting strategies and few-shot examples.
 
+## Structured Prompt Engineering
+
+### [APEX Optimizer](../apex_optimizer.md)
+Walk through APEX's analysis-driven workflow: sample failures, generate root-cause reports, synthesize hypotheses, and accept
+only the candidates that outperform the baseline on a calibration set. The tutorial highlights checkpointing, MLflow
+instrumentation, and Pareto-aware candidate selection so you can audit every prompt change. 【F:docs/docs/tutorials/apex_optimizer.md†L1-L104】
+
 ## Model Optimization
 
 ### [Classification Finetuning](../classification_finetuning/index.ipynb)

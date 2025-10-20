@@ -32,6 +32,8 @@ Welcome to DSPy tutorials! We've organized our tutorials into three main categor
     - [Classification Finetuning](classification_finetuning/index.ipynb)
     - [Advanced Tool Use](tool_use/index.ipynb)
     - [Finetuning Agents](games/index.ipynb)
+    - [APEX Optimizer](apex_optimizer.md)
+    - [AIME Math Reasoning with APEX](apex_optimizer/index.ipynb)
 
 
 - Reflective Prompt Evolution with dspy.GEPA:
