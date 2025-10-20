@@ -402,10 +402,10 @@ def test_apex_pareto_merge_flow_combines_candidates(monkeypatch: pytest.MonkeyPa
             ),
         ]
 
-    monkeypatch.setattr("dspy.teleprompt.apex.apex.generate_hypotheses", stub_generate_hypotheses)
-    monkeypatch.setattr("dspy.teleprompt.apex.apex.generate_merge_hypotheses", stub_generate_merge_hypotheses)
+    monkeypatch.setattr(apex.analysis_hooks, "generate_hypotheses", stub_generate_hypotheses)
+    monkeypatch.setattr(apex.analysis_hooks, "generate_merge_hypotheses", stub_generate_merge_hypotheses)
     monkeypatch.setattr("dspy.teleprompt.apex.candidate_selection.draw_weighted_candidate", stub_draw_weighted_candidate)
-    monkeypatch.setattr("dspy.teleprompt.apex.apex.analyze_record", fake_analyze_record)
+    monkeypatch.setattr(apex.analysis_hooks, "analyze_record", fake_analyze_record)
     monkeypatch.setattr(apex.evaluator, "run_train_example", fake_run_train_example)
     monkeypatch.setattr(apex.evaluator, "evaluate_candidate", evaluate_candidate_stub)
     monkeypatch.setattr(apex.evaluator, "evaluate_candidates", evaluate_candidates_stub)

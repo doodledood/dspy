@@ -3,8 +3,9 @@ from __future__ import annotations
 import logging
 import os
 import random
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 import dspy
 from dspy.adapters import Adapter, JSONAdapter
@@ -12,9 +13,6 @@ from dspy.clients.lm import LM
 from dspy.primitives import Example, Module
 from dspy.teleprompt.teleprompt import Teleprompter
 
-from .analysis import (
-    analyze_record as _analyze_single_record,
-)
 from .analysis import (
     generate_hypotheses as _generate_hypotheses,
 )
@@ -46,11 +44,18 @@ from .types import LogLevel, MetricFn, SamplerFn, TraceEntry, Verbosity
 logger = logging.getLogger(__name__)
 
 
-# Backward-compatible alias so downstream users (and tests) can monkeypatch
-# ``analyze_record`` directly from this module.
-analyze_record = _analyze_single_record
-generate_hypotheses = _generate_hypotheses
-generate_merge_hypotheses = _generate_merge_hypotheses
+@dataclass
+class AnalysisHooks:
+    """Configurable callables that drive analysis and hypothesis generation.
+
+    ``analyze_record`` defaults to ``None``, which instructs the optimization loop
+    to use the built-in batch analysis pipeline. Supplying a callable enables
+    per-record overrides while keeping the hypothesis generators pluggable.
+    """
+
+    analyze_record: Callable[..., object] | None = None
+    generate_hypotheses: Callable[..., object] = _generate_hypotheses
+    generate_merge_hypotheses: Callable[..., object] = _generate_merge_hypotheses
 
 
 class APEX(Teleprompter):
@@ -196,6 +201,8 @@ class APEX(Teleprompter):
 
         self.runtime = RuntimeTools(verbosity=self.verbosity, num_threads=self.num_threads, logger=logger)
         self.checkpoints = CheckpointManager(checkpoint_dir, runtime=self.runtime)
+
+        self.analysis_hooks: AnalysisHooks = AnalysisHooks()
 
         self.tracker = ExperimentTracker(
             use_mlflow=use_mlflow,
@@ -461,10 +468,10 @@ class APEX(Teleprompter):
                 analysis_adapter=self.analysis_adapter,
                 hypothesis_lm=self.hypothesis_lm,
                 hypothesis_adapter=self.hypothesis_adapter,
-                analysis_fn=analyze_record,
+                analysis_fn=self.analysis_hooks.analyze_record,
                 format_execution_flow=self._format_execution_flow_with_details,
-                generate_hypotheses=generate_hypotheses,
-                generate_merge_hypotheses=generate_merge_hypotheses,
+                generate_hypotheses=self.analysis_hooks.generate_hypotheses,
+                generate_merge_hypotheses=self.analysis_hooks.generate_merge_hypotheses,
             ),
         )
 

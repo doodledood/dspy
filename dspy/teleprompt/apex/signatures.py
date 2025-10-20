@@ -1135,7 +1135,7 @@ class ParetoMergeSignature(Signature):
     IF primary_wins_more_examples
       → Offspring 1: Keep primary approach
       → Offspring 2: Try partner approach with safety checks
-    ELSE IF approaches_serve_different_cases  
+    ELSE IF approaches_serve_different_cases
       → Offspring 1: Conditional logic (IF case_type A THEN approach_1 ELSE approach_2)
       → Offspring 2: Unified approach attempting both
     ```
@@ -1309,7 +1309,7 @@ class ParetoMergeSignature(Signature):
     You're creating the next generation of prompts through intelligent recombination.
     The best offspring:
     - Inherit complementary strengths
-    - Avoid known weaknesses  
+    - Avoid known weaknesses
     - Explore new combinations
     - Maintain simplicity where possible
     - Respect what already works

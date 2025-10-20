@@ -13,7 +13,6 @@ from .analysis import (
     _log_analysis_results,
     analyze_failures_and_successes,
 )
-from .analysis import analyze_record as _analyze_single_record
 from .candidate_selection import (
     CandidateSelectionStrategy,
     SelectionResult,
@@ -63,10 +62,10 @@ class LoopCollaborators:
     analysis_adapter: Adapter
     hypothesis_lm: LM
     hypothesis_adapter: Adapter
-    analysis_fn: Callable
+    analysis_fn: Callable[..., object] | None
     format_execution_flow: Callable[[Sequence], str]
-    generate_hypotheses: Callable
-    generate_merge_hypotheses: Callable
+    generate_hypotheses: Callable[..., object]
+    generate_merge_hypotheses: Callable[..., object]
 
 
 @dataclass
@@ -432,7 +431,7 @@ class OptimizationLoop:
     ) -> tuple[list, list]:
         analysis_fn = self.cb.analysis_fn
 
-        if analysis_fn is _analyze_single_record:
+        if analysis_fn is None:
             failure_summaries, success_summaries = analyze_failures_and_successes(
                 failure_records=failures,
                 success_records=successes,
