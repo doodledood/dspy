@@ -9,10 +9,7 @@ from dspy.clients.lm import LM
 from dspy.primitives import Example, Module
 
 from . import tracking_utils
-from .analysis import (
-    _log_analysis_results,
-    analyze_failures_and_successes,
-)
+from .analysis import analyze_failures_and_successes
 from .candidate_selection import (
     CandidateSelectionStrategy,
     SelectionResult,
@@ -486,10 +483,6 @@ class OptimizationLoop:
                 )
                 if summary is not None:
                     success_summaries.append(summary)
-
-        if self.cb.is_enabled(Verbosity.DETAILED):
-            _log_analysis_results("failure", failure_summaries, self.cb.log, self.cb.runtime)
-            _log_analysis_results("success", success_summaries, self.cb.log, self.cb.runtime)
 
         return failure_summaries, success_summaries
 
