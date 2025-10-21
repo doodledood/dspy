@@ -14,7 +14,7 @@ class _DummySpan:
     def __init__(self) -> None:
         self.inputs: Mapping[str, object] | None = None
 
-    def __enter__(self) -> "_DummySpan":
+    def __enter__(self) -> _DummySpan:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:  # pragma: no cover - nothing to clean up

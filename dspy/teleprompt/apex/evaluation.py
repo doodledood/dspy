@@ -11,7 +11,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 import dspy
 from dspy.primitives import Example, Module, Prediction
 
-from .execution_flow import extract_execution_flow
+from .execution_flow import extract_full_execution_flow_with_coverage
 from .models import CandidateRecord, HypothesisSpec, TrainExampleRecord
 from .runtime import RuntimeTools
 from .serialization import to_serializable
@@ -537,7 +537,7 @@ class EvaluationEngine:
                 finally:
                     raw_trace = list(dspy.settings.trace or [])
 
-        execution_flow = extract_execution_flow(raw_trace, program)
+        execution_flow = extract_full_execution_flow_with_coverage(raw_trace, program)
         trace_serialized = _serialize_trace_entries(raw_trace)
 
         metric_score = self.min_metric

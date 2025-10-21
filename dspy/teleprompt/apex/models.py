@@ -59,7 +59,11 @@ class HypothesisSpec(BaseModel):
 
 
 class ExecutionFlowEntry(BaseModel):
-    """Structured representation of a single predictor execution in the flow."""
+    """Structured representation of a predictor in the program execution flow.
+
+    Represents both executed predictors (with actual I/O data) and non-executed
+    predictors (e.g., conditional branches not taken) to show the full program structure.
+    """
 
     predictor_name: str
     predictor_type: str
@@ -68,6 +72,8 @@ class ExecutionFlowEntry(BaseModel):
     instructions: str
     dependencies: list[str] = Field(default_factory=list)
     input_sources: dict[str, list[str]] = Field(default_factory=dict)
+    executed: bool = True
+    execution_order: int | None = None
 
 
 class FailureSummaryRecord(BaseModel):

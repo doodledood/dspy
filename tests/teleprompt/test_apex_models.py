@@ -11,6 +11,7 @@ from dspy.teleprompt.apex.models import (
     CandidateRecord,
     ChangeMagnitude,
     CheckpointConfig,
+    ExecutionFlowEntry,
     HypothesisSpec,
     PromptChange,
     TrainExampleRecord,
@@ -143,3 +144,59 @@ def test_train_example_record_supports_prediction_feedback() -> None:
 
     assert dumped["example"].output == "y"
     assert dumped["prediction"].output == "y"
+
+
+def test_execution_flow_entry_new_fields_default_values() -> None:
+    entry = ExecutionFlowEntry(
+        predictor_name="test_predictor",
+        predictor_type="Predict",
+        inputs='{"input": "test"}',
+        outputs='{"output": "result"}',
+        instructions="Test instructions",
+    )
+
+    assert entry.executed is True
+    assert entry.execution_order is None
+    assert entry.predictor_name == "test_predictor"
+
+
+def test_execution_flow_entry_with_execution_tracking() -> None:
+    entry = ExecutionFlowEntry(
+        predictor_name="tracked_predictor",
+        predictor_type="ChainOfThought",
+        inputs='{"query": "test"}',
+        outputs='{"answer": "response"}',
+        instructions="Process the query",
+        dependencies=["previous_predictor"],
+        input_sources={"query": ["previous_predictor"]},
+        executed=False,
+        execution_order=5,
+    )
+
+    assert entry.executed is False
+    assert entry.execution_order == 5
+    assert entry.predictor_name == "tracked_predictor"
+    assert entry.dependencies == ["previous_predictor"]
+
+
+def test_execution_flow_entry_serialization_with_new_fields() -> None:
+    original = ExecutionFlowEntry(
+        predictor_name="serializable_predictor",
+        predictor_type="Predict",
+        inputs='{"x": 1}',
+        outputs='{"y": 2}',
+        instructions="Execute task",
+        dependencies=["dep1", "dep2"],
+        input_sources={"x": ["dep1"]},
+        executed=True,
+        execution_order=3,
+    )
+
+    dumped = original.model_dump()
+    restored = ExecutionFlowEntry.model_validate(dumped)
+
+    assert restored.predictor_name == "serializable_predictor"
+    assert restored.executed is True
+    assert restored.execution_order == 3
+    assert restored.dependencies == ["dep1", "dep2"]
+    assert restored.input_sources == {"x": ["dep1"]}

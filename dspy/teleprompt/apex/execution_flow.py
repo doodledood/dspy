@@ -135,17 +135,67 @@ def extract_execution_flow(trace: list[TraceEntry], program: Module) -> list[Exe
     return execution_flow
 
 
+def extract_full_execution_flow_with_coverage(trace: list[TraceEntry], program: Module) -> list[ExecutionFlowEntry]:
+    """Extract full program structure with execution coverage overlay.
+
+    Returns all predictors in the program, marking which were executed and which were not.
+    Executed predictors include actual I/O data and dependencies; non-executed predictors
+    show their instructions but mark I/O as '[not executed]'.
+    """
+    # Get executed predictors with full data
+    executed_flow = extract_execution_flow(trace, program)
+
+    # Build map of executed predictor names and assign execution order
+    executed_names: set[str] = set()
+    for idx, entry in enumerate(executed_flow):
+        executed_names.add(entry.predictor_name)
+        entry.execution_order = idx
+
+    # Get all predictors from the program
+    all_predictors = dict(program.named_predictors())
+
+    # Create entries for non-executed predictors
+    non_executed_flow: list[ExecutionFlowEntry] = []
+    for predictor_name, predictor_obj in all_predictors.items():
+        if predictor_name not in executed_names:
+            predictor_type = type(predictor_obj).__name__
+
+            # Extract instructions if available
+            instructions = ""
+            if hasattr(predictor_obj, "signature") and hasattr(predictor_obj.signature, "instructions"):
+                instructions = predictor_obj.signature.instructions
+
+            non_executed_flow.append(
+                ExecutionFlowEntry(
+                    predictor_name=predictor_name,
+                    predictor_type=predictor_type,
+                    inputs="[not executed]",
+                    outputs="[not executed]",
+                    instructions=instructions,
+                    dependencies=[],
+                    input_sources={},
+                    executed=False,
+                    execution_order=None,
+                )
+            )
+
+    # Combine: executed first (sorted by execution_order), then non-executed (alphabetically)
+    combined = executed_flow + sorted(non_executed_flow, key=lambda e: e.predictor_name)
+    return combined
+
+
 def format_execution_flow_as_graph(execution_flow: list[ExecutionFlowEntry]) -> str:
     if not execution_flow:
         return "No execution flow available"
 
     if len(execution_flow) == 1:
         entry = execution_flow[0]
+        exec_status = "[executed]" if entry.executed else "[not executed]"
         return (
             "Program DAG:\n"
             "  Input\n"
             f"    ↳ {entry.predictor_name}\n"
-            f"  {entry.predictor_name} ({entry.predictor_type})\n"
+            f"  {entry.predictor_name} ({entry.predictor_type}) {exec_status}\n"
             "    depends on: Input\n"
             "    feeds: Output"
         )
@@ -169,7 +219,8 @@ def format_execution_flow_as_graph(execution_flow: list[ExecutionFlowEntry]) -> 
         flow_lines.append("  Input (no predictors depend directly on program input)")
 
     for entry in execution_flow:
-        flow_lines.append(f"  {entry.predictor_name} ({entry.predictor_type})")
+        exec_status = "[executed]" if entry.executed else "[not executed]"
+        flow_lines.append(f"  {entry.predictor_name} ({entry.predictor_type}) {exec_status}")
         if entry.dependencies:
             flow_lines.append(f"    depends on: {', '.join(entry.dependencies)}")
         else:
@@ -196,18 +247,22 @@ def format_execution_flow_with_details(execution_flow: list[ExecutionFlowEntry])
     for idx, entry in enumerate(execution_flow, start=1):
         instructions = entry.instructions if entry.instructions else "No instructions"
         dependencies = ", ".join(entry.dependencies) if entry.dependencies else "Input"
+        exec_status = "[executed]" if entry.executed else "[not executed]"
         flow_parts.append(
-            f"\n{idx}. {entry.predictor_name} ({entry.predictor_type}):\n"
+            f"\n{idx}. {entry.predictor_name} ({entry.predictor_type}) {exec_status}:\n"
             f"   Instructions: {instructions}\n"
             f"   Depends on: {dependencies}"
         )
 
-        if entry.input_sources:
-            flow_parts.append("   Inputs sourced from:")
-            for input_name, sources in entry.input_sources.items():
-                flow_parts.append(f"     - {input_name}: {', '.join(sources)}")
+        if entry.executed:
+            if entry.input_sources:
+                flow_parts.append("   Inputs sourced from:")
+                for input_name, sources in entry.input_sources.items():
+                    flow_parts.append(f"     - {input_name}: {', '.join(sources)}")
+            else:
+                flow_parts.append("   Inputs sourced from: program input or constants")
         else:
-            flow_parts.append("   Inputs sourced from: program input or constants")
+            flow_parts.append("   Inputs sourced from: [not executed]")
 
         flow_parts.append(f"   Actual inputs: {entry.inputs}")
         flow_parts.append(f"   Actual outputs: {entry.outputs}")
