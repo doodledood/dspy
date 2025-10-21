@@ -241,9 +241,6 @@ class OptimizationLoop:
             pareto_baseline=pareto_baseline,
             selection_result=selection_result,
             snapshot=snapshot,
-            failure_summaries=failure_summaries,
-            success_summaries=success_summaries,
-            state=state,
         )
         if merge_hypotheses:
             hypotheses.extend(merge_hypotheses)
@@ -497,9 +494,6 @@ class OptimizationLoop:
         pareto_baseline: CandidateRecord | None,
         selection_result: SelectionResult | None,
         snapshot,
-        failure_summaries: list,
-        success_summaries: list,
-        state: OptimizationState,
     ) -> tuple[list[HypothesisSpec], dict[int, Module]]:
         if self.settings.candidate_selection != "pareto":
             self.cb.log(
@@ -567,10 +561,6 @@ class OptimizationLoop:
             )
             return [], {}
 
-        # Calculate general optimization health metric
-        total_examples = len(failure_summaries) + len(success_summaries)
-        success_rate_pct = (len(success_summaries) / total_examples * 100.0) if total_examples else 0.0
-
         merge_hypotheses = self.cb.generate_merge_hypotheses(
             baseline_candidate=pareto_baseline,
             partner_candidate=partner_candidate,
@@ -580,11 +570,6 @@ class OptimizationLoop:
             iteration=iteration,
             tracker=self.cb.tracker,
             snapshot=snapshot,
-            candidate_history=state.all_candidates,
-            best_val_score=state.best_candidate.overall_score,
-            selection_strategy=self.settings.candidate_selection,
-            include_history=self.settings.include_hypothesis_history,
-            success_rate_percentage=success_rate_pct,
         )
 
         if not merge_hypotheses:

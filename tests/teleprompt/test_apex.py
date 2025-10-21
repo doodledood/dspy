@@ -310,11 +310,6 @@ def test_apex_pareto_merge_flow_combines_candidates(monkeypatch: pytest.MonkeyPa
             "iteration",
             "tracker",
             "snapshot",
-            "candidate_history",
-            "best_val_score",
-            "selection_strategy",
-            "include_history",
-            "success_rate_percentage",
         }
         actual_fields = {"baseline_candidate", "partner_candidate"} | set(kwargs.keys())
         assert actual_fields == expected_fields, (
@@ -326,14 +321,11 @@ def test_apex_pareto_merge_flow_combines_candidates(monkeypatch: pytest.MonkeyPa
         )
 
         # Validate ParetoMergeSignature has minimal fields (what the LLM sees)
+        # PURE content-based crossover: only the two prompt sets and program architecture
         expected_sig_fields = {
             "primary_prompts",
             "partner_prompts",
             "program_flow",
-            "success_rate_percentage",
-            "best_validation_score",
-            "current_iteration",
-            "hypothesis_history",
         }
         actual_sig_fields = set(ParetoMergeSignature.input_fields.keys())
         assert actual_sig_fields == expected_sig_fields, (

@@ -799,11 +799,6 @@ def generate_merge_hypotheses(
     iteration: int | None,
     tracker: ExperimentTracker | None,
     snapshot: ProgramSnapshot,
-    candidate_history: list[CandidateRecord],
-    best_val_score: float | None,
-    selection_strategy: str,
-    include_history: bool,
-    success_rate_percentage: float,
 ) -> list[HypothesisSpec]:
     """Generate paired merged hypotheses combining two Pareto candidates from the frontier."""
 
@@ -832,24 +827,11 @@ def generate_merge_hypotheses(
         return "\n".join(lines)
 
     program_flow = build_program_flow_text()
-    history_text = (
-        build_hypothesis_history_text(
-            candidate_history=candidate_history,
-            selection_strategy=selection_strategy,
-        )
-        if include_history
-        else "N/A"
-    )
-    best_val_text = f"{best_val_score:.4f}" if best_val_score is not None else "N/A"
 
     call_inputs = {
         "primary_prompts": _prompt_map_from_candidate(baseline_candidate),
         "partner_prompts": _prompt_map_from_candidate(partner_candidate),
         "program_flow": program_flow,
-        "success_rate_percentage": success_rate_percentage,
-        "best_validation_score": best_val_text,
-        "current_iteration": iteration if iteration is not None else -1,
-        "hypothesis_history": history_text,
     }
 
     attributes = {

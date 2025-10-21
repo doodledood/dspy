@@ -1113,14 +1113,13 @@ class ParetoMergeSignature(Signature):
 
     ## Merge Decision Framework
 
-    ### Step 0: Context-Informed Strategy
-    Before comparing parents, analyze the optimization context:
+    ### Step 0: Analyze the Two Prompt Sets
+    Before merging, understand the content:
     1. **Compare the two prompt sets**: Read both primary_prompts and partner_prompts to understand structural differences
-    2. **Check hypothesis_history**: What changes succeeded/failed in past iterations?
-    3. **Assess success_rate_percentage**: High rate → conservative merge; low rate → bold merge
-    4. **Study program_flow**: Understand predictor dependencies and data flow through the architecture
+    2. **Study program_flow**: Understand predictor dependencies and data flow through the architecture
+    3. **Identify complementary strengths**: What does each parent do differently? Where might combining approaches add value?
 
-    Use this context to inform which predictor changes to prioritize in your merge.
+    This is PURE content analysis - you only see the prompts and program structure, nothing about optimization trajectory.
 
     ### Step 1: Comparative Analysis
     For each predictor, classify the relationship between parent prompts:
@@ -1332,21 +1331,6 @@ class ParetoMergeSignature(Signature):
     )
     program_flow: str = InputField(
         desc="Program source code and predictor structure showing the full architecture context"
-    )
-    success_rate_percentage: float = InputField(
-        desc="General optimization health metric: percentage of examples succeeding (0-100). Use to calibrate merge risk - high rate suggests conservative merges, low rate allows bolder combinations."
-    )
-    best_validation_score: str = InputField(
-        desc="Best validation score achieved so far; 'N/A' if unavailable",
-        default="N/A",
-    )
-    current_iteration: int = InputField(
-        desc="Current optimizer iteration number (0-indexed) to ground hypotheses",
-        default=-1,
-    )
-    hypothesis_history: str = InputField(
-        desc="History of previously tested hypotheses with validation scores and change notes; 'N/A' if unavailable",
-        default="N/A",
     )
 
     primary_hypothesis: HypothesisSpec = OutputField(
