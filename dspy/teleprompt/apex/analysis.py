@@ -595,20 +595,24 @@ def generate_hypotheses(
         )
 
     def build_program_flow_text() -> str:
-        """Return the text describing the DAG structure plus each predictor prompt."""
-
-        if not available_prompts:
-            return snapshot.flow_description
+        """Return the text describing the program source code and each predictor prompt."""
 
         lines: list[str] = [
-            f"Program structure: {snapshot.flow_description}",
-            "",
-            "Predictor prompts and configurations:",
+            "Program Source Code:",
+            "```python",
+            '"""',
+            snapshot.source_code,
+            '"""',
+            "```",
         ]
-        for predictor_name, prompt in available_prompts.items():
-            prompt_text = prompt if prompt else "(no prompt provided)"
-            lines.append(f"\n### {predictor_name} ###")
-            lines.append(prompt_text)
+
+        if available_prompts:
+            lines.extend(["", "Predictor prompts and configurations:"])
+            for predictor_name, prompt in available_prompts.items():
+                prompt_text = prompt if prompt else "(no prompt provided)"
+                lines.append(f"\n### {predictor_name} ###")
+                lines.append(f'"""\n{prompt_text}\n"""')
+
         return "\n".join(lines)
 
     def build_failure_records() -> tuple[list[FailureSummaryRecord], Counter[str]]:

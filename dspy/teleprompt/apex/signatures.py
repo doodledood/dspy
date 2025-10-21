@@ -343,7 +343,8 @@ class FailureAnalysisSignature(Signature):
         desc="List of 1-3 potential root causes ordered by likelihood. Each: 'In [Predictor], prompt lacks/has...'"
     )
     involved_predictors: list[str] = OutputField(
-        desc="List of predictors in causal order: primary failure first, then affected downstream", default_factory=list
+        desc="List of predictor names using EXACT names from '### predictor_name ###' section headers in execution_flow (e.g., 'router.predict', NOT 'router' from source code). Order: primary failure first, then affected downstream",
+        default_factory=list,
     )
     context: str = OutputField(
         desc="Specific input/data characteristics that trigger this failure (e.g., 'nested JSON', 'text >500 chars')"
@@ -729,7 +730,8 @@ class SuccessAnalysisSignature(Signature):
         desc="List of 1-3 potential enabling factors ordered by likelihood. Each: 'Success due to...'"
     )
     contributing_predictors: list[str] = OutputField(
-        desc="List of predictors essential to this success pattern", default_factory=list
+        desc="List of predictor names using EXACT names from '### predictor_name ###' section headers in execution_flow (e.g., 'router.predict', NOT 'router' from source code). Include only predictors essential to this success pattern",
+        default_factory=list,
     )
     context: str = OutputField(desc="Specific input characteristics that define when this pattern applies")
     categories: list[str] = OutputField(

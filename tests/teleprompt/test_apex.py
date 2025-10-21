@@ -1,6 +1,6 @@
 """High-level integration tests for the public APEX interface.
 
-These tests intentionally focus on observable behaviour – the optimizer should
+These tests intentionally focus on observable behaviour - the optimizer should
 respect its inputs, produce improved programs when hypotheses succeed, and keep
 its results accessible through the documented attributes. They avoid making
 assumptions about the internal implementation so the suite remains stable during
@@ -628,3 +628,43 @@ def test_apex_execution_flow_includes_non_executed_predictors() -> None:
     # that execution flow extraction works with both executed and non-executed predictors.
     assert result.best_candidate is not None
     assert result.stopped_after in ("patience", "max_iterations")
+
+
+def test_apex_program_structure_shows_source_code() -> None:
+    """Verify program snapshot includes full source code showing control flow."""
+    from dspy.teleprompt.apex.snapshot import snapshot_program
+
+    module = ConditionalRouterModule()
+    snapshot = snapshot_program(module)
+
+    # Should have source_code (not flow_description or structure)
+    assert hasattr(snapshot, "source_code")
+    assert not hasattr(snapshot, "flow_description")
+    assert not hasattr(snapshot, "structure")
+
+    # Source code should be exact
+    expected_source = '''class ConditionalRouterModule(dspy.Module):
+    """Module with conditional execution to test full program tree extraction."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.route_a = dspy.Predict("query -> answer")
+        self.route_b = dspy.Predict("query -> answer")
+        self.route_a.signature.instructions = "Handle type A queries with concise responses"
+        self.route_b.signature.instructions = "Handle type B queries with detailed explanations"
+
+    def forward(self, query: str, route: str) -> dspy.Prediction:  # type: ignore[override]
+        if route == "a":
+            return self.route_a(query=query)
+        else:
+            return self.route_b(query=query)'''
+
+    assert snapshot.source_code == expected_source
+
+    # Should still show all predictor prompts
+    assert "route_a" in snapshot.prompts
+    assert "route_b" in snapshot.prompts
+
+    # Verify the prompts contain instructions
+    assert "Handle type A queries" in snapshot.prompts["route_a"]
+    assert "Handle type B queries" in snapshot.prompts["route_b"]

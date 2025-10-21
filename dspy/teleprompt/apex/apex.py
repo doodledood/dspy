@@ -252,8 +252,10 @@ class APEX(Teleprompter):
     def _format_execution_flow_as_graph(self, execution_flow: list[ExecutionFlowEntry]) -> str:
         return format_execution_flow_as_graph(execution_flow)
 
-    def _format_execution_flow_with_details(self, execution_flow: list[ExecutionFlowEntry]) -> str:
-        return format_execution_flow_with_details(execution_flow)
+    def _format_execution_flow_with_details(
+        self, execution_flow: list[ExecutionFlowEntry], program: Module | None = None
+    ) -> str:
+        return format_execution_flow_with_details(execution_flow, program=program)
 
     def _build_checkpoint_config(self) -> CheckpointConfig:
         return CheckpointConfig(
@@ -423,6 +425,7 @@ class APEX(Teleprompter):
                 state=state,
                 trainset=trainset,
                 valset=valset,
+                program=student,
             )
 
         assert state is not None
@@ -441,7 +444,12 @@ class APEX(Teleprompter):
         state: OptimizationState,
         trainset: Sequence[Example],
         valset: Sequence[Example],
+        program: Module,
     ) -> OptimizationState:
+        # Create closure that captures program for execution flow formatting
+        def format_with_program(execution_flow: list[ExecutionFlowEntry]) -> str:
+            return self._format_execution_flow_with_details(execution_flow, program=program)
+
         loop = OptimizationLoop(
             settings=LoopSettings(
                 max_iterations=self.max_iterations,
@@ -469,7 +477,7 @@ class APEX(Teleprompter):
                 hypothesis_lm=self.hypothesis_lm,
                 hypothesis_adapter=self.hypothesis_adapter,
                 analysis_fn=self.analysis_hooks.analyze_record,
-                format_execution_flow=self._format_execution_flow_with_details,
+                format_execution_flow=format_with_program,
                 generate_hypotheses=self.analysis_hooks.generate_hypotheses,
                 generate_merge_hypotheses=self.analysis_hooks.generate_merge_hypotheses,
             ),

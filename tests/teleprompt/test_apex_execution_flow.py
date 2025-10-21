@@ -314,3 +314,93 @@ def test_format_details_empty_flow() -> None:
     details = format_execution_flow_with_details(empty_flow)
 
     assert details == "No execution flow available"
+
+
+def test_format_details_uses_triple_quotes() -> None:
+    """Test that instructions, inputs, and outputs are wrapped in triple quotes."""
+    entries = [
+        ExecutionFlowEntry(
+            predictor_name="test_predictor",
+            predictor_type="Predict",
+            inputs='{"input": "test_value"}',
+            outputs='{"output": "result_value"}',
+            instructions="Process the input and return output",
+            executed=True,
+            execution_order=0,
+        )
+    ]
+
+    details = format_execution_flow_with_details(entries)
+
+    # Verify instructions use triple quotes
+    assert 'Instructions: """\nProcess the input and return output\n"""' in details
+
+    # Verify inputs use triple quotes
+    assert 'Actual inputs: """\n{"input": "test_value"}\n"""' in details
+
+    # Verify outputs use triple quotes
+    assert 'Actual outputs: """\n{"output": "result_value"}\n"""' in details
+
+
+def test_format_details_includes_source_code() -> None:
+    """Test that format_execution_flow_with_details includes program source code when program provided."""
+    program = SimpleModule()
+
+    with dspy.settings.context(trace=[]):
+        _ = program(input="test")
+        trace = list(dspy.settings.trace or [])
+
+    from dspy.teleprompt.apex.execution_flow import extract_execution_flow
+
+    flow = extract_execution_flow(trace, program)
+
+    # Format with program parameter
+    details = format_execution_flow_with_details(flow, program=program)
+
+    # Should start with exact source code section
+    expected_source_section = '''Program Source Code:
+```python
+"""
+class SimpleModule(dspy.Module):
+    """Module with a single predictor."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.predictor = dspy.Predict("input -> output")
+        self.predictor.signature.instructions = "Process the input"
+
+    def forward(self, input: str) -> dspy.Prediction:  # type: ignore[override]
+        return self.predictor(input=input)
+"""
+```'''
+
+    assert details.startswith(expected_source_section)
+
+    # Should still include execution details below
+    assert "Program DAG:" in details
+    assert "Predictor Instructions and Data Flow:" in details
+    assert "predictor (Predict)" in details
+
+
+def test_format_details_without_program() -> None:
+    """Test backward compatibility - format_execution_flow_with_details works without program parameter."""
+    program = SimpleModule()
+
+    with dspy.settings.context(trace=[]):
+        _ = program(input="test")
+        trace = list(dspy.settings.trace or [])
+
+    from dspy.teleprompt.apex.execution_flow import extract_execution_flow
+
+    flow = extract_execution_flow(trace, program)
+
+    # Format without program parameter (backward compat)
+    details = format_execution_flow_with_details(flow)
+
+    # Should NOT include source code section
+    assert "Program Source Code:" not in details
+    assert "class SimpleModule" not in details
+
+    # Should still include execution details
+    assert "Program DAG:" in details
+    assert "Predictor Instructions and Data Flow:" in details

@@ -8,6 +8,7 @@ from typing import Any
 from dspy.primitives import Example, Module, Prediction
 
 from .models import ExecutionFlowEntry
+from .snapshot import extract_program_source
 from .types import TraceEntry
 
 
@@ -235,11 +236,26 @@ def format_execution_flow_as_graph(execution_flow: list[ExecutionFlowEntry]) -> 
     return "\n".join(flow_lines)
 
 
-def format_execution_flow_with_details(execution_flow: list[ExecutionFlowEntry]) -> str:
+def format_execution_flow_with_details(execution_flow: list[ExecutionFlowEntry], program: Module | None = None) -> str:
     if not execution_flow:
         return "No execution flow available"
 
     flow_parts: list[str] = []
+
+    # Show program source code first if available
+    if program is not None:
+        source_code = extract_program_source(program)
+        flow_parts.extend(
+            [
+                "Program Source Code:",
+                "```python",
+                '"""',
+                source_code,
+                '"""',
+                "```",
+                "",
+            ]
+        )
 
     flow_parts.append(format_execution_flow_as_graph(execution_flow))
     flow_parts.append("\nPredictor Instructions and Data Flow:")
@@ -250,7 +266,7 @@ def format_execution_flow_with_details(execution_flow: list[ExecutionFlowEntry])
         exec_status = "[executed]" if entry.executed else "[not executed]"
         flow_parts.append(
             f"\n{idx}. {entry.predictor_name} ({entry.predictor_type}) {exec_status}:\n"
-            f"   Instructions: {instructions}\n"
+            f'   Instructions: """\n{instructions}\n"""\n'
             f"   Depends on: {dependencies}"
         )
 
@@ -264,7 +280,7 @@ def format_execution_flow_with_details(execution_flow: list[ExecutionFlowEntry])
         else:
             flow_parts.append("   Inputs sourced from: [not executed]")
 
-        flow_parts.append(f"   Actual inputs: {entry.inputs}")
-        flow_parts.append(f"   Actual outputs: {entry.outputs}")
+        flow_parts.append(f'   Actual inputs: """\n{entry.inputs}\n"""')
+        flow_parts.append(f'   Actual outputs: """\n{entry.outputs}\n"""')
 
     return "\n".join(flow_parts)

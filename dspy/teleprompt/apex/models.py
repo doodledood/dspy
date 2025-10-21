@@ -143,8 +143,7 @@ class CandidateRecord(BaseModel):
 
 
 class ProgramSnapshot(BaseModel):
-    structure: str
-    flow_description: str
+    source_code: str
     prompts: dict[str, str]
     predictor_name_by_id: dict[int, str]
 
