@@ -798,17 +798,58 @@ def generate_merge_hypotheses(
     hypothesis_adapter: Adapter,
     iteration: int | None,
     tracker: ExperimentTracker | None,
+    snapshot: ProgramSnapshot,
+    candidate_history: list[CandidateRecord],
+    best_val_score: float | None,
+    selection_strategy: str,
+    include_history: bool,
+    success_rate_percentage: float,
 ) -> list[HypothesisSpec]:
     """Generate paired merged hypotheses combining two Pareto candidates from the frontier."""
 
+    # Build available prompts from snapshot
+    available_prompts = snapshot.prompts if snapshot.prompts else {}
+
+    def build_program_flow_text() -> str:
+        """Return the text describing the program source code and each predictor prompt."""
+
+        lines: list[str] = [
+            "Program Source Code:",
+            "```python",
+            '"""',
+            snapshot.source_code,
+            '"""',
+            "```",
+        ]
+
+        if available_prompts:
+            lines.extend(["", "Predictor prompts and configurations:"])
+            for predictor_name, prompt in available_prompts.items():
+                prompt_text = prompt if prompt else "(no prompt provided)"
+                lines.append(f"\n### {predictor_name} ###")
+                lines.append(f'"""\n{prompt_text}\n"""')
+
+        return "\n".join(lines)
+
+    program_flow = build_program_flow_text()
+    history_text = (
+        build_hypothesis_history_text(
+            candidate_history=candidate_history,
+            selection_strategy=selection_strategy,
+        )
+        if include_history
+        else "N/A"
+    )
+    best_val_text = f"{best_val_score:.4f}" if best_val_score is not None else "N/A"
+
     call_inputs = {
-        "primary_summary": _summarize_candidate(baseline_candidate, label="baseline"),
-        "partner_summary": _summarize_candidate(partner_candidate, label="partner"),
         "primary_prompts": _prompt_map_from_candidate(baseline_candidate),
         "partner_prompts": _prompt_map_from_candidate(partner_candidate),
-        "primary_prompt_changes": _summarize_prompt_changes(baseline_candidate),
-        "partner_prompt_changes": _summarize_prompt_changes(partner_candidate),
-        "per_example_notes": _format_per_example_notes(baseline_candidate, partner_candidate),
+        "program_flow": program_flow,
+        "success_rate_percentage": success_rate_percentage,
+        "best_validation_score": best_val_text,
+        "current_iteration": iteration if iteration is not None else -1,
+        "hypothesis_history": history_text,
     }
 
     attributes = {

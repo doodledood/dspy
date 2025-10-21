@@ -1113,6 +1113,15 @@ class ParetoMergeSignature(Signature):
 
     ## Merge Decision Framework
 
+    ### Step 0: Context-Informed Strategy
+    Before comparing parents, analyze the optimization context:
+    1. **Compare the two prompt sets**: Read both primary_prompts and partner_prompts to understand structural differences
+    2. **Check hypothesis_history**: What changes succeeded/failed in past iterations?
+    3. **Assess success_rate_percentage**: High rate → conservative merge; low rate → bold merge
+    4. **Study program_flow**: Understand predictor dependencies and data flow through the architecture
+
+    Use this context to inform which predictor changes to prioritize in your merge.
+
     ### Step 1: Comparative Analysis
     For each predictor, classify the relationship between parent prompts:
 
@@ -1214,7 +1223,6 @@ class ParetoMergeSignature(Signature):
 
     ### Example 1: Methodology Conflict
     **Scenario**: Primary uses step-by-step, Partner uses holistic reasoning
-    **Per-example notes**: Primary wins on computation, Partner on conceptual
 
     **Primary-anchored offspring**:
     ```json
@@ -1251,7 +1259,6 @@ class ParetoMergeSignature(Signature):
 
     ### Example 2: Complementary Constraints
     **Scenario**: Primary has format specs, Partner has validation rules
-    **Per-example notes**: Both needed for complete success
 
     **Primary-anchored offspring**:
     ```json
@@ -1269,7 +1276,6 @@ class ParetoMergeSignature(Signature):
 
     ### Example 3: Different Predictors Excel
     **Scenario**: Primary's Extractor excellent, Partner's Validator excellent
-    **Per-example notes**: Each parent has one strong predictor
 
     **Primary-anchored offspring**:
     ```json
@@ -1318,22 +1324,29 @@ class ParetoMergeSignature(Signature):
 
     Think like a genetic engineer: selective breeding beats random mutation."""
 
-    primary_summary: str = InputField(desc="Summary of baseline candidate trajectory, iteration, and score context")
-    partner_summary: str = InputField(desc="Summary of partner candidate trajectory, iteration, and score context")
     primary_prompts: dict[str, str] = InputField(
         desc="Mapping of predictor name to full prompt for the baseline candidate"
     )
     partner_prompts: dict[str, str] = InputField(
         desc="Mapping of predictor name to full prompt for the partner candidate"
     )
-    primary_prompt_changes: dict[str, str] = InputField(
-        desc="Summary of prior prompt edits applied in the baseline candidate", default_factory=dict
+    program_flow: str = InputField(
+        desc="Program source code and predictor structure showing the full architecture context"
     )
-    partner_prompt_changes: dict[str, str] = InputField(
-        desc="Summary of prior prompt edits applied in the partner candidate", default_factory=dict
+    success_rate_percentage: float = InputField(
+        desc="General optimization health metric: percentage of examples succeeding (0-100). Use to calibrate merge risk - high rate suggests conservative merges, low rate allows bolder combinations."
     )
-    per_example_notes: str = InputField(
-        desc="Description of per-example win patterns comparing the two candidates", default=""
+    best_validation_score: str = InputField(
+        desc="Best validation score achieved so far; 'N/A' if unavailable",
+        default="N/A",
+    )
+    current_iteration: int = InputField(
+        desc="Current optimizer iteration number (0-indexed) to ground hypotheses",
+        default=-1,
+    )
+    hypothesis_history: str = InputField(
+        desc="History of previously tested hypotheses with validation scores and change notes; 'N/A' if unavailable",
+        default="N/A",
     )
 
     primary_hypothesis: HypothesisSpec = OutputField(

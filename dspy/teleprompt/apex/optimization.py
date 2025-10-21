@@ -240,6 +240,10 @@ class OptimizationLoop:
             iteration=iteration,
             pareto_baseline=pareto_baseline,
             selection_result=selection_result,
+            snapshot=snapshot,
+            failure_summaries=failure_summaries,
+            success_summaries=success_summaries,
+            state=state,
         )
         if merge_hypotheses:
             hypotheses.extend(merge_hypotheses)
@@ -492,18 +496,52 @@ class OptimizationLoop:
         iteration: int,
         pareto_baseline: CandidateRecord | None,
         selection_result: SelectionResult | None,
+        snapshot,
+        failure_summaries: list,
+        success_summaries: list,
+        state: OptimizationState,
     ) -> tuple[list[HypothesisSpec], dict[int, Module]]:
-        if (
-            self.settings.candidate_selection != "pareto"
-            or selection_result is None
-            or len(selection_result.frontier) <= 1
-            or self.settings.pareto_merge_probability <= 0.0
-        ):
+        if self.settings.candidate_selection != "pareto":
+            self.cb.log(
+                f"APEX: Skipping merge (not using Pareto selection, using {self.settings.candidate_selection})",
+                Verbosity.DETAILED,
+            )
+            return [], {}
+
+        if selection_result is None:
+            self.cb.log(
+                "APEX: Skipping merge (selection_result is None)",
+                Verbosity.DETAILED,
+            )
+            return [], {}
+
+        frontier_size = len(selection_result.frontier) if selection_result else 0
+        if frontier_size <= 1:
+            self.cb.log(
+                f"APEX: Skipping merge (frontier too small: {frontier_size} <= 1)",
+                Verbosity.DETAILED,
+            )
+            return [], {}
+
+        if self.settings.pareto_merge_probability <= 0.0:
+            self.cb.log(
+                f"APEX: Skipping merge (probability too low: {self.settings.pareto_merge_probability})",
+                Verbosity.DETAILED,
+            )
             return [], {}
 
         merge_roll = self.cb.rng.random()
         if merge_roll >= self.settings.pareto_merge_probability:
+            self.cb.log(
+                f"APEX: Skipping merge (random roll {merge_roll:.4f} >= probability {self.settings.pareto_merge_probability})",
+                Verbosity.DETAILED,
+            )
             return [], {}
+
+        self.cb.log(
+            f"APEX: Attempting merge generation (frontier_size={frontier_size}, probability={self.settings.pareto_merge_probability}, roll={merge_roll:.4f})",
+            Verbosity.DETAILED,
+        )
 
         try:
             partner_candidate = draw_weighted_candidate(
@@ -529,6 +567,10 @@ class OptimizationLoop:
             )
             return [], {}
 
+        # Calculate general optimization health metric
+        total_examples = len(failure_summaries) + len(success_summaries)
+        success_rate_pct = (len(success_summaries) / total_examples * 100.0) if total_examples else 0.0
+
         merge_hypotheses = self.cb.generate_merge_hypotheses(
             baseline_candidate=pareto_baseline,
             partner_candidate=partner_candidate,
@@ -537,6 +579,12 @@ class OptimizationLoop:
             hypothesis_adapter=self.cb.hypothesis_adapter,
             iteration=iteration,
             tracker=self.cb.tracker,
+            snapshot=snapshot,
+            candidate_history=state.all_candidates,
+            best_val_score=state.best_candidate.overall_score,
+            selection_strategy=self.settings.candidate_selection,
+            include_history=self.settings.include_hypothesis_history,
+            success_rate_percentage=success_rate_pct,
         )
 
         if not merge_hypotheses:

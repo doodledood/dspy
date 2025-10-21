@@ -22,6 +22,7 @@ from dspy.adapters.chat_adapter import FieldInfoWithName
 from dspy.signatures.field import OutputField
 from dspy.teleprompt.apex import APEX, ChangeMagnitude, PromptChange
 from dspy.teleprompt.apex.models import CandidateRecord, HypothesisSpec, TrainExampleRecord
+from dspy.teleprompt.apex.signatures import ParetoMergeSignature
 from dspy.utils.dummies import DummyLM
 
 
@@ -297,8 +298,52 @@ def test_apex_pareto_merge_flow_combines_candidates(monkeypatch: pytest.MonkeyPa
             return [alpha_spec, beta_spec]
         return []
 
-    def stub_generate_merge_hypotheses(*, baseline_candidate, partner_candidate, **_kwargs):
+    def stub_generate_merge_hypotheses(*, baseline_candidate, partner_candidate, **kwargs):
         merge_calls.append((baseline_candidate, partner_candidate))
+
+        expected_fields = {
+            "baseline_candidate",
+            "partner_candidate",
+            "runtime",
+            "hypothesis_lm",
+            "hypothesis_adapter",
+            "iteration",
+            "tracker",
+            "snapshot",
+            "candidate_history",
+            "best_val_score",
+            "selection_strategy",
+            "include_history",
+            "success_rate_percentage",
+        }
+        actual_fields = {"baseline_candidate", "partner_candidate"} | set(kwargs.keys())
+        assert actual_fields == expected_fields, (
+            f"Merge function signature changed:\n"
+            f"  Expected: {sorted(expected_fields)}\n"
+            f"  Actual: {sorted(actual_fields)}\n"
+            f"  Missing: {sorted(expected_fields - actual_fields)}\n"
+            f"  Extra: {sorted(actual_fields - expected_fields)}"
+        )
+
+        # Validate ParetoMergeSignature has minimal fields (what the LLM sees)
+        expected_sig_fields = {
+            "primary_prompts",
+            "partner_prompts",
+            "program_flow",
+            "success_rate_percentage",
+            "best_validation_score",
+            "current_iteration",
+            "hypothesis_history",
+        }
+        actual_sig_fields = set(ParetoMergeSignature.input_fields.keys())
+        assert actual_sig_fields == expected_sig_fields, (
+            f"ParetoMergeSignature fields changed:\n"
+            f"  Expected minimal: {sorted(expected_sig_fields)}\n"
+            f"  Actual: {sorted(actual_sig_fields)}\n"
+            f"  Missing: {sorted(expected_sig_fields - actual_sig_fields)}\n"
+            f"  Extra: {sorted(actual_sig_fields - expected_sig_fields)}"
+        )
+
         return [primary_merge, partner_merge]
 
     def stub_draw_weighted_candidate(candidates, weights, *, rng, exclude=None):
