@@ -62,16 +62,18 @@ These optimizers produce optimal instructions for the prompt and, in the case of
 
 8. [**`GEPA`**](../../api/optimizers/GEPA/overview.md): Uses LM's to reflect on the DSPy program's trajectory, to identify what worked, what didn't and propose prompts addressing the gaps. Additionally, GEPA can leverage domain-specific textual feedback to rapidly improve the DSPy program. Detailed tutorials on using GEPA are available at [dspy.GEPA Tutorials](../../tutorials/gepa_ai_program/index.md).
 
+9. [**`APEX`**](../../api/optimizers/APEX.md): Runs a map-reduce style analysis loop that samples training examples, records execution traces, gathers structured failure/success analyses, and tests history-aware prompt hypotheses on a calibration set using Pareto or best-on-val selection with median-of-runs scoring. [Explore the full tutorial here.](../../tutorials/apex_optimizer.md) 【F:docs/docs/api/optimizers/APEX.md†L1-L72】
+
 ### Automatic Finetuning
 
 This optimizer is used to fine-tune the underlying LLM(s).
 
-9. [**`BootstrapFinetune`**](/api/optimizers/BootstrapFinetune): Distills a prompt-based DSPy program into weight updates. The output is a DSPy program that has the same steps, but where each step is conducted by a finetuned model instead of a prompted LM. [See the classification fine-tuning tutorial](https://dspy.ai/tutorials/classification_finetuning/) for a complete example.
+10. [**`BootstrapFinetune`**](/api/optimizers/BootstrapFinetune): Distills a prompt-based DSPy program into weight updates. The output is a DSPy program that has the same steps, but where each step is conducted by a finetuned model instead of a prompted LM. [See the classification fine-tuning tutorial](https://dspy.ai/tutorials/classification_finetuning/) for a complete example.
 
 
 ### Program Transformations
 
-10. [**`Ensemble`**](../../api/optimizers/Ensemble.md): Ensembles a set of DSPy programs and either uses the full set or randomly samples a subset into a single program.
+11. [**`Ensemble`**](../../api/optimizers/Ensemble.md): Ensembles a set of DSPy programs and either uses the full set or randomly samples a subset into a single program.
 
 
 ## Which optimizer should I use?
