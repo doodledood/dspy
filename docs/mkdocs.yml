@@ -120,6 +120,7 @@ nav:
             - ReAct: api/modules/ReAct.md
             - Refine: api/modules/Refine.md
         - Optimizers:
+            - APEX: api/optimizers/APEX.md
             - GEPA:
                 - 1. GEPA Overview: api/optimizers/GEPA/overview.md
                 - 2. GEPA Advanced: api/optimizers/GEPA/GEPA_Advanced.md

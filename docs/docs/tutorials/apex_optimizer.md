@@ -1,24 +1,24 @@
 # APEX Optimizer (`dspy.APEX`)
 
-APEX is a teleprompter that mirrors how experienced prompt engineers improve programs:
-systematically inspect failures, synthesize hypotheses that fix every actionable issue,
-test each proposal on a calibration set, and advance only when the best candidate
-outperforms the current baseline. The loop is intentionally simple—no Pareto frontier
-or stochastic branching—so you can understand, debug, and reproduce every prompt
-change that lands in your system.
+APEX is a GEPA-style optimizer that mirrors how experienced prompt engineers improve
+programs: systematically inspect failures, synthesize hypotheses that fix every actionable
+issue, and test each proposal on a calibration set. It augments that classic loop with
+history-aware prompts, Pareto-frontier candidate sampling (default), and median-of-runs
+evaluation so the optimization curve stays smooth even on noisy metrics.【F:dspy/teleprompt/apex/apex.py†L61-L199】
 
-[👉 Run the hands-on notebook on the PAPILLON dataset.](./apex_optimizer/index.ipynb)
+[👉 Run the hands-on notebook on the AIME math benchmark.](./apex_optimizer/index.ipynb) 【F:docs/docs/tutorials/apex_optimizer/index.ipynb†L1-L40】
 
 ## When to use APEX
 
 - You can capture full execution traces of your DSPy program.
 - The metric supplies either a scalar score or a `(score, feedback)` dictionary.
 - You want interpretable hypotheses with explicit rationales and minimal prompt edits.
-- Monotonic calibration performance matters—APEX never accepts regressions.
+- You appreciate stable progress: APEX defaults to Pareto sampling for smoother trends but
+  can be forced into `"best_on_val"` mode for strictly monotonic calibration scores.【F:dspy/teleprompt/apex/apex.py†L95-L176】
 
-If you need evolutionary exploration or Pareto tracking, see `dspy.GEPA`. If you are
-bootstrapping examples or finetuning weights, reach for `dspy.BootstrapFewShot`,
-`dspy.MIPROv2`, or `dspy.BootstrapFinetune`.
+If you need broader evolutionary exploration, see `dspy.GEPA`. If you are bootstrapping
+examples or finetuning weights, reach for `dspy.BootstrapFewShot`, `dspy.MIPROv2`, or
+`dspy.BootstrapFinetune`.
 
 ## Quick start
 
@@ -39,6 +39,7 @@ apex = APEX(
     num_hypotheses=2,
     num_eval_runs=3,
     train_sample=80,                   # sample subset of trainset each iteration
+    candidate_selection="pareto",   # multi-objective frontier sampling (default)
     convergence_patience=3,
 )
 
@@ -65,12 +66,14 @@ Each iteration performs:
    (>= `success_threshold`).
 2. **Root cause analysis** – issue one LLM call per failure (and matching successes)
    using full traces and prompts; responses must be structured JSON.
-3. **Hypothesis generation** – single synthesis call that receives all analyses +
-   current prompts and returns up to `num_hypotheses` comprehensive proposals.
+3. **Hypothesis generation** – single synthesis call that receives all analyses,
+   summaries of prior hypotheses (if enabled), and current prompts, then returns up to
+   `num_hypotheses` comprehensive proposals.【F:dspy/teleprompt/apex/apex.py†L170-L199】
 4. **Calibration testing** – evaluate baseline plus all hypotheses on the full
-   calibration set, repeating each example `num_eval_runs` times and taking the median.
-5. **Selection** – choose the candidate with the highest mean calibration score
-   (ties broken randomly). Only adopt the candidate if it strictly beats the baseline.
+   calibration set, repeating each example `num_eval_runs` times and taking the median.【F:dspy/teleprompt/apex/apex.py†L95-L118】
+5. **Selection** – either sample from the Pareto frontier of per-example scores or pick
+   the best average score, depending on `candidate_selection`. Adoption still requires a
+   strict improvement over the current baseline.【F:dspy/teleprompt/apex/apex.py†L119-L176】
 6. **Convergence** – stop after `convergence_patience` non-improving iterations or when
    `max_iterations` is reached. Results are monotonic because APEX never accepts a
    regression.
@@ -138,3 +141,8 @@ for predictor, change in best.hypothesis.prompt_changes.items():
 
 Use this information to audit prompt changes, reproduce analysis decisions, or feed the
 history into downstream visualizations.
+
+## Additional resources
+
+- [APEX API reference](../api/optimizers/APEX.md) — parameter definitions, public methods, and code snippets. 【F:docs/docs/api/optimizers/APEX.md†L1-L72】
+- [AIME Math Reasoning with APEX](./apex_optimizer/index.ipynb) — end-to-end notebook featuring Pareto sampling, MLflow dashboards, and history-aware hypothesis generation. 【F:docs/docs/tutorials/apex_optimizer/index.ipynb†L1-L40】
